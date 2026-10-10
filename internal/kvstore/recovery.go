@@ -90,10 +90,25 @@ func (kvs *KVServer) finishFirstGC(startTime time.Time) {
 }
 
 // finishAnotherGC completes the second (merging) round after a successful migration.
+//
+// 与上游的差别只有一处：末尾多删一个文件——**被本轮产物取代的那个排序文件**。
+//
+// 上游只在 finishFirstGC / finishAnotherGC 里删 oldLog（valuelog），排序文件从来没人删。
+// 两轮上限之下最多多留一份，无所谓；把 numGC >= 2 的上限摘掉之后，它就成了空间无界增长的
+// 直接原因：每轮的排序文件约等于活数据大小，第 k 轮就多留 k 份。
+//
+// 顺序沿用 finishFirstGC 那条注释里的规矩：**先把新状态落盘，最后才删旧文件**。崩在中间
+// 只会留下一个没人引用的文件；反过来（先删后落盘）会让清单指向一个已经不存在的文件，
+// 节点再也起不来。
+//
+// 只删排序文件，**不动 RocksDB 旧库**——那一份每轮只有活数据的百分之几，多留几轮可以承受，
+// 少改一处就少一个说不清的地方。
 func (kvs *KVServer) finishAnotherGC(startTime time.Time) {
 	fmt.Printf("垃圾回收完成，共花费了%v\n", time.Since(startTime))
 	kvs.raft.PersistLogBase()
 	kvs.mu.Lock()
+	// 本轮的产物取代了它，先把路径记下来，等状态落盘之后再删。
+	prevSorted := kvs.sortedFilePath
 	kvs.anotherStartGC, kvs.anotherEndGC = false, false
 	kvs.lastGCFinish = true
 	kvs.lastSortedFileIndex = kvs.anothersortedFileIndex // 更新本轮的变量为上一次
@@ -103,6 +118,14 @@ func (kvs *KVServer) finishAnotherGC(startTime time.Time) {
 	kvs.mu.Unlock()
 	if err := os.Remove(kvs.oldLog); err != nil {
 		fmt.Printf("第 %v 轮垃圾回收删除旧文件出现了错误: %v\n", kvs.numGC, err)
+	}
+	// 上一轮的排序文件：本轮产物已经把它整个并进去了，读路径也只认 sortedFilePath，
+	// 所以它已经没有引用。判一下路径不等，免得某轮 anotherSortedFilePath 恰好指回同一份。
+	// NotExist 不算错——崩溃重做时它可能已经被删过一次。
+	if prevSorted != "" && prevSorted != kvs.sortedFilePath {
+		if err := os.Remove(prevSorted); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("第 %v 轮删除上一轮排序文件出现了错误: %v\n", kvs.numGC, err)
+		}
 	}
 	fmt.Printf("第 %v 轮垃圾回收完成，等待下一轮垃圾回收，且已删除 oldLog 指向的文件\n", kvs.numGC)
 }
