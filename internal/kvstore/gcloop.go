@@ -49,10 +49,19 @@ func (kvs *KVServer) gcLoop(ctx context.Context) {
 			// fmt.Printf("文件 %s 大小为 %.2f GB，未达到垃圾回收阈值\n", kvs.currentLog, fileSizeGB)
 			continue
 		}
-		if kvs.numGC >= 2 {
-			// fmt.Printf("已经进行了 %d 轮垃圾回收，停止进一步的垃圾回收\n", kvs.numGC)
-			continue
-		}
+				// 本对比实验用：摘掉两轮上限。上游 e811c32 原样是 numGC >= 2 就永久停止，
+		// 第 3 轮起旧版根本不干活——那样"相同 GC 轮次"的对比无从谈起，比出来的是
+		// "旧版不做任何事"而不是"旧版每轮花多少"。
+		//
+		// 只注释、不删除：还原只需取消注释。
+		//
+		// 注意这个上限正是 O(n²) 的遮蔽物（见 348db68）：摘掉之后，第 k 轮重写
+		// k×阈值 的活数据却只吸收一个阈值的新数据，代价是真的，不是测量误差。
+		//
+		// if kvs.numGC >= 2 {
+		// 	// fmt.Printf("已经进行了 %d 轮垃圾回收，停止进一步的垃圾回收\n", kvs.numGC)
+		// 	continue
+		// }
 		if kvs.gcInProgress {
 			continue // the previous round (possibly a post-restart redo) has not finished
 		}
