@@ -757,19 +757,19 @@ func (kvs *KVServer) anotherGCGet(key string, reply *kvrpc.GetInRaftResponse) *k
 	}
 	// post-GC
 	// 创建用于接收结果的通道
-		newFileResult := make(chan searchResult, 1)
-		anotherSortedFileResult := make(chan searchResult, 1)
+	newFileResult := make(chan searchResult, 1)
+	anotherSortedFileResult := make(chan searchResult, 1)
 
-		if kvs.tailRouteShortcut(key) {
-			value, err := kvs.getFromSortedFile(key, kvs.anothersortedFileIndex)
-			if err != nil {
-				reply.Err = raft.ErrNoKey
-				reply.Value = raft.NoKey
-				return reply
-			}
-			reply.Value = value
+	if kvs.tailRouteShortcut(key) {
+		value, err := kvs.getFromSortedFile(key, kvs.anothersortedFileIndex)
+		if err != nil {
+			reply.Err = raft.ErrNoKey
+			reply.Value = raft.NoKey
 			return reply
 		}
+		reply.Value = value
+		return reply
+	}
 
 	// 并行搜索新文件（本轮的新文件）
 	go func() {

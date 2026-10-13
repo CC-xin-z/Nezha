@@ -49,7 +49,7 @@ func (kvs *KVServer) gcLoop(ctx context.Context) {
 			// fmt.Printf("文件 %s 大小为 %.2f GB，未达到垃圾回收阈值\n", kvs.currentLog, fileSizeGB)
 			continue
 		}
-				// 本对比实验用：摘掉两轮上限。上游 e811c32 原样是 numGC >= 2 就永久停止，
+		// 本对比实验用：摘掉两轮上限。上游 e811c32 原样是 numGC >= 2 就永久停止，
 		// 第 3 轮起旧版根本不干活——那样"相同 GC 轮次"的对比无从谈起，比出来的是
 		// "旧版不做任何事"而不是"旧版每轮花多少"。
 		//
