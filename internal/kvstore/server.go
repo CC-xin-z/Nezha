@@ -94,6 +94,14 @@ type KVServer struct {
 
 	// AVP: adaptive value placement
 	kvSeparation bool // false 时退化为 standard Raft+RocksDB 基线
+	// tailFilter 是"尾部集合"的不漏报判定，只在 -tailRoute 打开时非 nil。
+	//
+	// nil 表示这套机制整个不参与：不调 Add、读路径不做路由判定，行为与改造前一致。
+	// 见 tailfilter.go。
+	tailFilter *TailFilter
+	// tailSealBoundary 是本轮 absorb 开始时封口到的段号，absorb 成功后据此丢段。
+	// 初值 -1 让"没跑过 GC"与"跑过第 0 段"区分开（DropThrough(-1) 是空操作）。
+	tailSealBoundary int
 	// gcEnabled 把"要不要跑 GC"从阈值大小里分离出来。
 	// 原先只能靠调大 gcThresholdGB 让 GC 永不触发来模拟 Nezha-NoGC，
 	// 阈值算错就会静默变成另一个被测系统。
@@ -232,6 +240,12 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	kvs.InitialRaftStateLog = filepath.Join(cfg.DataDir, "data", "valuelog", "RaftState.log")
 	kvs.currentLog = kvs.InitialRaftStateLog
+	// 尾部过滤器：造出来就是保守的（`MightContain` 一律答"可能在"），能不能放开由
+	// 下面恢复阶段的结果决定。关掉 -tailRoute 时它是 nil，整套机制不参与。
+	kvs.tailSealBoundary = -1
+	if cfg.TailRoute {
+		kvs.tailFilter = NewTailFilter(0, 0)
+	}
 	InitGCPaths(cfg.DataDir)
 	InitAnotherGCPaths(cfg.DataDir)
 
@@ -241,10 +255,10 @@ func New(cfg Config) (*KVServer, error) {
 	StartAVPViz(cfg.VizAddr, cfg.systemName(), kvs.inlineThreshold)
 	// One line that says which system this log measured: the switches can come from the
 	// preset or be set individually, and results must be attributable afterwards.
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d | tailRoute=%v\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL,
-		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB)
+		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, cfg.TailRoute)
 
 	// A fresh node opens the initial store; a restarted node restores GC state, the
 	// sorted-file index and the applied index, and returns the log files Raft must replay.
@@ -278,6 +292,21 @@ func New(cfg Config) (*KVServer, error) {
 	kvs.raft.SetCurrentLogVersioned(kvs.currentLog, int32(kvs.numGC))
 	kvs.raft.Gap = cfg.Gap
 	kvs.raft.SyncTime = cfg.SyncTime
+	// 尾部过滤器能不能放开精确判定，取决于这一轮恢复有没有搬回东西。
+	//
+	// 新节点（数据目录被清过、或第一次起来）尾部是空的，"位数组里什么都没有"就是正确的，
+	// 可以立刻 MarkExact。**重启过的节点不行**：恢复出来的日志会被 Raft 重放填回尾部,
+	// 而重放是异步的——在它跑完之前位数组是空的，此时判"不在尾部"就是漏报。这种节点
+	// 保持保守，读退化成两路（功能完全正常，只是路由不生效）；要让它生效得先扫一遍
+	// 恢复出来的尾部再 MarkExact，那是下一步。
+	if kvs.tailFilter != nil {
+		if len(recoveredFiles) == 0 {
+			kvs.tailFilter.MarkExact()
+			fmt.Println("[TAIL-FILTER] 尾部为空，精确判定已放开")
+		} else {
+			fmt.Printf("[TAIL-FILTER] 从盘上恢复了 %d 个日志文件，保持保守（路由暂不生效）\n", len(recoveredFiles))
+		}
+	}
 	return kvs, nil
 }
 

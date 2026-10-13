@@ -30,6 +30,13 @@ type Config struct {
 
 	// AVP (adaptive value placement) is orthogonal to System.
 	InlinePlacement bool // values below InlineThreshold are stored inline in the store
+
+	// TailRoute 打开"尾部集合过滤 + 单路路由"。
+	//
+	// 关掉时（默认）行为与改造前**逐字节相同**：不建过滤器、不调 Add、读路径照旧两路并发。
+	// 打开后才维护 tailFilter 并在读路径上用 MightContain 短路掉注定落空的那一路。
+	// 做成开关而不是默认打开，是为了让 A/B 是同一份二进制的单变量对照。
+	TailRoute bool
 	InlineThreshold int  // bytes
 	InlineCacheMB   int  // memory budget of the inline cache per sorted-file index
 	IndexBlockKB    int  // sparse index granularity over sorted files

@@ -1,6 +1,9 @@
 package kvstore
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // TailFilter 是"尾部集合"的不漏报判定：回答一个 key **是否可能**还在尾部
 // ——即尚未被 GC 搬进排序文件的那部分 valuelog。
@@ -63,6 +66,10 @@ type TailFilter struct {
 	// conservative 为真时无论内容如何都判"可能在"。启动、换主、装快照之后置上，
 	// 直到尾部被重新扫描再清掉。
 	conservative bool
+
+	// 路由计数，纯观测：判定为"不在尾部"因而只跑了一路的次数，与跑两路的次数。
+	singlePath atomic.Uint64
+	bothPaths  atomic.Uint64
 }
 
 // tailSeg 是一个段的位数组。sealed 只作观测用——判定不看它，因为"这段还在不在"
@@ -129,6 +136,9 @@ func (f *TailFilter) newSegLocked() *tailSeg {
 // 必须在 key 变得可读之前调用——否则读者可能问到一个位数组里还没有的 key,
 // 那就是漏报。
 func (f *TailFilter) Add(key string) {
+	if f == nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	seg := f.segs[len(f.segs)-1]
@@ -151,6 +161,9 @@ func (f *TailFilter) Add(key string) {
 // 返回 false 表示**确定不在**——调用方据此可以只查排序文件那一路。返回 true 只表示
 // 可能在（含假阳性与一切安全退化的情形），调用方按老样子跑两路。
 func (f *TailFilter) MightContain(key string) bool {
+	if f == nil {
+		return true // 没有过滤器 = 不知道 ⇒ 保守
+	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.conservative || len(f.segs) == 0 {
@@ -184,6 +197,9 @@ func (f *TailFilter) MightContain(key string) bool {
 // DropThrough(段号) 丢掉被搬走的那些段。**absorb 期间新写进来的数据落在新段里，
 // 段号更大，因此不会被误丢**——这正是"absorb 边界与段边界对齐"的落点。
 func (f *TailFilter) SealSegment() int {
+	if f == nil {
+		return -1
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	no := f.segs[len(f.segs)-1].no
@@ -204,6 +220,9 @@ func (f *TailFilter) sealLocked() *tailSeg {
 // 段号比 no 大的段（absorb 期间写进来的）一律保留。若因此把所有段都丢了,
 // 会补一个新段，保证"总是在写的那一段"始终存在。
 func (f *TailFilter) DropThrough(no int) {
+	if f == nil || no < 0 {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	keep := f.segs[:0]
@@ -223,6 +242,9 @@ func (f *TailFilter) DropThrough(no int) {
 // 崩溃恢复、换主、装快照之后调用——此时位数组与盘上的尾部已经对不上，任何精确判定
 // 都可能漏报。保守状态下功能完全正常，只是每次读都跑两路。
 func (f *TailFilter) Invalidate() {
+	if f == nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.conservative = true
@@ -235,6 +257,9 @@ func (f *TailFilter) Invalidate() {
 // 这个方法只翻标志，不清位数组——把"清空"和"放开"分成两步，就是为了不让中间那
 // 一瞬间的"精确但空"变成漏报。
 func (f *TailFilter) MarkExact() {
+	if f == nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.conservative = false
@@ -244,6 +269,9 @@ func (f *TailFilter) MarkExact() {
 //
 // 字节数是估算内存占用的唯一依据，所以它就是位数组本身，不含每段的切片头与结构体。
 func (f *TailFilter) Stats() (segments int, bitBytes int64, items int, conservative bool) {
+	if f == nil {
+		return 0, 0, 0, false
+	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	for _, s := range f.segs {
@@ -251,6 +279,41 @@ func (f *TailFilter) Stats() (segments int, bitBytes int64, items int, conservat
 		items += s.items
 	}
 	return len(f.segs), bitBytes, items, f.conservative
+}
+
+// NoteRoute 记一次路由判定：single=true 表示判成"确定不在尾部"、只跑了一路。
+//
+// 收益的上限就是 singlePath 的比例——它直接决定省掉了多少次注定落空的查找。
+func (f *TailFilter) NoteRoute(single bool) {
+	if f == nil {
+		return
+	}
+	if single {
+		f.singlePath.Add(1)
+		return
+	}
+	f.bothPaths.Add(1)
+}
+
+// RouteStats 返回（判成单路的次数，跑了两路的次数）。
+func (f *TailFilter) RouteStats() (singlePath, bothPaths uint64) {
+	if f == nil {
+		return 0, 0
+	}
+	return f.singlePath.Load(), f.bothPaths.Load()
+}
+
+// tailRouteShortcut 回答一个问题：这个 key 确定不在尾部、因而可以只查排序文件那一路吗？
+//
+// 顺手把判定计进观测——**收益的上限就是这个判定说"是"的比例**，没有它就无法解释
+// A/B 的差值是从哪来的。过滤器为 nil（没开 -tailRoute）时一律返回 false，也不计数。
+func (kvs *KVServer) tailRouteShortcut(key string) bool {
+	if kvs.tailFilter == nil {
+		return false
+	}
+	single := !kvs.tailFilter.MightContain(key)
+	kvs.tailFilter.NoteRoute(single)
+	return single
 }
 
 // tailHash 是 FNV-1a 64 后面接一道 fmix64 收尾。

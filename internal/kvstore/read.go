@@ -509,6 +509,21 @@ func (kvs *KVServer) firstGCGet(key string, reply *kvrpc.GetInRaftResponse) *kvr
 	}
 
 	if kvs.startGC && kvs.endGC {
+		// 尾部里确定没有这个 key ⇒ 答案只可能在排序文件里，直接跑那一路。
+		//
+		// 能这么短路，是因为紧随其后的取结果顺序本来就是"valuelog 先、排序文件后":
+		// 判"不在尾部"等于把那条已经存在的短路关系提前用掉，结果与顺序都不变，
+		// 只是省掉一次注定落空的查找。
+		if kvs.tailRouteShortcut(key) {
+			value, err := kvs.getFromSortedFile(key, kvs.firstSortedFileIndex)
+			if err != nil {
+				reply.Err = raft.ErrNoKey
+				reply.Value = raft.NoKey
+				return reply
+			}
+			reply.Value = value
+			return reply
+		}
 		// 创建用于接收结果的通道
 		newFileResult := make(chan searchResult, 1)
 		sortedFileResult := make(chan searchResult, 1)
@@ -578,6 +593,18 @@ func (kvs *KVServer) anotherGCGet(key string, reply *kvrpc.GetInRaftResponse) *k
 		err   error
 	}
 	if !kvs.anotherStartGC {
+		// 同 firstGCGet：这一路是"persister+currentLog"对"上一轮排序文件"，
+		// 取结果顺序是 valuelog 先，所以判"不在尾部"可以直接走排序文件。
+		if kvs.tailRouteShortcut(key) {
+			value, err := kvs.getFromSortedFile(key, kvs.lastSortedFileIndex)
+			if err != nil {
+				reply.Err = raft.ErrNoKey
+				reply.Value = raft.NoKey
+				return reply
+			}
+			reply.Value = value
+			return reply
+		}
 		// 创建用于接收结果的通道
 		oldFileResult := make(chan searchResult, 1)
 		lastSortedFileResult := make(chan searchResult, 1)
@@ -730,8 +757,19 @@ func (kvs *KVServer) anotherGCGet(key string, reply *kvrpc.GetInRaftResponse) *k
 	}
 	// post-GC
 	// 创建用于接收结果的通道
-	newFileResult := make(chan searchResult, 1)
-	anotherSortedFileResult := make(chan searchResult, 1)
+		newFileResult := make(chan searchResult, 1)
+		anotherSortedFileResult := make(chan searchResult, 1)
+
+		if kvs.tailRouteShortcut(key) {
+			value, err := kvs.getFromSortedFile(key, kvs.anothersortedFileIndex)
+			if err != nil {
+				reply.Err = raft.ErrNoKey
+				reply.Value = raft.NoKey
+				return reply
+			}
+			reply.Value = value
+			return reply
+		}
 
 	// 并行搜索新文件（本轮的新文件）
 	go func() {

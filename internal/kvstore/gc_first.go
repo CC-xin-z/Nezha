@@ -57,6 +57,10 @@ func (kvs *KVServer) entryFromRecord(paddedKey string, raw []byte, logFile *os.F
 }
 
 func (kvs *KVServer) FirstGarbageCollection() error {
+	// 尾部过滤器：把当前段封口，记下边界段号。**这一轮之后被搬走的那些 key 落在
+	// 段号 <= 边界的段里，而 absorb 期间新写进来的落在更大的段号上**——于是
+	// finishFirstGC 里的 DropThrough(边界) 只丢被搬走的，不会误伤新数据。
+	kvs.tailSealBoundary = kvs.tailFilter.SealSegment()
 	fmt.Println("Starting garbage collection...")
 	startTime := time.Now()
 

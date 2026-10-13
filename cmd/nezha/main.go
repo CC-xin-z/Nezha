@@ -42,6 +42,7 @@ func main() {
 	flag.IntVar(&cfg.InlineThreshold, "inlineThreshold", 512, "value size threshold in bytes for inline placement and the inline cache")
 	flag.IntVar(&cfg.InlineCacheMB, "inlineCacheMB", 256, "memory budget in MB for the inline small-value cache (0 disables it)")
 	flag.IntVar(&cfg.IndexBlockKB, "indexBlockKB", 4, "sparse index block size in KB: one in-memory index entry per block")
+	flag.BoolVar(&cfg.TailRoute, "tailRoute", false, "maintain a tail-side set filter and skip the value-log path when a key cannot be in the tail (off = byte-for-byte the old behaviour)")
 	flag.Float64Var(&cfg.GCThresholdGB, "gcThresholdGB", 4000, "value log size in GB that triggers garbage collection; lower it to exercise GC in tests")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
 	// and throughput is decided by the slowest goroutine, so the value shapes the

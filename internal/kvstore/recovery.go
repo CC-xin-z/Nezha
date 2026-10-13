@@ -73,6 +73,9 @@ func loadKVState(path string) (kvState, bool, error) {
 // first, delete the old file last. A crash in between leaves the old file on disk with
 // the state already pointing at the new one, which is merely an unreferenced file.
 func (kvs *KVServer) finishFirstGC(startTime time.Time) {
+	// 搬运成功、新状态已经落盘并切换，被搬进排序文件的那一段尾部可以忘掉了。
+	// 丢的是"段号 <= 边界"的位数组；absorb 期间写进来的段段号更大，保留。
+	kvs.tailFilter.DropThrough(kvs.tailSealBoundary)
 	fmt.Printf("垃圾回收完成，共花费了%v\n", time.Since(startTime))
 	kvs.raft.PersistLogBase()
 	kvs.mu.Lock()
@@ -104,6 +107,8 @@ func (kvs *KVServer) finishFirstGC(startTime time.Time) {
 // 只删排序文件，**不动 RocksDB 旧库**——那一份每轮只有活数据的百分之几，多留几轮可以承受，
 // 少改一处就少一个说不清的地方。
 func (kvs *KVServer) finishAnotherGC(startTime time.Time) {
+	// 同 finishFirstGC。
+	kvs.tailFilter.DropThrough(kvs.tailSealBoundary)
 	fmt.Printf("垃圾回收完成，共花费了%v\n", time.Since(startTime))
 	kvs.raft.PersistLogBase()
 	kvs.mu.Lock()

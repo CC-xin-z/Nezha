@@ -57,6 +57,9 @@ func ensurePathExists(path string) error {
 }
 
 func (kvs *KVServer) AnotherGarbageCollection() error {
+	// 同 FirstGarbageCollection：封口当前段并记下边界，absorb 成功后由
+	// finishAnotherGC 丢段。
+	kvs.tailSealBoundary = kvs.tailFilter.SealSegment()
 	err := kvs.MergedGarbageCollection()
 	return err
 }

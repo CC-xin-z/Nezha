@@ -106,6 +106,18 @@ func (kvs *KVServer) applyCommand(msg raft.ApplyMsg) {
 		// fmt.Printf("此时put进去的offsetL%v\n", offset)
 		// fmt.Printf("转换后的offset：%v\n", positionBytes)
 
+		// 尾部过滤器：这个 key 从此可能还在尾部。
+		//
+		// **必须排在下面所有 store 写之前。** 读者是靠 store 里那一行可见来判断"这个
+		// key 已经提交"的；把 Add 放到 store 写之后，就会出现"行已经可见、位数组里却
+		// 没有"的瞬间，而那个瞬间的判定是"确定不在尾部"——于是读会直接去排序文件、
+		// 报 NOKEY，而数据其实还在尾部里。放在前面，"看见行"就蕴含"位已置"，靠
+		// RocksDB 自己的同步边就够了。
+		//
+		// 这里覆盖全部四个分支（内联 / 基线 / 新库偏移 / 旧库偏移），因为对过滤器
+		// 而言它们都只是"这个 key 又出现在尾部一次"。
+		kvs.tailFilter.Add(op.Key)
+
 		tRocks := time.Now()
 		if kvs.inlinePlacement && len(op.Value) < kvs.inlineThreshold {
 			// 小值直接落在存储引擎里，不进 valuelog：读路径因此缩短为一次点查，
