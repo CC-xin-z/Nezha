@@ -1,8 +1,10 @@
 package kvstore
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // TailFilter 是"尾部集合"的不漏报判定：回答一个 key **是否可能**还在尾部
@@ -314,6 +316,66 @@ func (kvs *KVServer) tailRouteShortcut(key string) bool {
 	single := !kvs.tailFilter.MightContain(key)
 	kvs.tailFilter.NoteRoute(single)
 	return single
+}
+
+// tailRouteTarget 回答：当前状态下"另一路"是不是唯一确定的？是则返回那个排序文件索引。
+//
+// 这是把单路判定从"多路查找内部"提到 StartGet 最前面所需要的全部信息。只要这里返回
+// 非 nil，调用方就可以在碰存储引擎之前先做一次位探测，命中就直接读那一个排序文件——
+// 连 GetInline 那次点查都省掉。返回 nil 表示当前状态不支持前置。
+//
+// 与 read.go 三个分支的对应关系（前置之后，那三处不再各自判定）：
+//
+//	FirstGC=false && !anotherStartGC                → anotherGCGet 的 "!anotherStartGC" 分支 → lastSortedFileIndex
+//	FirstGC=false && anotherStartGC && anotherEndGC → anotherGCGet 的 post-GC 分支            → anothersortedFileIndex
+//	FirstGC=true  && startGC && endGC               → firstGCGet 的 post-GC 分支               → firstSortedFileIndex
+//
+// 其余状态不支持前置，各有理由：
+//
+//	FirstGC && !startGC                 首轮 GC 之前还没有排序文件，"另一路"是空的
+//	FirstGC && startGC && !endGC        首轮 GC 进行中，两路都是 valuelog，没有"另一路"
+//	anotherStartGC && !anotherEndGC     合并 GC 进行中，候选有三处（oldLog + currentLog + 排序
+//	                                    文件），前置判定只能排除一路、剩下两路，省不了
+//
+// 注意 endGC 目前在全仓库范围内从未被置真，所以第三个表项对应的分支是死代码。这里仍按
+// 结构把对应关系写全，是为了将来补上 endGC 的语义时不会留下一个没有路由的洞。
+func (kvs *KVServer) tailRouteTarget() *SortedFileIndex {
+	if kvs.tailFilter == nil {
+		return nil
+	}
+	if kvs.FirstGC {
+		if kvs.startGC && kvs.endGC {
+			return kvs.firstSortedFileIndex
+		}
+		return nil
+	}
+	if !kvs.anotherStartGC {
+		return kvs.lastSortedFileIndex
+	}
+	if kvs.anotherEndGC {
+		return kvs.anothersortedFileIndex
+	}
+	return nil
+}
+
+// StartTailRouteStatsReporter 周期性把单路比例打进节点日志。
+//
+// 这个数是"前置单路"的直接读数：single/(single+both) 就是有多少请求真的只跑了一路。
+// 没有它就只能从端到端延迟倒推，而延迟同时受块读、页缓存状态、GC 干扰影响，倒推不准。
+func (kvs *KVServer) StartTailRouteStatsReporter(interval time.Duration) {
+	if kvs.tailFilter == nil || interval <= 0 {
+		return
+	}
+	go func() {
+		for range time.Tick(interval) {
+			single, both := kvs.tailFilter.RouteStats()
+			if single+both == 0 {
+				continue
+			}
+			fmt.Printf("[TAIL-ROUTE] single=%d both=%d single_ratio=%.4f\n",
+				single, both, float64(single)/float64(single+both))
+		}
+	}()
 }
 
 // tailHash 是 FNV-1a 64 后面接一道 fmix64 收尾。

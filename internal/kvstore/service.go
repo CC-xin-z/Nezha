@@ -122,6 +122,25 @@ func (kvs *KVServer) StartGet(args *kvrpc.GetInRaftRequest) *kvrpc.GetInRaftResp
 		reply.Value = value
 		return reply
 	}
+	// 单路路由：在碰存储引擎之前，先把"值确定不在尾部"这一类判掉。
+	//
+	// 尾部过滤器是内存里的位探测，代价纳秒级；它要否掉的那次查找却是一次 RocksDB 点查
+	// （blockCacheMB=0 时数十微秒）。放在这里，这一批请求连 GetInline 都不用做——而这
+	// 正是把它留在多路查找内部做不到的：那时候 GetInline 和尾部那一路的 Get_opt 已经
+	// 各查过一遍同一个 key 了。
+	//
+	// 只有"另一路唯一确定"的状态才前置（见 tailRouteTarget）；GC 进行中有三处候选，
+	// 前置判定省不了一路，那一支仍走原来的多路查找。
+	if tgt := kvs.tailRouteTarget(); tgt != nil && kvs.tailRouteShortcut(key) {
+		if value, err := kvs.getFromSortedFile(key, tgt); err == nil {
+			reply.Value = value
+			return reply
+		}
+		// 排序文件里也没有。要么这个键真的不存在（下面那一路最终会给出 NOKEY），要么
+		// 过滤器出了假阴性。这里刻意不直接判 NOKEY，而是落回原来的多路查找：正确性
+		// 因此不再依赖过滤器，代价只是这一种情况多跑一遍——而"键真的不存在"在现有
+		// 工作负载里从不发生（not_found=0）。
+	}
 	if kvs.inlinePlacement {
 		// 小值内联时一次点查就拿到 value，省去"查偏移 + 读日志文件"的第二次 I/O。
 		// 不是内联的 key 会落回下面的多路查找，大 value 的路径完全不变。

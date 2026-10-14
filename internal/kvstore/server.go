@@ -245,6 +245,7 @@ func New(cfg Config) (*KVServer, error) {
 	kvs.tailSealBoundary = -1
 	if cfg.TailRoute {
 		kvs.tailFilter = NewTailFilter(0, 0)
+		kvs.StartTailRouteStatsReporter(15 * time.Second)
 	}
 	InitGCPaths(cfg.DataDir)
 	InitAnotherGCPaths(cfg.DataDir)

@@ -219,3 +219,75 @@ func TestTailFilterConcurrentPublishesAreVisible(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// tailRouteTarget 只在"另一路唯一确定"时给出目标；其余状态必须返回 nil。
+// 返回错的索引比不返回更糟：前置单路会把请求导向一个不含该 key 的排序文件。
+func TestTailRouteTargetOnlyWhenOtherPathIsUnique(t *testing.T) {
+	newKVS := func(withFilter bool) *KVServer {
+		kvs := &KVServer{
+			firstSortedFileIndex:   &SortedFileIndex{FilePath: "first"},
+			lastSortedFileIndex:    &SortedFileIndex{FilePath: "last"},
+			anothersortedFileIndex: &SortedFileIndex{FilePath: "another"},
+		}
+		if withFilter {
+			kvs.tailFilter = NewTailFilter(0, 0)
+		}
+		return kvs
+	}
+	target := func(kvs *KVServer) string {
+		if idx := kvs.tailRouteTarget(); idx != nil {
+			return idx.FilePath
+		}
+		return ""
+	}
+
+	// 首轮 GC 之前、以及首轮 GC 进行中：都没有"另一路"可走
+	for _, st := range []struct {
+		label          string
+		startGC, endGC bool
+	}{
+		{"首轮 GC 前", false, false},
+		{"首轮 GC 进行中", true, false},
+	} {
+		kvs := newKVS(true)
+		kvs.FirstGC, kvs.startGC, kvs.endGC = true, st.startGC, st.endGC
+		if got := target(kvs); got != "" {
+			t.Errorf("%s：tailRouteTarget()=%q，期望 nil", st.label, got)
+		}
+	}
+
+	// 首轮 GC 后。endGC 目前从不置真，这一支是死代码，但对应关系要写对。
+	kvs := newKVS(true)
+	kvs.FirstGC, kvs.startGC, kvs.endGC = true, true, true
+	if got := target(kvs); got != "first" {
+		t.Errorf("首轮 GC 后：tailRouteTarget()=%q，期望 first", got)
+	}
+
+	// 稳态：另一路是上一轮排序文件
+	kvs = newKVS(true)
+	kvs.FirstGC = false
+	if got := target(kvs); got != "last" {
+		t.Errorf("稳态：tailRouteTarget()=%q，期望 last", got)
+	}
+
+	// 合并 GC 进行中：候选三处，前置只能排除一路，省不了
+	kvs = newKVS(true)
+	kvs.FirstGC, kvs.anotherStartGC, kvs.anotherEndGC = false, true, false
+	if got := target(kvs); got != "" {
+		t.Errorf("合并 GC 进行中：tailRouteTarget()=%q，期望 nil", got)
+	}
+
+	// 合并 GC 后：另一路是本轮排序文件
+	kvs = newKVS(true)
+	kvs.FirstGC, kvs.anotherStartGC, kvs.anotherEndGC = false, true, true
+	if got := target(kvs); got != "another" {
+		t.Errorf("合并 GC 后：tailRouteTarget()=%q，期望 another", got)
+	}
+
+	// 没开 -tailRoute（过滤器为 nil）：一律不前置
+	kvs = newKVS(false)
+	kvs.FirstGC = false
+	if got := target(kvs); got != "" {
+		t.Errorf("过滤器为 nil：tailRouteTarget()=%q，期望 nil", got)
+	}
+}
