@@ -22,6 +22,7 @@ var avpStats struct {
 	blockScans     atomic.Uint64 // 块扫描次数（每次未命中一次）
 	entriesScanned atomic.Uint64 // 块内顺序解析的 entry 总条数
 	bytesRead      atomic.Uint64 // 从 sortedFile 实际读取的字节数
+	skippedValueBytes atomic.Uint64 // 块内扫描时跳过、未拷贝的 value 字节数
 }
 
 func avpRecordHit()  { avpStats.inlineHits.Add(1) }
@@ -43,6 +44,16 @@ func avpRecordScan(entries int, bytes int64) {
 	avpStats.bytesRead.Add(uint64(bytes))
 }
 
+// avpRecordSkip 记下块内扫描时跳过的 value 字节数。
+//
+// 这条与 entries_per_scan 互补：后者说明"一次点查要扫几条"，前者说明"其中多少
+// 字节不用真的搬出来"。只读头与 key 的改动，效果只体现在后者上。
+func avpRecordSkip(n int64) {
+	if n > 0 {
+		avpStats.skippedValueBytes.Add(uint64(n))
+	}
+}
+
 // AVPStatsLine 汇总成一行，供从节点日志里抓取。
 // 命中率和"平均每次未命中解析多少条 entry"是两个核心指标：
 // 前者说明 AVP 覆盖了多少读，后者量化它每次省下的解析工作量。
@@ -52,6 +63,7 @@ func AVPStatsLine() string {
 	scans := avpStats.blockScans.Load()
 	ents := avpStats.entriesScanned.Load()
 	bytes := avpStats.bytesRead.Load()
+	skipped := avpStats.skippedValueBytes.Load()
 
 	nf := avpStats.notFound.Load()
 
@@ -72,8 +84,8 @@ func AVPStatsLine() string {
 		entsPerScan = float64(ents) / float64(scans)
 	}
 	return fmt.Sprintf(
-		"[AVP-STATS] reads=%d hits=%d misses=%d not_found=%d hit_rate=%.2f%% eff_hit_rate=%.2f%% block_scans=%d entries_scanned=%d entries_per_scan=%.1f bytes_read=%d",
-		total, h, m, nf, hitRate, effRate, scans, ents, entsPerScan, bytes)
+		"[AVP-STATS] reads=%d hits=%d misses=%d not_found=%d hit_rate=%.2f%% eff_hit_rate=%.2f%% block_scans=%d entries_scanned=%d entries_per_scan=%.1f bytes_read=%d skipped_value_bytes=%d",
+		total, h, m, nf, hitRate, effRate, scans, ents, entsPerScan, bytes, skipped)
 }
 
 // StartAVPStatsReporter 周期性把指标打进节点日志。

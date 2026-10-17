@@ -114,29 +114,51 @@ func (kvs *KVServer) scanBlock(index *SortedFileIndex, paddedKey string, start, 
 		return nil, err
 	}
 
-	reader := bufio.NewReaderSize(io.LimitReader(file, end-start), 64*1024)
+	// 缓冲按块大小开。原来固定 64KB，而一次块查找只读 4KB —— 每次查找白分配 64KB，
+	// 数量级上比解析本身还贵。上限兜底，防异常索引把分配放大。
+	blockLen := end - start
+	if blockLen <= 0 {
+		return nil, errors.New(raft.ErrNoKey)
+	}
+	bufSize := int(blockLen)
+	if bufSize > 1<<20 {
+		bufSize = 1 << 20
+	}
+	reader := bufio.NewReaderSize(io.LimitReader(file, blockLen), bufSize)
 	// 解析条数就是 AVP 每次命中所省下的工作量，逐条计数后统一上报
 	scanned := 0
 	for {
-		entry, size, err := ReadEntry(reader, 0)
+		// 先只读头与 key：块内平均 8 条里只有 1 条是目标，其余 7 条的 value
+		// 不读也不拷贝（见 readEntryKeyOnly）。
+		key, valueSize, err := readEntryKeyOnly(reader)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			avpRecordScan(scanned, end-start)
+			avpRecordScan(scanned, blockLen)
 			return nil, err
 		}
 		scanned++
-		_ = size
-		if entry.Key == paddedKey {
-			avpRecordScan(scanned, end-start)
-			return entry, nil
+		if key == paddedKey {
+			value, err := readValueBytes(reader, valueSize)
+			if err != nil {
+				avpRecordScan(scanned, blockLen)
+				return nil, err
+			}
+			avpRecordScan(scanned, blockLen)
+			return &raft.Entry{Key: key, Value: value}, nil
 		}
-		if entry.Key > paddedKey { // 已越过目标，块内有序，后面不可能再有
+		if key > paddedKey { // 已越过目标，块内有序，后面不可能再有
 			break
 		}
+		// 不是目标：把它的 value 跳过，不拷贝
+		avpRecordSkip(valueSize)
+		if _, err := reader.Discard(int(valueSize)); err != nil {
+			avpRecordScan(scanned, blockLen)
+			return nil, err
+		}
 	}
-	avpRecordScan(scanned, end-start)
+	avpRecordScan(scanned, blockLen)
 	return nil, errors.New(raft.ErrNoKey)
 }
 

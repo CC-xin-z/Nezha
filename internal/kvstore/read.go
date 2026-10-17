@@ -399,6 +399,42 @@ func ReadEntry(reader *bufio.Reader, currentOffset int64) (*raft.Entry, int64, e
 	return &entry, entrySize, nil
 }
 
+// readEntryKeyOnly 只读一条 entry 的 20B 头与 key，value 留给调用方按需读或跳过。
+//
+// 块内点查平均要扫 8 条 entry，其中只有一条是目标。走 ReadEntry 的话，其余 7 条
+// 的 value 也会被一起读出来并复制成 string —— 256B 值时每次点查白拷贝约 1.8KB、
+// 多 14 次分配。这里先把"是不是这一条"判掉，命中才搬 value。
+func readEntryKeyOnly(reader *bufio.Reader) (key string, valueSize int64, err error) {
+	header := make([]byte, 20)
+	n, err := io.ReadFull(reader, header)
+	if err != nil {
+		if err == io.EOF && n == 0 {
+			return "", 0, io.EOF
+		}
+		return "", 0, fmt.Errorf("failed to read header: %v (read %d bytes)", err, n)
+	}
+	keySize := binary.LittleEndian.Uint32(header[12:16])
+	valueSize = int64(binary.LittleEndian.Uint32(header[16:20]))
+
+	keyBuf := make([]byte, keySize)
+	if _, err := io.ReadFull(reader, keyBuf); err != nil {
+		return "", 0, fmt.Errorf("failed to read key: %v", err)
+	}
+	return string(keyBuf), valueSize, nil
+}
+
+// readValueBytes 读出一条 entry 的 value。调用方已经读过它的头部与 key。
+func readValueBytes(reader *bufio.Reader, valueSize int64) (string, error) {
+	if valueSize <= 0 {
+		return "", nil
+	}
+	buf := make([]byte, valueSize)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		return "", fmt.Errorf("failed to read value: %v", err)
+	}
+	return string(buf), nil
+}
+
 // ==================================================
 
 func (kvs *KVServer) firstGCGet(key string, reply *kvrpc.GetInRaftResponse) *kvrpc.GetInRaftResponse {
