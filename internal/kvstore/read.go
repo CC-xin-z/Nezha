@@ -829,7 +829,8 @@ func (kvs *KVServer) anotherGCGet(key string, reply *kvrpc.GetInRaftResponse) *k
 	}
 }
 
-// getFromSortedFile looks a key up in a sorted file: inline cache first, then the sparse index and a block scan.
+// getFromSortedFile looks a key up in a sorted file: inline cache first, then sparse
+// block selection plus the block-local hash index (linear scan is the fallback).
 func (kvs *KVServer) getFromSortedFile(key string, index *SortedFileIndex) (string, error) {
 	// 先检查LRU缓存
 	// if value, ok := kvs.sortedFileCache.Get(key); ok {
@@ -848,7 +849,7 @@ func (kvs *KVServer) getFromSortedFile(key string, index *SortedFileIndex) (stri
 	}
 	avpRecordMiss()
 
-	// 未命中：经稀疏索引二分定位到块，块内顺序扫描
+	// 未命中：经稀疏索引二分定位到块，再由块内哈希表定位 entry。
 	entry, err := kvs.lookupInSortedFile(index, key)
 	if err != nil {
 		// 这里不能记 not_found。GC 之后数据分散在多个 sortedFile 与新旧 valuelog 中，

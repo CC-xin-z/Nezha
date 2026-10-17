@@ -16,13 +16,16 @@ import (
 // 多少条 entry——不受 page cache 影响，是审稿人真正要看的证据。
 // 热路径上只有 atomic 加法，开销可忽略。
 var avpStats struct {
-	inlineHits     atomic.Uint64 // 内联缓存命中：直接返回 value，零文件 I/O
-	inlineMisses   atomic.Uint64 // 未命中：需要走 sortedFile
-	notFound       atomic.Uint64 // 其中 key 根本不存在的部分
-	blockScans     atomic.Uint64 // 块扫描次数（每次未命中一次）
-	entriesScanned atomic.Uint64 // 块内顺序解析的 entry 总条数
-	bytesRead      atomic.Uint64 // 从 sortedFile 实际读取的字节数
-	skippedValueBytes atomic.Uint64 // 块内扫描时跳过、未拷贝的 value 字节数
+	inlineHits        atomic.Uint64 // 内联缓存命中：直接返回 value，零文件 I/O
+	inlineMisses      atomic.Uint64 // 未命中：需要走 sortedFile
+	notFound          atomic.Uint64 // 其中 key 根本不存在的部分
+	blockScans        atomic.Uint64 // 块查找次数（每次未命中一次）
+	entriesScanned    atomic.Uint64 // 实际解析或验证的 entry 条数
+	bytesRead         atomic.Uint64 // 从 sortedFile 读取的字节数
+	skippedValueBytes atomic.Uint64 // 顺序回退时跳过、未拷贝的 value 字节数
+	hashLookups       atomic.Uint64 // 使用块内哈希表的查找次数
+	hashKeyProbes     atomic.Uint64 // 哈希查找中实际回读并验证的 key 条数
+	hashFallbacks     atomic.Uint64 // 哈希表不可用、退回顺序扫描的次数
 }
 
 func avpRecordHit()  { avpStats.inlineHits.Add(1) }
@@ -54,6 +57,15 @@ func avpRecordSkip(n int64) {
 	}
 }
 
+func avpRecordHashLookup(probes int) {
+	avpStats.hashLookups.Add(1)
+	avpStats.hashKeyProbes.Add(uint64(probes))
+}
+
+func avpRecordHashFallback() {
+	avpStats.hashFallbacks.Add(1)
+}
+
 // AVPStatsLine 汇总成一行，供从节点日志里抓取。
 // 命中率和"平均每次未命中解析多少条 entry"是两个核心指标：
 // 前者说明 AVP 覆盖了多少读，后者量化它每次省下的解析工作量。
@@ -64,6 +76,9 @@ func AVPStatsLine() string {
 	ents := avpStats.entriesScanned.Load()
 	bytes := avpStats.bytesRead.Load()
 	skipped := avpStats.skippedValueBytes.Load()
+	hashLookups := avpStats.hashLookups.Load()
+	hashProbes := avpStats.hashKeyProbes.Load()
+	hashFallbacks := avpStats.hashFallbacks.Load()
 
 	nf := avpStats.notFound.Load()
 
@@ -83,9 +98,14 @@ func AVPStatsLine() string {
 	if scans > 0 {
 		entsPerScan = float64(ents) / float64(scans)
 	}
+	var probesPerHashLookup float64
+	if hashLookups > 0 {
+		probesPerHashLookup = float64(hashProbes) / float64(hashLookups)
+	}
 	return fmt.Sprintf(
-		"[AVP-STATS] reads=%d hits=%d misses=%d not_found=%d hit_rate=%.2f%% eff_hit_rate=%.2f%% block_scans=%d entries_scanned=%d entries_per_scan=%.1f bytes_read=%d skipped_value_bytes=%d",
-		total, h, m, nf, hitRate, effRate, scans, ents, entsPerScan, bytes, skipped)
+		"[AVP-STATS] reads=%d hits=%d misses=%d not_found=%d hit_rate=%.2f%% eff_hit_rate=%.2f%% block_scans=%d entries_scanned=%d entries_per_scan=%.1f bytes_read=%d skipped_value_bytes=%d hash_lookups=%d hash_key_probes=%d probes_per_hash_lookup=%.1f hash_fallbacks=%d",
+		total, h, m, nf, hitRate, effRate, scans, ents, entsPerScan, bytes, skipped,
+		hashLookups, hashProbes, probesPerHashLookup, hashFallbacks)
 }
 
 // StartAVPStatsReporter 周期性把指标打进节点日志。

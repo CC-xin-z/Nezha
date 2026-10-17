@@ -1,8 +1,13 @@
 package kvstore
 
 import (
+	"bufio"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
 
 func mkIndex(entries []SparseEntry, fileSize int64) *SortedFileIndex {
@@ -66,7 +71,7 @@ func TestSparseIndexBuilder(t *testing.T) {
 		b.Observe(fmt.Sprintf("%010d", i), off, 30)
 		off += 30
 	}
-	got := b.Build()
+	got := b.Build().Entries
 	// 期望索引点落在累计字节跨过 100 的边界：第0条(0)、第4条(120)、第8条(240)
 	want := []SparseEntry{
 		{PaddedKey: "0000000000", Offset: 0},
@@ -91,7 +96,7 @@ func TestSparseIndexIsSorted(t *testing.T) {
 		b.Observe(fmt.Sprintf("%010d", i), off, 20)
 		off += 20
 	}
-	got := b.Build()
+	got := b.Build().Entries
 	if len(got) < 2 {
 		t.Fatal("索引项太少")
 	}
@@ -115,10 +120,101 @@ func TestSparseIndexMemoryReduction(t *testing.T) {
 		b.Observe(fmt.Sprintf("%010d", i), off, entryBytes)
 		off += entryBytes
 	}
-	n := len(b.Build())
+	n := len(b.Build().Entries)
 	ratio := float64(keys) / float64(n)
 	if ratio < 100 {
 		t.Fatalf("压缩比仅 %.0fx（%d key -> %d 索引项），期望 >100x", ratio, keys, n)
 	}
 	t.Logf("%d 个 key -> %d 个索引项，压缩 %.0fx", keys, n, ratio)
+}
+
+func TestBlockHashDisablesWhenUint16OffsetOverflows(t *testing.T) {
+	b := NewSparseIndexBuilder(1 << 20)
+	b.Observe("0000000001", 0, 65535)
+	b.Observe("0000000002", 65535, 100)
+
+	built := b.Build()
+	if len(built.Entries) != 1 || len(built.BlockHashes) != 1 {
+		t.Fatalf("entries=%d hashes=%d, want 1,1", len(built.Entries), len(built.BlockHashes))
+	}
+	if built.BlockHashes[0].Mask != 0 {
+		t.Fatal("第二个 entry 的偏移超出 uint16，必须禁用该块哈希表并回退顺序扫描")
+	}
+}
+
+func TestBlockHashIndexFindsEveryKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "RaftState_sorted_test")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	kvs := &KVServer{persister: &raft.Persister{}}
+	writer := bufio.NewWriter(file)
+	const count = 257
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2)
+		entry := &raft.Entry{
+			Index: uint32(i + 1),
+			Key:   key,
+			Value: fmt.Sprintf("value-%06d", i),
+		}
+		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	built, fileSize, err := kvs.BuildSparseIndex(path, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(built.BlockHashes) != len(built.Entries) {
+		t.Fatalf("BlockHashes=%d, Sparse=%d; 必须一一对应", len(built.BlockHashes), len(built.Entries))
+	}
+	indexedBlocks := 0
+	for _, meta := range built.BlockHashes {
+		if meta.Mask != 0 {
+			indexedBlocks++
+		}
+	}
+	if indexedBlocks == 0 {
+		t.Fatal("没有生成任何块内哈希表")
+	}
+
+	index := &SortedFileIndex{
+		Sparse:      built.Entries,
+		BlockHashes: built.BlockHashes,
+		HashSlots:   built.HashSlots,
+		FileSize:    fileSize,
+		FilePath:    path,
+	}
+	hashLookupsBefore := avpStats.hashLookups.Load()
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2)
+		got, err := kvs.lookupInSortedFile(index, key)
+		if err != nil {
+			t.Fatalf("lookup(%s): %v", key, err)
+		}
+		want := fmt.Sprintf("value-%06d", i)
+		if got.Key != key || got.Value != want {
+			t.Fatalf("lookup(%s) = {%q,%q}, want {%q,%q}", key, got.Key, got.Value, key, want)
+		}
+	}
+	if avpStats.hashLookups.Load() <= hashLookupsBefore {
+		t.Fatal("存在块内哈希表，但查找没有走哈希路径")
+	}
+
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2+1)
+		if _, err := kvs.lookupInSortedFile(index, key); err == nil {
+			t.Fatalf("不存在的 key %s 被错误命中", key)
+		}
+	}
 }

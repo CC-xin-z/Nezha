@@ -48,7 +48,7 @@ const vizPage = `<!doctype html>
   <div class="card"><div class="k">内联命中率</div><div class="v"><span id="hr">—</span><small>%</small></div></div>
   <div class="card"><div class="k">有效命中率</div><div class="v"><span id="ehr">—</span><small>%</small></div></div>
   <div class="card"><div class="k">读请求</div><div class="v" id="reads">—</div></div>
-  <div class="card"><div class="k">未命中每次解析</div><div class="v"><span id="eps">—</span><small> 条</small></div></div>
+  <div class="card"><div class="k">未命中每次验证</div><div class="v"><span id="eps">—</span><small> 条</small></div></div>
 </div>
 
 <div class="legend">
@@ -62,8 +62,8 @@ const vizPage = `<!doctype html>
 </table>
 
 <p class="note">
-  未命中每次解析的条数反映稀疏索引的块内扫描量：它是块大小与 entry 大小的函数，
-  与命中率无关。命中率会随读的键空间漂移，有效命中率剔除了本就不存在的 key。
+  未命中每次验证的条数反映稀疏索引定位后，块内哈希实际回读并比较了几个 key。
+  它与命中率无关；有效命中率剔除了本就不存在的 key。
 </p>
 
 <script>

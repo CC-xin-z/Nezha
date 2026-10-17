@@ -332,10 +332,13 @@ func (kvs *KVServer) mergeIntoSortedFile(startTime time.Time) error {
 	// ============= 直接构建SortedFileIndex对象，避免AnotherCreateIndex =============
 
 	// 使用加锁保护索引更新
+	builtIndex := sparse.Build()
 	kvs.mu.Lock()
 	kvs.anotherSortedFilePath = mergedSortedFilePath
 	kvs.anothersortedFileIndex = &SortedFileIndex{
-		Sparse:       sparse.Build(),
+		Sparse:       builtIndex.Entries,
+		BlockHashes:  builtIndex.BlockHashes,
+		HashSlots:    builtIndex.HashSlots,
 		FileSize:     currentOffset,
 		InlineValues: inlineCache,
 		FilePath:     mergedSortedFilePath,
@@ -385,7 +388,7 @@ func (kvs *KVServer) AnotherCreateIndex(SortedFilePath string) error {
 	// // 预热缓存
 	// kvs.warmupCache(SortedFilePath)
 
-	fmt.Println("建立了索引，得到了针对已排序文件的稀疏索引")
+	fmt.Println("建立了索引，得到了针对已排序文件的稀疏索引和块内哈希索引")
 	kvs.filePool, err = NewFileDescriptorPool(SortedFilePath, 50)
 	if err != nil {
 		fmt.Printf("Failed to create file descriptor pool: %v\n", err)

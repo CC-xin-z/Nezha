@@ -225,10 +225,13 @@ func (kvs *KVServer) firstGCMigrate(sortedFile *os.File, firstSortedFilePath str
 	// ============= 直接构建SortedFileIndex对象 =============
 
 	// 使用加锁保护索引更新
+	builtIndex := sparse.Build()
 	kvs.mu.Lock()
 	kvs.firstSortedFilePath = firstSortedFilePath
 	kvs.firstSortedFileIndex = &SortedFileIndex{
-		Sparse:       sparse.Build(),
+		Sparse:       builtIndex.Entries,
+		BlockHashes:  builtIndex.BlockHashes,
+		HashSlots:    builtIndex.HashSlots,
 		FileSize:     currentOffset,
 		InlineValues: inlineCache,
 		FilePath:     firstSortedFilePath,
@@ -329,7 +332,7 @@ func (kvs *KVServer) CreateIndex(firstSortedFilePath string) error {
 	// // 预热缓存
 	// kvs.warmupCache(firstSortedFilePath)
 
-	fmt.Println("建立了索引，得到了针对已排序文件的稀疏索引")
+	fmt.Println("建立了索引，得到了针对已排序文件的稀疏索引和块内哈希索引")
 	kvs.filePool, err = NewFileDescriptorPool(firstSortedFilePath, 50)
 	if err != nil {
 		fmt.Printf("Failed to create file descriptor pool: %v\n", err)
@@ -347,15 +350,17 @@ func (kvs *KVServer) CreateIndex(firstSortedFilePath string) error {
 // CreateSortedFileIndex 扫描整个 sortedFile 重建索引（重启或 GC 合并后使用）。
 //
 // 原实现为每个 key 建一条 key→offset 的内存记录，索引内存随 key 数线性增长。
-// 现在改建稀疏块索引，内存降为 O(块数)。注意此路径不重建内联缓存——那是纯加速层，
-// 冷启动为空即可，读路径会在未命中时自然回填。
+// 现在改建稀疏块索引 + 每块一张紧凑哈希表；哈希槽只保存块内偏移，不常驻 key。
+// 注意此路径不重建内联缓存——那是纯加速层，冷启动为空即可，读路径会在未命中时自然回填。
 func (kvs *KVServer) CreateSortedFileIndex(filePath string) (*SortedFileIndex, error) {
-	sparse, fileSize, err := kvs.BuildSparseIndex(filePath, kvs.indexBlockBytes)
+	builtIndex, fileSize, err := kvs.BuildSparseIndex(filePath, kvs.indexBlockBytes)
 	if err != nil {
 		return nil, err
 	}
 	return &SortedFileIndex{
-		Sparse:       sparse,
+		Sparse:       builtIndex.Entries,
+		BlockHashes:  builtIndex.BlockHashes,
+		HashSlots:    builtIndex.HashSlots,
 		FileSize:     fileSize,
 		InlineValues: NewInlineCache(kvs.inlineCacheBytes),
 		FilePath:     filePath,

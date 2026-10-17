@@ -113,7 +113,7 @@ type KVServer struct {
 	inlineThreshold  int     // values smaller than this (bytes) are eligible for the inline cache
 	inlineCacheBytes int64   // memory budget for each SortedFileIndex's inline cache
 	gcThresholdGB    float64 // value log size in GB that triggers GC
-	indexBlockBytes  int64   // sparse index granularity: one index entry per this many bytes
+	indexBlockBytes  int64   // target bytes per sorted-file block; sparse index + block hash index
 }
 
 func (kv *KVServer) Kill() {
