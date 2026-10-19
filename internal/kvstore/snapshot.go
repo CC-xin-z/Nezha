@@ -85,8 +85,8 @@ type snapshotManifest struct {
 	SortedFile string          `json:"sorted_file"` // 分区组基名，文件名
 	Partitions []partitionMeta `json:"partitions"`
 
-	CurrentLog      string `json:"current_log"`       // 当前日志的文件名
-	CurrentLogBytes int64  `json:"current_log_bytes"` // 只取前这么多字节
+	CurrentLog      string                  `json:"current_log"`       // 当前日志的文件名
+	CurrentLogBytes int64                   `json:"current_log_bytes"` // 只取前这么多字节
 	BPHS            []bphsSnapshotPartition `json:"bphs,omitempty"`
 	// StoreSST 为空表示库里一行都没有（全新节点，或者上一轮 GC 之后没写过）。
 	StoreSST  string `json:"store_sst"`

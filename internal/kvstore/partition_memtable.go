@@ -31,11 +31,11 @@ type bphsBlobRef struct {
 // Version 直接使用 Raft CommandIndex，而不是客户端 Seq：P1 有统一的 Raft 顺序，
 // 本地自增序列在 leader 切换后没有可比性。
 type bphsRecord struct {
-	Key     string
-	Version uint32
-	Kind    bphsRecordKind
-	Value   string
-	Blob    bphsBlobRef
+	Key       string
+	Version   uint32
+	Kind      bphsRecordKind
+	Value     string
+	Blob      bphsBlobRef
 	LogOffset int64 // 仅内存记录使用；SST/L0 中的记录没有外部日志位置
 }
 
