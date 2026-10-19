@@ -28,6 +28,7 @@ type kvState struct {
 	GCInProgress bool            `json:"gc_in_progress"`
 	OldLog       string          `json:"old_log"` // the next two are meaningful only while GCInProgress
 	OldDB        string          `json:"old_db"`
+	BPHSDir      string          `json:"bphs_dir,omitempty"`
 }
 
 func (kvs *KVServer) stateFilePath() string {
@@ -48,6 +49,11 @@ func (kvs *KVServer) saveKVState() {
 	if kvs.gcInProgress {
 		st.OldLog = kvs.oldLog
 		st.OldDB = kvs.oldDBPath
+	}
+	if kvs.bphs != nil {
+		if rel, err := filepath.Rel(kvs.dataDir, kvs.bphs.Dir()); err == nil {
+			st.BPHSDir = rel
+		}
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -114,6 +120,9 @@ func (kvs *KVServer) finishFirstGC(startTime time.Time) {
 	kvs.retirePartitions(kvs.firstPartitions) // 第一轮之前没有上一组，只是换上新的
 	kvs.sortedFilePath = kvs.firstSortedFilePath
 	kvs.gcInProgress = false
+	if err := kvs.enableOrUpdateBPHS(kvs.lastPartitions); err != nil {
+		log.Fatalf("enable BPHS after first GC: %v", err)
+	}
 	// 把 applied 索引落进**新**库。GC 切换时新建的库从没记过它，而 SetApplied 只在 apply
 	// 路径上被调用——于是一轮 GC 完成之后若没有新的写入，新库里的 applied 就一直是 0，
 	// 而 Raft 持久化的 base 已经推到了压实位置。重启时两者矛盾，恢复直接放弃：
@@ -154,6 +163,9 @@ func (kvs *KVServer) finishAnotherGC(startTime time.Time) {
 	kvs.retirePartitions(kvs.anotherPartitions)
 	kvs.sortedFilePath = kvs.anotherSortedFilePath
 	kvs.gcInProgress = false
+	if err := kvs.enableOrUpdateBPHS(kvs.lastPartitions); err != nil {
+		log.Fatalf("update BPHS base after absorb GC: %v", err)
+	}
 	// 同 finishFirstGC：新库不知道 applied 到哪了，不补这一笔，一轮之后无写入的节点起不来
 	kvs.persister.SetApplied(kvs.lastAppliedIndex)
 	kvs.saveKVState()
@@ -264,6 +276,15 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 	kvs.currentLog = st.CurrentLog
 	kvs.currentDBPath = st.CurrentDB
 	kvs.sortedFilePath = st.SortedFile
+	if st.BPHSDir != "" {
+		if !kvs.bphsEnabled {
+			log.Fatalf("[RECOVER] state contains BPHS data but -bphs is disabled")
+		}
+		kvs.bphsDir = filepath.Join(kvs.dataDir, filepath.Clean(st.BPHSDir))
+		if _, err := os.Stat(kvs.bphsDir); err != nil {
+			log.Fatalf("[RECOVER] BPHS directory named by state is unavailable: %v", err)
+		}
+	}
 	if _, err := kvs.persister.Init(st.CurrentDB, true); err != nil {
 		log.Fatalf("[RECOVER] open current RocksDB %s: %v", st.CurrentDB, err)
 	}
@@ -294,6 +315,9 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 		kvs.FirstGC = false
 		kvs.startGC = true
 		kvs.lastGCFinish = true
+		if err := kvs.enableOrUpdateBPHS(kvs.lastPartitions); err != nil {
+			log.Fatalf("[RECOVER] enable BPHS: %v", err)
+		}
 		fmt.Printf("[RECOVER] partition set rebuilt: %s (%d partitions, %d bytes)\n",
 			st.SortedFile, parts.Len(), parts.TotalSize())
 		// 分区数此刻才知道，所以余量检查放在这里。超了不拦启动——只是警告，

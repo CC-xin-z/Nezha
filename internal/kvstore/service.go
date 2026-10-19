@@ -108,6 +108,30 @@ func (kvs *KVServer) ScanRangeInRaft(ctx context.Context, in *kvrpc.ScanRangeReq
 		return reply, nil
 	}
 
+	if st.bphs != nil {
+		legacy, err := kvs.anotherGCScan(st, in.StartKey, in.EndKey)
+		if err != nil {
+			fmt.Printf("[SCAN] BPHS 查询旧尾部失败: %v\n", err)
+			reply.Err = "error in scan"
+			return reply, nil
+		}
+		bphsResult, err := st.bphs.Scan(in.StartKey, in.EndKey)
+		if err != nil {
+			fmt.Printf("[SCAN] BPHS 范围查询失败: %v\n", err)
+			reply.Err = "error in scan"
+			return reply, nil
+		}
+		result := make(map[string]string, len(legacy)+len(bphsResult))
+		for k, v := range legacy {
+			result[k] = v
+		}
+		for k, v := range bphsResult {
+			result[k] = v
+		}
+		reply.KeyValuePairs = result
+		return reply, nil
+	}
+
 	if st.firstGC {
 		result, err := kvs.firstGCScan(st, in.StartKey, in.EndKey)
 		if err != nil {
@@ -209,6 +233,23 @@ func (kvs *KVServer) StartGet(st stateSnapshot, args *kvrpc.GetInRaftRequest) *k
 		}
 		reply.Value = value
 		return reply
+	}
+	if st.bphs != nil {
+		value, found, err := st.bphs.Get(key)
+		if err != nil {
+			fmt.Printf("[READ] BPHS 点查失败，按 ErrInternal 上报: %v\n", err)
+			reply.Err = raft.ErrInternal
+			reply.Value = raft.NoKey
+			return reply
+		}
+		if !found {
+			// Bootstrap is allowed to overlap the tail of the transition GC. Those
+			// writes live in the legacy currentLog/currentStore and are not part of the
+			// base partitions yet, so fall through to the old read path.
+		} else {
+			reply.Value = value
+			return reply
+		}
 	}
 	// **这里不再预查一次"是不是内联"。**
 	//

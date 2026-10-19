@@ -128,6 +128,13 @@ type Config struct {
 	// rewritten stay proportional to the new data absorbed; see gcloop.go.
 	AbsorbRatio float64
 
+	// BPHS enables the static Bootstrap-Partitioned Hybrid Storage prototype after
+	// the first partition-producing GC. Writes then go to the owning partition's
+	// local record log (small values inline, large values in a partition VLog)
+	// instead of the global tail store. Dynamic range splitting is not included.
+	BPHS           bool
+	BPHSMemtableMB int
+
 	// LSM-Raft baseline (lsmraft.go): span size and idle cut.
 	SSTSpanMB int
 	SSTIdleMs int

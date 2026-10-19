@@ -4,6 +4,7 @@ package kvstore
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/api/raftrpc"
@@ -207,6 +208,7 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 	wake := kvs.applyWakeBuf[:0]
 	applied := 0
 	pending := false // 自上次落库以来有没有需要写的东西
+	var bphsDirty map[int]struct{}
 
 	for i := range msgs {
 		msg := msgs[i]
@@ -248,6 +250,17 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 			}
 			kvs.lastPutTime = time.Now() // 更新put操作时间
 			switch {
+			case kvs.bphs != nil:
+				part, err := kvs.bphs.Put(op.Key, op.Value, uint32(index))
+				if err != nil {
+					// The record is already committed by Raft. Continuing would advance applied
+					// without materializing it, so fail loudly and let restart replay it.
+					log.Fatalf("BPHS apply key=%q index=%d: %v", op.Key, index, err)
+				}
+				if bphsDirty == nil {
+					bphsDirty = make(map[int]struct{})
+				}
+				bphsDirty[part] = struct{}{}
 			case kvs.inlinePlacement && kvs.shouldInline(len(op.Value)) && kvs.takeInlineBudget(len(op.Key)+len(op.Value)):
 				// 小值直接落在存储引擎里：读路径因此缩短为一次点查，不必再按偏移读 valuelog。
 				// 额度用完就落到下面的偏移分支，与 nezha 相同——理由见 takeInlineBudget。
@@ -305,6 +318,9 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 	}
 
 	if pending {
+		if err := kvs.bphs.SyncPartitions(bphsDirty); err != nil {
+			log.Fatalf("sync BPHS before applied=%d: %v", applied, err)
+		}
 		rows = kvs.flushApplyRows(rows, applied)
 	}
 	kvs.applyRowsBuf, kvs.applyWakeBuf = rows, wake

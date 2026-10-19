@@ -34,6 +34,7 @@ func (kvs *KVServer) gcLoop(ctx context.Context) {
 		curLog := kvs.currentLog
 		firstGC, lastFinish, inProgress := kvs.FirstGC, kvs.lastGCFinish, kvs.gcInProgress
 		partsTotal := kvs.lastPartitions.TotalSize()
+		bphsActive := kvs.bphs != nil
 		kvs.mu.Unlock()
 
 		// 检查文件是否存在并且大小是否超过4GB
@@ -57,6 +58,13 @@ func (kvs *KVServer) gcLoop(ctx context.Context) {
 			// 解析（unknown record tag: 0x76 —— 那是 value 的首字符）。
 			// 更要命的是 GC 在搬运之前就把 persister 换成了新的空库，
 			// 于是失败之后所有 GET 都返回 NOKEY。
+			continue
+		}
+		if bphsActive {
+			// BPHS owns post-bootstrap writes and performs partition-local L0
+			// compaction. Re-entering global absorb would change the static ownership
+			// boundaries underneath the BPHS overlays; dynamic repartitioning is a later
+			// phase. The Raft log remains the recovery WAL while BPHS is active.
 			continue
 		}
 

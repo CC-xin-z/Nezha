@@ -46,6 +46,7 @@ type stateSnapshot struct {
 	startGC      bool
 	anotherStart bool
 	anotherEnd   bool
+	bphs         *bphsStore
 	// lease 把读锁的生命周期与"这份快照上所有读者"绑在一起。由 beginRead 填上；
 	// 派生 goroutine 一律走 st.spawn，理由见 storeLease 的注释。
 	lease *storeLease
@@ -96,6 +97,7 @@ func (kvs *KVServer) captureState() stateSnapshot {
 		startGC:      kvs.startGC,
 		anotherStart: kvs.anotherStartGC,
 		anotherEnd:   kvs.anotherEndGC,
+		bphs:         kvs.bphs,
 	}
 }
 

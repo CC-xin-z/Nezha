@@ -87,6 +87,7 @@ type snapshotManifest struct {
 
 	CurrentLog      string `json:"current_log"`       // 当前日志的文件名
 	CurrentLogBytes int64  `json:"current_log_bytes"` // 只取前这么多字节
+	BPHS            []bphsSnapshotPartition `json:"bphs,omitempty"`
 	// StoreSST 为空表示库里一行都没有（全新节点，或者上一轮 GC 之后没写过）。
 	StoreSST  string `json:"store_sst"`
 	StoreRows int    `json:"store_rows"`
@@ -154,6 +155,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 	numGC, currentLog, sortedFile := kvs.numGC, kvs.currentLog, kvs.sortedFilePath
 	ps, releasePins := kvs.pinPartitionsLocked()
+	bphs := kvs.bphs
 	manifest := kvs.lastPartitions.manifest()
 	kvs.mu.Unlock()
 
@@ -200,6 +202,21 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		release()
 		return nil, fmt.Errorf("snapshot: store applied=%d is ahead of the log cut at %d", applied, cut.LastIndex)
 	}
+	var bphsCut []bphsSnapshotPartition
+	if bphs != nil {
+		bphsCut, err = bphs.SnapshotCut()
+		if err != nil {
+			release()
+			return nil, fmt.Errorf("cut BPHS state: %w", err)
+		}
+		kvs.mu.Lock()
+		changedAfterBPHS := kvs.gcInProgress || kvs.numGC != numGC || kvs.currentLog != currentLog
+		kvs.mu.Unlock()
+		if changedAfterBPHS {
+			release()
+			return nil, errSnapshotBusy
+		}
+	}
 
 	sm := snapshotManifest{
 		LastIncludedIndex: cut.BaseIndex,
@@ -212,6 +229,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		Partitions:        manifest,
 		CurrentLog:        filepath.Base(cut.Path),
 		CurrentLogBytes:   cut.Bytes,
+		BPHS:              bphsCut,
 		StoreRows:         rows,
 	}
 	if rows > 0 {
@@ -242,6 +260,18 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 			// O(数据量) 变成 O(索引量)——实测 34 个分区 / 278MB，读索引 3.5ms，
 			// 扫描重建 266ms。
 			files = append(files, raft.SSTableFile{Path: idx})
+		}
+	}
+	if bphs != nil {
+		for _, part := range bphsCut {
+			if part.RecordsBytes > 0 {
+				files = append(files,
+					raft.SSTableFile{Path: filepath.Join(bphs.Dir(), part.RecordsFile), Limit: part.RecordsBytes})
+			}
+			if part.VLogBytes > 0 {
+				files = append(files,
+					raft.SSTableFile{Path: filepath.Join(bphs.Dir(), part.VLogFile), Limit: part.VLogBytes})
+			}
 		}
 	}
 
@@ -287,6 +317,7 @@ type snapshotInstallNames struct {
 	logPath    string // 日志文件的落位
 	sortedBase string // 分区组的基名（不含 .pN）
 	storePath  string // 新库的目录
+	bphsDir    string // BPHS 分区记录与 VLog 的目录
 }
 
 func (kvs *KVServer) snapshotInstallNames(idx int) snapshotInstallNames {
@@ -297,6 +328,7 @@ func (kvs *KVServer) snapshotInstallNames(idx int) snapshotInstallNames {
 		logPath:    filepath.Join(vlog, fmt.Sprintf("RaftState_snap%d.log", idx)),
 		sortedBase: filepath.Join(vlog, fmt.Sprintf("RaftState_sorted_snap%d", idx)),
 		storePath:  filepath.Join(kvs.dataDir, "data", "dbfile", fmt.Sprintf("keyIndex_snap%d", idx)),
+		bphsDir:    filepath.Join(kvs.dataDir, "data", fmt.Sprintf("bphs_snap%d", idx)),
 	}
 }
 
@@ -318,6 +350,14 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	// GET 上变成一个 NOKEY，不报错。
 	if err := checkSnapshotFiles(sm, byName); err != nil {
 		util.EPrintf("[SNAPSHOT] %v", err)
+		return kvs.appliedIndexNow(), raftrpc.InstallSSTableStatus_FAILED
+	}
+	if len(sm.BPHS) > 0 && !kvs.bphsEnabled {
+		util.EPrintf("[SNAPSHOT] 快照携带 BPHS 状态，但本节点未启用 -bphs")
+		return kvs.appliedIndexNow(), raftrpc.InstallSSTableStatus_FAILED
+	}
+	if len(sm.Partitions) > 0 && kvs.bphsEnabled && len(sm.BPHS) == 0 {
+		util.EPrintf("[SNAPSHOT] BPHS 节点收到不含 BPHS 状态的快照")
 		return kvs.appliedIndexNow(), raftrpc.InstallSSTableStatus_FAILED
 	}
 
@@ -361,6 +401,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	}
 	kvs.installing = true
 	prevPartitions, prevLog, prevStore := kvs.lastPartitions, kvs.currentLog, kvs.currentDBPath
+	prevBPHS, prevBPHSDir := kvs.bphs, kvs.bphsDir
 	kvs.mu.Unlock()
 
 	// Raft 侧再判一次"会不会后退"。上面那条用的是 KV 层的 applied，而真正不能后退的是
@@ -387,6 +428,36 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	}
 	if err := os.MkdirAll(names.indexDir, 0o755); err != nil {
 		return fail("建索引目录: %v", err)
+	}
+	if len(sm.BPHS) > 0 {
+		if err := os.RemoveAll(names.bphsDir); err != nil {
+			return fail("清理 BPHS 安装目录: %v", err)
+		}
+		if err := os.MkdirAll(names.bphsDir, 0o755); err != nil {
+			return fail("建 BPHS 安装目录: %v", err)
+		}
+		for _, part := range sm.BPHS {
+			for _, f := range []struct {
+				name string
+				size int64
+			}{
+				{part.RecordsFile, part.RecordsBytes},
+				{part.VLogFile, part.VLogBytes},
+			} {
+				dst := filepath.Join(names.bphsDir, f.name)
+				if src := byName[f.name]; src != "" {
+					if err := os.Rename(src, dst); err != nil {
+						return fail("BPHS 文件 %s 落位: %v", f.name, err)
+					}
+				} else if f.size == 0 {
+					if err := os.WriteFile(dst, nil, 0o644); err != nil {
+						return fail("创建空 BPHS 文件 %s: %v", f.name, err)
+					}
+				} else {
+					return fail("BPHS 文件 %s 缺失", f.name)
+				}
+			}
+		}
 	}
 
 	// 1) 分区与旁挂索引落位，同时把清单里的文件名改成落位后的名字。
@@ -448,6 +519,16 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		store.Close()
 		return fail("装载快照的分区组: %v", err)
 	}
+	var newBPHS *bphsStore
+	if kvs.bphsEnabled && len(sm.BPHS) > 0 {
+		newBPHS, err = openBPHSStore(kvs, newParts, names.bphsDir,
+			kvs.bphsMemtableBytes, kvs.inlineCacheBytes, uint32(sm.AppliedIndex))
+		if err != nil {
+			newParts.Close()
+			store.Close()
+			return fail("装载快照的 BPHS 状态: %v", err)
+		}
+	}
 
 	// 5) 换掉内存里的状态机指针，再让 Raft 接上新日志。
 	kvs.mu.Lock()
@@ -471,6 +552,12 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		kvs.FirstGC = false
 		kvs.startGC = true
 		kvs.lastGCFinish = true
+	}
+	kvs.bphs = newBPHS
+	if newBPHS != nil {
+		kvs.bphsDir = names.bphsDir
+	} else {
+		kvs.bphsDir = ""
 	}
 	kvs.raft.SetCurrentPersister(store)
 	kvs.mu.Unlock()
@@ -509,6 +596,16 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	if waited := time.Since(retireStart); waited > 5*time.Second {
 		fmt.Printf("[SNAPSHOT] 等在途的读者放开旧库等了 %v（很可能有一次长范围扫描）\n",
 			waited.Round(time.Millisecond))
+	}
+	if prevBPHS != nil {
+		if err := prevBPHS.Close(); err != nil {
+			util.EPrintf("[SNAPSHOT] 关闭被替换的 BPHS 状态失败: %v", err)
+		}
+	}
+	if prevBPHSDir != "" && prevBPHSDir != names.bphsDir {
+		if err := os.RemoveAll(prevBPHSDir); err != nil {
+			util.EPrintf("[SNAPSHOT] 删除被替换的 BPHS 目录 %s 失败: %v", prevBPHSDir, err)
+		}
 	}
 	if prevStore != "" && prevStore != names.storePath {
 		if err := os.RemoveAll(prevStore); err != nil {
@@ -556,6 +653,9 @@ func readSnapshotManifest(path string) (snapshotManifest, error) {
 	if sm.LastIncludedIndex > sm.AppliedIndex {
 		return sm, fmt.Errorf("快照清单自相矛盾：位点 %d 超过 applied %d", sm.LastIncludedIndex, sm.AppliedIndex)
 	}
+	if len(sm.BPHS) > 0 && len(sm.BPHS) != len(sm.Partitions) {
+		return sm, fmt.Errorf("快照 BPHS 分区数 %d 与分区文件数 %d 不一致", len(sm.BPHS), len(sm.Partitions))
+	}
 	return sm, nil
 }
 
@@ -579,6 +679,30 @@ func checkSnapshotFiles(sm snapshotManifest, byName map[string]string) error {
 		// 去撞一个说不出哪里不对的 "unexpected EOF"。
 		if st.Size() != m.Size {
 			return fmt.Errorf("快照的分区 %s 清单说 %d 字节，收到 %d 字节", m.Path, m.Size, st.Size())
+		}
+	}
+	for _, m := range sm.BPHS {
+		for _, f := range []struct {
+			name string
+			size int64
+		}{
+			{m.RecordsFile, m.RecordsBytes},
+			{m.VLogFile, m.VLogBytes},
+		} {
+			if f.size == 0 {
+				continue
+			}
+			p := byName[f.name]
+			if p == "" {
+				return fmt.Errorf("快照缺 BPHS 文件 %s", f.name)
+			}
+			st, err := os.Stat(p)
+			if err != nil {
+				return fmt.Errorf("快照的 BPHS 文件 %s: %v", f.name, err)
+			}
+			if st.Size() != f.size {
+				return fmt.Errorf("快照的 BPHS 文件 %s 清单说 %d 字节，收到 %d 字节", f.name, f.size, st.Size())
+			}
 		}
 	}
 	return nil

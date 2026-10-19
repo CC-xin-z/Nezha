@@ -190,10 +190,25 @@ type KVServer struct {
 	// 用比例而不是绝对阈值，是为了让"重写多少"与"因此吸收了多少新数据"成正比——
 	// 否则第 k 轮重写 k×阈值 却只吸收一个阈值，总代价 O(n²)。见 gcloop.go 的注释。
 	absorbRatio float64
+
+	// BPHS 在首轮 GC 形成固定 Key-Range 分区后启用。之后新 PUT 进入目标分区的
+	// record log / VLog，不再写入全局尾部索引。指针和 enabled 开关都在 kvs.mu 下切换。
+	bphsEnabled       bool
+	bphs              *bphsStore
+	bphsMemtableBytes int64
+	bphsDir           string
 }
 
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	kv.mu.Lock()
+	bphs := kv.bphs
+	kv.bphs = nil
+	kv.bphsEnabled = false
+	kv.mu.Unlock()
+	if bphs != nil {
+		_ = bphs.Close()
+	}
 	kv.raft.Kill()
 }
 
@@ -265,6 +280,9 @@ func New(cfg Config) (*KVServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.BPHS && (!cfg.KVSeparation || !cfg.GCEnabled) {
+		return nil, fmt.Errorf("-bphs requires KV separation and GC (use -system nezha)")
+	}
 	if cfg.DataDir == "" || cfg.DataDir == "." {
 		if cfg.DataDir, err = os.Getwd(); err != nil {
 			return nil, err
@@ -310,6 +328,8 @@ func New(cfg Config) (*KVServer, error) {
 
 		partitionTargetBytes: int64(cfg.PartitionTargetMB) << 20,
 		absorbRatio:          cfg.AbsorbRatio,
+		bphsEnabled:          cfg.BPHS,
+		bphsMemtableBytes:    int64(cfg.BPHSMemtableMB) << 20,
 	}
 	// PASV switches off the storage engine's WAL. RocksDB reads that option once, when
 	// the store is opened, so it must be set before recoverOrInit.
@@ -351,10 +371,10 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
-		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20)
+		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.BPHS)
 
 	// A fresh node opens the initial store; a restarted node restores GC state, the
 	// sorted-file index and the applied index, and returns the log files Raft must replay.
