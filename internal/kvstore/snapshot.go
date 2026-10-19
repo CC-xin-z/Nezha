@@ -168,8 +168,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	manifestPath := filepath.Join(dir, snapshotManifestName)
 	release := func() {
 		releasePins()
-		os.Remove(sstPath)
-		os.Remove(manifestPath)
+		os.RemoveAll(dir)
 	}
 
 	rows, applied, err := kvs.persister.ExportStoreSST(sstPath)
@@ -204,7 +203,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 	var bphsCut []bphsSnapshotPartition
 	if bphs != nil {
-		bphsCut, err = bphs.SnapshotCut()
+		bphsCut, err = bphs.SnapshotCut(dir, applied)
 		if err != nil {
 			release()
 			return nil, fmt.Errorf("cut BPHS state: %w", err)
@@ -266,11 +265,23 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		for _, part := range bphsCut {
 			if part.RecordsBytes > 0 {
 				files = append(files,
-					raft.SSTableFile{Path: filepath.Join(bphs.Dir(), part.RecordsFile), Limit: part.RecordsBytes})
+					raft.SSTableFile{Path: filepath.Join(dir, part.RecordsFile), Limit: part.RecordsBytes})
 			}
 			if part.VLogBytes > 0 {
 				files = append(files,
-					raft.SSTableFile{Path: filepath.Join(bphs.Dir(), part.VLogFile), Limit: part.VLogBytes})
+					raft.SSTableFile{Path: filepath.Join(dir, part.VLogFile), Limit: part.VLogBytes})
+			}
+			if part.BaseFile != "" {
+				files = append(files,
+					raft.SSTableFile{Path: filepath.Join(dir, part.BaseFile), Limit: part.BaseBytes})
+			}
+			if part.BaseIndexFile != "" {
+				files = append(files,
+					raft.SSTableFile{Path: filepath.Join(dir, part.BaseIndexFile), Limit: part.BaseIndexBytes})
+			}
+			if part.ManifestFile != "" {
+				files = append(files,
+					raft.SSTableFile{Path: filepath.Join(dir, part.ManifestFile), Limit: part.ManifestBytes})
 			}
 		}
 	}
@@ -436,25 +447,61 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		if err := os.MkdirAll(names.bphsDir, 0o755); err != nil {
 			return fail("建 BPHS 安装目录: %v", err)
 		}
+		if err := os.MkdirAll(filepath.Join(names.bphsDir, sparseIndexDir), 0o755); err != nil {
+			return fail("建 BPHS 索引目录: %v", err)
+		}
 		for _, part := range sm.BPHS {
 			for _, f := range []struct {
-				name string
-				size int64
+				label string
+				name  string
+				size  int64
 			}{
-				{part.RecordsFile, part.RecordsBytes},
-				{part.VLogFile, part.VLogBytes},
+				{"records", part.RecordsFile, part.RecordsBytes},
+				{"vlog", part.VLogFile, part.VLogBytes},
 			} {
-				dst := filepath.Join(names.bphsDir, f.name)
+				dst := filepath.Join(names.bphsDir, filepath.Base(f.name))
 				if src := byName[f.name]; src != "" {
 					if err := os.Rename(src, dst); err != nil {
-						return fail("BPHS 文件 %s 落位: %v", f.name, err)
+						return fail("BPHS %s 文件 %s 落位: %v", f.label, f.name, err)
 					}
 				} else if f.size == 0 {
 					if err := os.WriteFile(dst, nil, 0o644); err != nil {
-						return fail("创建空 BPHS 文件 %s: %v", f.name, err)
+						return fail("创建空 BPHS %s 文件 %s: %v", f.label, f.name, err)
 					}
 				} else {
-					return fail("BPHS 文件 %s 缺失", f.name)
+					return fail("BPHS %s 文件 %s 缺失", f.label, f.name)
+				}
+			}
+			for _, f := range []struct {
+				label string
+				name  string
+				size  int64
+				dst   string
+			}{
+				{"base", part.BaseFile, part.BaseBytes, filepath.Join(names.bphsDir, filepath.Base(part.BaseFile))},
+				{"manifest", part.ManifestFile, part.ManifestBytes,
+					filepath.Join(names.bphsDir, filepath.Base(part.ManifestFile))},
+			} {
+				if f.name == "" {
+					continue
+				}
+				src := byName[f.name]
+				if src == "" {
+					return fail("BPHS %s 文件 %s 缺失", f.label, f.name)
+				}
+				if err := os.Rename(src, f.dst); err != nil {
+					return fail("BPHS %s 文件 %s 落位: %v", f.label, f.name, err)
+				}
+			}
+			if part.BaseIndexFile != "" {
+				src := byName[part.BaseIndexFile]
+				if src == "" {
+					// 旁挂索引可以重建，缺了不影响正确性。
+					continue
+				}
+				dst := filepath.Join(names.bphsDir, sparseIndexDir, filepath.Base(part.BaseIndexFile))
+				if err := os.Rename(src, dst); err != nil {
+					return fail("BPHS base index 文件 %s 落位: %v", part.BaseIndexFile, err)
 				}
 			}
 		}
@@ -683,25 +730,40 @@ func checkSnapshotFiles(sm snapshotManifest, byName map[string]string) error {
 	}
 	for _, m := range sm.BPHS {
 		for _, f := range []struct {
-			name string
-			size int64
+			label      string
+			name       string
+			size       int64
+			allowEmpty bool
 		}{
-			{m.RecordsFile, m.RecordsBytes},
-			{m.VLogFile, m.VLogBytes},
+			{"records", m.RecordsFile, m.RecordsBytes, true},
+			{"vlog", m.VLogFile, m.VLogBytes, true},
+			{"base", m.BaseFile, m.BaseBytes, false},
+			{"base index", m.BaseIndexFile, m.BaseIndexBytes, true},
+			{"manifest", m.ManifestFile, m.ManifestBytes, false},
 		} {
-			if f.size == 0 {
+			if f.name == "" {
+				if f.size != 0 {
+					return fmt.Errorf("快照 BPHS 分区 %d 的 %s 有长度但没有文件名", m.Index, f.label)
+				}
 				continue
+			}
+			if f.size == 0 && f.allowEmpty {
+				continue
+			}
+			if f.size <= 0 {
+				return fmt.Errorf("快照 BPHS 分区 %d 的 %s %s 长度非法: %d", m.Index, f.label, f.name, f.size)
 			}
 			p := byName[f.name]
 			if p == "" {
-				return fmt.Errorf("快照缺 BPHS 文件 %s", f.name)
+				return fmt.Errorf("快照缺 BPHS %s 文件 %s", f.label, f.name)
 			}
 			st, err := os.Stat(p)
 			if err != nil {
-				return fmt.Errorf("快照的 BPHS 文件 %s: %v", f.name, err)
+				return fmt.Errorf("快照的 BPHS %s 文件 %s: %v", f.label, f.name, err)
 			}
 			if st.Size() != f.size {
-				return fmt.Errorf("快照的 BPHS 文件 %s 清单说 %d 字节，收到 %d 字节", f.name, f.size, st.Size())
+				return fmt.Errorf("快照的 BPHS %s 文件 %s 清单说 %d 字节，收到 %d 字节",
+					f.label, f.name, f.size, st.Size())
 			}
 		}
 	}
@@ -778,6 +840,10 @@ func (kvs *KVServer) clearOrphanSnapshotArtifacts(st kvState) {
 		filepath.Base(st.CurrentDB):  true,
 		filepath.Base(st.OldDB):      true,
 	}
+	keepBPHSDir := ""
+	if st.BPHSDir != "" {
+		keepBPHSDir = filepath.Join(kvs.dataDir, filepath.Clean(st.BPHSDir))
+	}
 	for _, m := range st.Partitions {
 		keep[filepath.Base(m.Path)] = true
 		keep[filepath.Base(sparseIndexPath(m.Path))] = true
@@ -787,6 +853,7 @@ func (kvs *KVServer) clearOrphanSnapshotArtifacts(st kvState) {
 		filepath.Join(kvs.dataDir, "data", "valuelog", "*snap*"),
 		filepath.Join(kvs.dataDir, "data", "valuelog", sparseIndexDir, "*snap*"),
 		filepath.Join(kvs.dataDir, "data", "dbfile", "*snap*"),
+		filepath.Join(kvs.dataDir, "data", "bphs_snap*"),
 	}
 	for _, g := range globs {
 		matches, err := filepath.Glob(g)
@@ -794,6 +861,9 @@ func (kvs *KVServer) clearOrphanSnapshotArtifacts(st kvState) {
 			continue
 		}
 		for _, p := range matches {
+			if keepBPHSDir != "" && filepath.Clean(p) == filepath.Clean(keepBPHSDir) {
+				continue
+			}
 			if keep[filepath.Base(p)] {
 				continue
 			}

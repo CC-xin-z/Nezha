@@ -2,10 +2,12 @@ package kvstore
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -15,20 +17,50 @@ import (
 
 const bphsL0CompactionTrigger = 4
 
+type bphsPartitionManifest struct {
+	Generation uint64 `json:"generation"`
+	BaseFile   string `json:"base_file,omitempty"`
+	BaseSize   int64  `json:"base_size,omitempty"`
+	MaxVersion uint32 `json:"max_version"`
+	Lo         string `json:"lo,omitempty"`
+	Hi         string `json:"hi,omitempty"`
+	Entries    int    `json:"entries"`
+}
+
+func bphsPartitionManifestPath(dir string, partition int) string {
+	return filepath.Join(dir, fmt.Sprintf("p%06d.manifest.json", partition))
+}
+
+func loadBPHSPartitionManifest(dir string, partition int) (bphsPartitionManifest, bool, error) {
+	var m bphsPartitionManifest
+	data, err := os.ReadFile(bphsPartitionManifestPath(dir, partition))
+	if os.IsNotExist(err) {
+		return m, false, nil
+	}
+	if err != nil {
+		return m, false, err
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return m, false, err
+	}
+	return m, true, nil
+}
+
 // bphsPartition 是固定 Key Range 上的本地写入层。
 //
 // base 是全局分区 GC 产出的不可变有序文件；memtable 和 records 保存 BPHS 启用后的
 // 新版本。MemTable 达到预算后刷成 L0，l0 数量达到阈值时只在本分区内合并；
 // records 仍是持久化 WAL，重启时只重放比最新 L0 更新的版本。
 type bphsPartition struct {
-	mu      sync.RWMutex
-	index   int
-	base    *SortedFileIndex
-	mem     *partitionMemtable
-	records *partitionRecordLog
-	vlog    *partitionVLog
-	l0      []*SortedFileIndex // 从旧到新
-	gen     uint64
+	mu        sync.RWMutex
+	index     int
+	base      *SortedFileIndex
+	baseLocal bool
+	mem       *partitionMemtable
+	records   *partitionRecordLog
+	vlog      *partitionVLog
+	l0        []*SortedFileIndex // 从旧到新
+	gen       uint64
 }
 
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
@@ -58,42 +90,90 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		inlineCacheBytes: inlineCacheBytes,
 	}
 	for i, basePart := range base.parts {
+		meta, hasMeta, err := loadBPHSPartitionManifest(dir, i)
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("load partition %d BPHS manifest: %w", i, err)
+		}
+		localBase := basePart
+		localBaseLoaded := false
+		maxCoveredVersion := uint32(0)
+		gen := uint64(1)
+		if hasMeta {
+			gen = meta.Generation
+			maxCoveredVersion = meta.MaxVersion
+			if meta.BaseFile != "" {
+				localBase, err = loadBPHSBaseFile(kvs, dir, meta, inlineCacheBytes)
+				if err != nil {
+					s.Close()
+					return nil, fmt.Errorf("load partition %d BPHS base: %w", i, err)
+				}
+				localBaseLoaded = true
+			}
+		}
 		records, err := openPartitionRecordLog(filepath.Join(dir, fmt.Sprintf("p%06d.records", i)))
 		if err != nil {
+			if localBaseLoaded {
+				localBase.closePool()
+			}
 			s.Close()
 			return nil, fmt.Errorf("open partition %d record log: %w", i, err)
 		}
 		vlog, err := openPartitionVLog(filepath.Join(dir, fmt.Sprintf("p%06d.vlog", i)))
 		if err != nil {
 			records.Close()
+			if localBaseLoaded {
+				localBase.closePool()
+			}
 			s.Close()
 			return nil, fmt.Errorf("open partition %d vlog: %w", i, err)
 		}
 		part := &bphsPartition{
-			index:   i,
-			base:    basePart,
-			mem:     newPartitionMemtable(memtableBytes),
-			records: records,
-			vlog:    vlog,
-			gen:     1,
+			index:     i,
+			base:      localBase,
+			baseLocal: localBaseLoaded,
+			mem:       newPartitionMemtable(memtableBytes),
+			records:   records,
+			vlog:      vlog,
+			gen:       gen,
 		}
-		l0, maxL0Version, err := loadPartitionL0Files(kvs, dir, i, inlineCacheBytes)
+		l0, err := loadPartitionL0Files(kvs, dir, i, inlineCacheBytes)
 		if err != nil {
 			records.Close()
 			vlog.Close()
+			if localBaseLoaded {
+				localBase.closePool()
+			}
 			s.Close()
 			return nil, fmt.Errorf("load partition %d L0: %w", i, err)
 		}
-		part.l0 = l0
+		for _, loaded := range l0 {
+			if localBaseLoaded && loaded.maxVersion <= maxCoveredVersion {
+				loaded.file.closePool()
+				for _, p := range []string{loaded.file.FilePath, sparseIndexPath(loaded.file.FilePath)} {
+					if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+						fmt.Printf("[RECOVER] 删除已被 BPHS base 覆盖的 L0 %s 失败: %v\n", p, err)
+					}
+				}
+				continue
+			}
+			part.l0 = append(part.l0, loaded.file)
+			if loaded.maxVersion > maxCoveredVersion {
+				maxCoveredVersion = loaded.maxVersion
+			}
+		}
 		replayed, err := records.ScanAll()
 		if err != nil {
 			records.Close()
 			vlog.Close()
+			if localBaseLoaded {
+				localBase.closePool()
+			}
 			s.Close()
 			return nil, fmt.Errorf("replay partition %d records: %w", i, err)
 		}
 		for _, rec := range replayed {
-			if rec.Version <= maxL0Version {
+			if rec.Version <= maxCoveredVersion {
 				continue
 			}
 			if maxVersion > 0 && rec.Version > maxVersion {
@@ -115,11 +195,22 @@ func (s *bphsStore) SetBase(base *PartitionSet) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, part := range s.parts {
+		part.mu.Lock()
+	}
+	defer func() {
+		for _, part := range s.parts {
+			part.mu.Unlock()
+		}
+	}()
+	for i, part := range s.parts {
+		if part.baseLocal {
+			return fmt.Errorf("BPHS partition %d has a compacted local base; global base replacement is not supported", i)
+		}
+	}
 	s.base = base
 	for i, part := range s.parts {
-		part.mu.Lock()
 		part.base = base.parts[i]
-		part.mu.Unlock()
 	}
 	return nil
 }
@@ -206,6 +297,171 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 			return fmt.Errorf("compact partition %d L0: %w", part.index, err)
 		}
 	}
+	if s.shouldCompactPartitionLocked(part) {
+		if err := s.compactPartitionLocked(part); err != nil {
+			return fmt.Errorf("compact partition %d base: %w", part.index, err)
+		}
+	}
+	return nil
+}
+
+func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
+	if part == nil || len(part.l0) == 0 {
+		return false
+	}
+	var delta int64
+	for _, run := range part.l0 {
+		delta += run.FileSize
+	}
+	threshold := int64(16 << 20)
+	if part.base != nil {
+		if want := part.base.FileSize / 4; want > threshold {
+			threshold = want
+		}
+	}
+	return delta >= threshold
+}
+
+func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
+	if part == nil || (len(part.l0) == 0 && part.mem.Len() == 0) {
+		return nil
+	}
+	if err := part.vlog.Sync(); err != nil {
+		return err
+	}
+	if err := part.records.Sync(); err != nil {
+		return err
+	}
+
+	merged := make(map[string]bphsRecord)
+	putLatest := func(rec bphsRecord) {
+		old, ok := merged[rec.Key]
+		if !ok || rec.Version >= old.Version {
+			merged[rec.Key] = rec
+		}
+	}
+
+	if part.base != nil {
+		records, err := readRawSortedFile(part.base.FilePath)
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			putLatest(rec)
+		}
+	}
+	for _, run := range part.l0 {
+		records, err := readBPHSSortedFile(run.FilePath)
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			value, err := s.recordValue(part, rec)
+			if err != nil {
+				return err
+			}
+			putLatest(bphsRecord{
+				Key: rec.Key, Version: rec.Version, Kind: bphsInlineRecord, Value: value,
+			})
+		}
+	}
+	for _, rec := range part.mem.Sorted() {
+		value, err := s.recordValue(part, rec)
+		if err != nil {
+			return err
+		}
+		putLatest(bphsRecord{
+			Key: rec.Key, Version: rec.Version, Kind: bphsInlineRecord, Value: value,
+		})
+	}
+
+	records := make([]bphsRecord, 0, len(merged))
+	var cutVersion uint32
+	for _, rec := range merged {
+		if rec.Version > cutVersion {
+			cutVersion = rec.Version
+		}
+		records = append(records, rec)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+
+	name := fmt.Sprintf("p%06d_base_%020d.sst", part.index, time.Now().UnixNano())
+	path := filepath.Join(s.dir, name)
+	newBase, err := s.kvs.flushBPHSBaseFile(records, path, s.inlineCacheBytes)
+	if err != nil {
+		return err
+	}
+	if newBase == nil {
+		return nil
+	}
+
+	nextGen := part.gen + 1
+	meta := bphsPartitionManifest{
+		Generation: nextGen,
+		BaseFile:   filepath.Base(path),
+		BaseSize:   newBase.FileSize,
+		MaxVersion: cutVersion,
+		Lo:         newBase.Lo,
+		Hi:         newBase.Hi,
+		Entries:    newBase.Entries,
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		newBase.closePool()
+		os.Remove(path)
+		os.Remove(sparseIndexPath(path))
+		return err
+	}
+	if err := raft.WriteFileAtomic(bphsPartitionManifestPath(s.dir, part.index), data); err != nil {
+		newBase.closePool()
+		os.Remove(path)
+		os.Remove(sparseIndexPath(path))
+		return err
+	}
+
+	oldBase, oldLocal := part.base, part.baseLocal
+	oldL0 := part.l0
+	part.base = newBase
+	part.baseLocal = true
+	part.gen = nextGen
+	part.l0 = nil
+	part.mem.Reset()
+
+	for _, run := range oldL0 {
+		run.closePool()
+		os.Remove(run.FilePath)
+		os.Remove(sparseIndexPath(run.FilePath))
+	}
+
+	if err := part.records.Close(); err != nil {
+		return err
+	}
+	recordPath := part.records.Path()
+	if err := os.Remove(recordPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	part.records, err = openPartitionRecordLog(recordPath)
+	if err != nil {
+		return err
+	}
+
+	if err := part.vlog.Close(); err != nil {
+		return err
+	}
+	vlogPath := part.vlog.Path()
+	if err := os.Remove(vlogPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	part.vlog, err = openPartitionVLog(vlogPath)
+	if err != nil {
+		return err
+	}
+
+	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
+		oldBase.closePool()
+		os.Remove(oldBase.FilePath)
+		os.Remove(sparseIndexPath(oldBase.FilePath))
+	}
 	return nil
 }
 
@@ -275,33 +531,122 @@ func readBPHSSortedFile(path string) ([]bphsRecord, error) {
 	}
 }
 
-func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheBytes int64) ([]*SortedFileIndex, uint32, error) {
+func readRawSortedFile(path string) ([]bphsRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 1<<20)
+	var records []bphsRecord
+	for {
+		entry, _, err := ReadEntry(reader, 0)
+		if err == io.EOF {
+			return records, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, bphsRecord{
+			Key: entry.Key, Version: entry.Index, Kind: bphsInlineRecord, Value: entry.Value,
+		})
+	}
+}
+
+func (kvs *KVServer) flushBPHSBaseFile(records []bphsRecord, path string, inlineCacheBytes int64) (*SortedFileIndex, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	writer := bufio.NewWriter(file)
+	sparse := NewSparseIndexBuilder(kvs.indexBlockBytes)
+	var offset int64
+	lo, hi := records[0].Key, records[0].Key
+	for _, rec := range records {
+		entry := &raft.Entry{Index: rec.Version, Key: rec.Key, Value: rec.Value}
+		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
+			file.Close()
+			os.Remove(path)
+			return nil, err
+		}
+		size := int64(20 + len(rec.Key) + len(rec.Value))
+		sparse.Observe(rec.Key, offset, size)
+		offset += size
+		hi = rec.Key
+	}
+	if err := writer.Flush(); err != nil {
+		file.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return nil, err
+	}
+	sparseEntries := sparse.Build()
+	if err := writeSparseIndex(path, sparseEntries, kvs.indexBlockBytes, offset); err != nil {
+		os.Remove(path)
+		os.Remove(sparseIndexPath(path))
+		return nil, err
+	}
+	pool, err := NewFileDescriptorPool(path, partitionPoolSize)
+	if err != nil {
+		os.Remove(path)
+		os.Remove(sparseIndexPath(path))
+		return nil, err
+	}
+	return &SortedFileIndex{
+		Sparse:       sparseEntries,
+		FileSize:     offset,
+		InlineValues: NewInlineCache(inlineCacheBytes),
+		FilePath:     path,
+		Lo:           lo,
+		Hi:           hi,
+		pool:         pool,
+		Entries:      len(records),
+	}, nil
+}
+
+type bphsLoadedL0 struct {
+	file       *SortedFileIndex
+	maxVersion uint32
+}
+
+func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheBytes int64) ([]bphsLoadedL0, error) {
 	pattern := filepath.Join(dir, fmt.Sprintf("p%06d_l0_*.sst", partition))
 	paths, err := filepath.Glob(pattern)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	var out []*SortedFileIndex
-	var maxVersion uint32
+	var out []bphsLoadedL0
 	for _, path := range paths {
 		st, err := os.Stat(path)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		sparse, size, _, err := kvs.loadOrRebuildSparseIndex(path, st.Size())
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		if len(sparse) == 0 {
-			return nil, 0, fmt.Errorf("BPHS L0 %s has no sparse index entries", path)
+			return nil, fmt.Errorf("BPHS L0 %s has no sparse index entries", path)
 		}
 
 		file, err := os.Open(path)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		reader := bufio.NewReaderSize(file, 1<<20)
 		count := 0
+		var maxVersion uint32
 		for {
 			entry, _, err := ReadEntry(reader, 0)
 			if err == io.EOF {
@@ -309,7 +654,7 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 			}
 			if err != nil {
 				file.Close()
-				return nil, 0, err
+				return nil, err
 			}
 			count++
 			if entry.Index > maxVersion {
@@ -320,24 +665,69 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 
 		hi, err := lastKeyFrom(path, sparse[len(sparse)-1].Offset, size)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		pool, err := NewFileDescriptorPool(path, partitionPoolSize)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
-		out = append(out, &SortedFileIndex{
-			Sparse:       sparse,
-			FileSize:     size,
-			InlineValues: NewInlineCache(inlineCacheBytes),
-			FilePath:     path,
-			Lo:           sparse[0].PaddedKey,
-			Hi:           hi,
-			pool:         pool,
-			Entries:      count,
+		out = append(out, bphsLoadedL0{
+			file: &SortedFileIndex{
+				Sparse:       sparse,
+				FileSize:     size,
+				InlineValues: NewInlineCache(inlineCacheBytes),
+				FilePath:     path,
+				Lo:           sparse[0].PaddedKey,
+				Hi:           hi,
+				pool:         pool,
+				Entries:      count,
+			},
+			maxVersion: maxVersion,
 		})
 	}
-	return out, maxVersion, nil
+	return out, nil
+}
+
+func loadBPHSBaseFile(kvs *KVServer, dir string, meta bphsPartitionManifest, inlineCacheBytes int64) (*SortedFileIndex, error) {
+	path := filepath.Join(dir, filepath.Base(meta.BaseFile))
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() != meta.BaseSize {
+		return nil, fmt.Errorf("BPHS base %s size %d, manifest says %d", path, st.Size(), meta.BaseSize)
+	}
+	sparse, size, _, err := kvs.loadOrRebuildSparseIndex(path, meta.BaseSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(sparse) == 0 {
+		return nil, fmt.Errorf("BPHS base %s has no sparse index entries", path)
+	}
+	if meta.Lo != "" && sparse[0].PaddedKey != meta.Lo {
+		return nil, fmt.Errorf("BPHS base %s starts at %q, manifest says %q", path, sparse[0].PaddedKey, meta.Lo)
+	}
+	hi, err := lastKeyFrom(path, sparse[len(sparse)-1].Offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if meta.Hi != "" && hi != meta.Hi {
+		return nil, fmt.Errorf("BPHS base %s ends at %q, manifest says %q", path, hi, meta.Hi)
+	}
+	pool, err := NewFileDescriptorPool(path, partitionPoolSize)
+	if err != nil {
+		return nil, err
+	}
+	return &SortedFileIndex{
+		Sparse:       sparse,
+		FileSize:     size,
+		InlineValues: NewInlineCache(inlineCacheBytes),
+		FilePath:     path,
+		Lo:           sparse[0].PaddedKey,
+		Hi:           hi,
+		pool:         pool,
+		Entries:      meta.Entries,
+	}, nil
 }
 
 func (s *bphsStore) Get(key string) (value string, found bool, err error) {
@@ -582,14 +972,18 @@ func (s *bphsStore) Close() error {
 		for _, l0 := range part.l0 {
 			l0.closePool()
 		}
+		if part.baseLocal && part.base != nil {
+			part.base.closePool()
+		}
 		part.mu.Unlock()
 	}
 	s.parts = nil
 	return first
 }
 
-// enableOrUpdateBPHS 在首轮分区 GC 完成后打开本地 BPHS 状态；后续全局 GC
-// 仍复用同一组固定分区时，只更新 base 指针。调用方持有 kvs.mu。
+// enableOrUpdateBPHS 在首轮分区 GC 完成后打开本地 BPHS 状态。BPHS 激活后
+// gcLoop 会暂停全局 absorb GC，以保持 Ownership Range 与本地 base 的版本语义稳定。
+// 调用方持有 kvs.mu。
 func (kvs *KVServer) enableOrUpdateBPHS(base *PartitionSet) error {
 	if !kvs.bphsEnabled || base == nil || base.Len() == 0 {
 		return nil
@@ -617,17 +1011,25 @@ func (kvs *KVServer) enableOrUpdateBPHS(base *PartitionSet) error {
 }
 
 type bphsSnapshotPartition struct {
-	Index        int    `json:"index"`
-	Generation   uint64 `json:"generation"`
-	RecordsFile  string `json:"records_file"`
-	RecordsBytes int64  `json:"records_bytes"`
-	VLogFile     string `json:"vlog_file"`
-	VLogBytes    int64  `json:"vlog_bytes"`
+	Index          int    `json:"index"`
+	Generation     uint64 `json:"generation"`
+	MaxVersion     uint32 `json:"max_version"`
+	RecordsFile    string `json:"records_file"`
+	RecordsBytes   int64  `json:"records_bytes"`
+	VLogFile       string `json:"vlog_file"`
+	VLogBytes      int64  `json:"vlog_bytes"`
+	BaseFile       string `json:"base_file,omitempty"`
+	BaseBytes      int64  `json:"base_bytes,omitempty"`
+	BaseIndexFile  string `json:"base_index_file,omitempty"`
+	BaseIndexBytes int64  `json:"base_index_bytes,omitempty"`
+	ManifestFile   string `json:"manifest_file,omitempty"`
+	ManifestBytes  int64  `json:"manifest_bytes,omitempty"`
 }
 
 // SnapshotCut 返回一份可随 Raft 快照发送的分区本地文件切点。记录日志包含所有
-// 已写入 BPHS 的版本；接收端按快照 AppliedIndex 过滤更高版本。
-func (s *bphsStore) SnapshotCut() ([]bphsSnapshotPartition, error) {
+// 已写入 BPHS 的版本；接收端按快照 AppliedIndex 过滤更高版本。base 已经把版本
+// 物化进文件，无法在接收端过滤，所以 base 领先 appliedLimit 时必须让快照稍后重试。
+func (s *bphsStore) SnapshotCut(workDir string, appliedLimit int) ([]bphsSnapshotPartition, error) {
 	if s == nil {
 		return nil, nil
 	}
@@ -643,6 +1045,29 @@ func (s *bphsStore) SnapshotCut() ([]bphsSnapshotPartition, error) {
 			RecordsFile: filepath.Base(part.records.Path()),
 			VLogFile:    filepath.Base(part.vlog.Path()),
 		}
+		if manifest, ok, err := loadBPHSPartitionManifest(s.dir, part.index); err != nil {
+			part.mu.Unlock()
+			return nil, err
+		} else if ok {
+			if appliedLimit >= 0 && uint64(manifest.MaxVersion) > uint64(appliedLimit) {
+				part.mu.Unlock()
+				return nil, fmt.Errorf("%w: partition %d local base covers version %d, snapshot applied only %d",
+					errSnapshotBusy, part.index, manifest.MaxVersion, appliedLimit)
+			}
+			meta.MaxVersion = manifest.MaxVersion
+			manifestPath := bphsPartitionManifestPath(s.dir, part.index)
+			manifestData, err := os.ReadFile(manifestPath)
+			if err != nil {
+				part.mu.Unlock()
+				return nil, err
+			}
+			meta.ManifestFile = filepath.Base(manifestPath)
+			meta.ManifestBytes = int64(len(manifestData))
+		}
+		if part.baseLocal && part.base != nil {
+			meta.BaseFile = filepath.Base(part.base.FilePath)
+			meta.BaseBytes = part.base.FileSize
+		}
 		if err := part.vlog.Sync(); err != nil {
 			part.mu.Unlock()
 			return nil, err
@@ -653,8 +1078,69 @@ func (s *bphsStore) SnapshotCut() ([]bphsSnapshotPartition, error) {
 		}
 		meta.RecordsBytes = part.records.Size()
 		meta.VLogBytes = part.vlog.Size()
+		if meta.RecordsBytes > 0 {
+			if err := copyFilePrefix(part.records.Path(), filepath.Join(workDir, meta.RecordsFile), meta.RecordsBytes); err != nil {
+				part.mu.Unlock()
+				return nil, err
+			}
+		}
+		if meta.VLogBytes > 0 {
+			if err := copyFilePrefix(part.vlog.Path(), filepath.Join(workDir, meta.VLogFile), meta.VLogBytes); err != nil {
+				part.mu.Unlock()
+				return nil, err
+			}
+		}
+		if meta.BaseFile != "" {
+			if err := copyFilePrefix(part.base.FilePath, filepath.Join(workDir, meta.BaseFile), meta.BaseBytes); err != nil {
+				part.mu.Unlock()
+				return nil, err
+			}
+			if idx := sparseIndexPath(part.base.FilePath); fileExists(idx) {
+				st, err := os.Stat(idx)
+				if err != nil {
+					part.mu.Unlock()
+					return nil, err
+				}
+				meta.BaseIndexFile = filepath.Base(idx)
+				meta.BaseIndexBytes = st.Size()
+				if err := copyFilePrefix(idx, filepath.Join(workDir, meta.BaseIndexFile), meta.BaseIndexBytes); err != nil {
+					part.mu.Unlock()
+					return nil, err
+				}
+			}
+		}
+		if meta.ManifestFile != "" && meta.ManifestBytes > 0 {
+			if err := copyFilePrefix(filepath.Join(s.dir, meta.ManifestFile),
+				filepath.Join(workDir, meta.ManifestFile), meta.ManifestBytes); err != nil {
+				part.mu.Unlock()
+				return nil, err
+			}
+		}
 		part.mu.Unlock()
 		out = append(out, meta)
 	}
 	return out, nil
+}
+
+func copyFilePrefix(src, dst string, size int64) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.CopyN(out, in, size); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
