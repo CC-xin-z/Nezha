@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"gitee.com/dong-shuishui/FlexSync/internal/raft"
+	"github.com/linxGnu/grocksdb"
 )
 
 const bphsL0CompactionTrigger = 4
@@ -147,8 +150,7 @@ func (s *bphsStore) Dir() string {
 // Put 把一条已提交的 Raft PUT 写入目标分区。返回分区 id，调用方应把它加入 dirty
 // 集合并在这批 applied index 落库之前调用 SyncPartitions。
 func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
-	paddedKey := s.kvs.persister.PadKey(key)
-	part, err := s.route(paddedKey)
+	part, err := s.route(key)
 	if err != nil {
 		return -1, err
 	}
@@ -156,7 +158,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	part.mu.Lock()
 	defer part.mu.Unlock()
 
-	rec := bphsRecord{Key: paddedKey, Version: version}
+	rec := bphsRecord{Key: key, Version: version}
 	if s.kvs.shouldInline(len(value)) {
 		rec.Kind = bphsInlineRecord
 		rec.Value = value
@@ -339,15 +341,14 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 }
 
 func (s *bphsStore) Get(key string) (value string, found bool, err error) {
-	paddedKey := s.kvs.persister.PadKey(key)
-	part, err := s.route(paddedKey)
+	part, err := s.route(key)
 	if err != nil {
 		return "", false, err
 	}
 
 	part.mu.RLock()
 	defer part.mu.RUnlock()
-	if rec, ok := part.mem.Get(paddedKey); ok {
+	if rec, ok := part.mem.Get(key); ok {
 		switch rec.Kind {
 		case bphsInlineRecord:
 			return rec.Value, true, nil
@@ -366,7 +367,7 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 
 	// L0 目前不会自动产生；保留从新到旧的查找顺序，供局部 Compaction 接入。
 	for i := len(part.l0) - 1; i >= 0; i-- {
-		entry, err := s.kvs.lookupInSortedFile(part.l0[i], paddedKey)
+		entry, err := s.kvs.lookupInSortedFile(part.l0[i], key)
 		if err != nil {
 			if err == ErrKeyAbsent {
 				continue
@@ -388,7 +389,7 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	}
 
 	if part.base != nil {
-		entry, err := s.kvs.lookupInSortedFile(part.base, paddedKey)
+		entry, err := s.kvs.lookupInSortedFile(part.base, key)
 		if err == nil {
 			return entry.Value, true, nil
 		}
@@ -400,9 +401,7 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 }
 
 func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
-	paddedStart := s.kvs.persister.PadKey(startKey)
-	paddedEnd := s.kvs.persister.PadKey(endKey)
-	if paddedStart > paddedEnd {
+	if startKey > endKey {
 		return nil, nil
 	}
 
@@ -412,29 +411,29 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 
 	result := make(map[string]string)
 	for i, basePart := range base.parts {
-		if basePart.OwnershipHi != "" && paddedStart >= basePart.OwnershipHi {
+		if basePart.OwnershipHi != "" && startKey >= basePart.OwnershipHi {
 			continue
 		}
-		if basePart.OwnershipLo != "" && paddedEnd < basePart.OwnershipLo {
+		if basePart.OwnershipLo != "" && endKey < basePart.OwnershipLo {
 			continue
 		}
 		part := s.parts[i]
 		part.mu.RLock()
 
 		if part.base != nil {
-			if err := s.kvs.scanFromSortedFileInto(result, paddedStart, paddedEnd, part.base); err != nil {
+			if err := s.kvs.scanFromSortedFileInto(result, startKey, endKey, part.base); err != nil {
 				part.mu.RUnlock()
 				return nil, err
 			}
 		}
 		for _, l0 := range part.l0 {
-			if err := s.scanBPHSSortedFileInto(result, paddedStart, paddedEnd, part, l0); err != nil {
+			if err := s.scanBPHSSortedFileInto(result, startKey, endKey, part, l0); err != nil {
 				part.mu.RUnlock()
 				return nil, err
 			}
 		}
 		for _, rec := range part.mem.Sorted() {
-			if rec.Key < paddedStart || rec.Key > paddedEnd {
+			if rec.Key < startKey || rec.Key > endKey {
 				continue
 			}
 			value, err := s.recordValue(part, rec)
@@ -442,7 +441,7 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 				part.mu.RUnlock()
 				return nil, err
 			}
-			result[s.kvs.persister.UnpadKey(rec.Key)] = value
+			result[rec.Key] = value
 		}
 		part.mu.RUnlock()
 	}
@@ -488,7 +487,7 @@ func (s *bphsStore) scanBPHSSortedFileInto(result map[string]string, startKey, e
 		if err != nil {
 			return err
 		}
-		result[s.kvs.persister.UnpadKey(rec.Key)] = value
+		result[rec.Key] = value
 	}
 }
 
@@ -528,6 +527,41 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 		part.mu.Unlock()
 	}
 	return nil
+}
+
+// drainLegacyTailIntoBPHS 把首次启用前落在 currentDB/currentLog 的尾部记录导入
+// BPHS 覆盖层。首轮 GC 的切换与搬迁之间允许客户端继续写；如果不导入，base 中的
+// 旧值会在 BPHS.Get 中先被找到，遮蔽 currentDB 中更新的版本。
+func (s *bphsStore) drainLegacyTailIntoBPHS() error {
+	file, err := os.Open(s.kvs.currentLog)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	it := s.kvs.persister.GetDb().NewIterator(grocksdb.NewDefaultReadOptions())
+	defer it.Close()
+	dirty := make(map[int]struct{})
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		key, value := it.Key(), it.Value()
+		if raft.IsMetaKey(key.Data()) {
+			key.Free()
+			value.Free()
+			continue
+		}
+		entry, err := s.kvs.entryFromRecord(string(key.Data()), value.Data(), file)
+		key.Free()
+		value.Free()
+		if err != nil {
+			return fmt.Errorf("migrate legacy tail into BPHS: %w", err)
+		}
+		part, err := s.Put(entry.Key, entry.Value, entry.Index)
+		if err != nil {
+			return err
+		}
+		dirty[part] = struct{}{}
+	}
+	return s.SyncPartitions(dirty)
 }
 
 func (s *bphsStore) Close() error {
@@ -570,6 +604,12 @@ func (kvs *KVServer) enableOrUpdateBPHS(base *PartitionSet) error {
 	store, err := openBPHSStore(kvs, base, dir, kvs.bphsMemtableBytes, kvs.inlineCacheBytes, 0)
 	if err != nil {
 		return err
+	}
+	if kvs.bphsDir == "" {
+		if err := store.drainLegacyTailIntoBPHS(); err != nil {
+			store.Close()
+			return err
+		}
 	}
 	kvs.bphs = store
 	kvs.bphsDir = dir

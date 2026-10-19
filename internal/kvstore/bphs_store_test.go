@@ -76,9 +76,9 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 		key, value string
 		version    uint32
 	}{
-		{"1", "small", 2},
-		{"2", strings.Repeat("x", 1024), 3},
-		{"5", "base-new", 4},
+		{"0000000001", "small", 2},
+		{"0000000002", strings.Repeat("x", 1024), 3},
+		{"0000000005", "base-new", 4},
 	} {
 		idx, err := store.Put(tc.key, tc.value, tc.version)
 		if err != nil {
@@ -91,9 +91,9 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	}
 
 	for key, want := range map[string]string{
-		"1": "small",
-		"2": strings.Repeat("x", 1024),
-		"5": "base-new",
+		"0000000001": "small",
+		"0000000002": strings.Repeat("x", 1024),
+		"0000000005": "base-new",
 	} {
 		got, found, err := store.Get(key)
 		if err != nil {
@@ -103,14 +103,14 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 			t.Fatalf("get(%s) = %q,%v; want %q,true", key, got, found, want)
 		}
 	}
-	scan, err := store.Scan("0", "9")
+	scan, err := store.Scan("0000000000", "0000000009")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{
-		"1": "small",
-		"2": strings.Repeat("x", 1024),
-		"5": "base-new",
+		"0000000001": "small",
+		"0000000002": strings.Repeat("x", 1024),
+		"0000000005": "base-new",
 	} {
 		if got := scan[key]; got != want {
 			t.Fatalf("scan[%s] = %q, want %q; all=%v", key, got, want, scan)
@@ -126,9 +126,9 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	}
 	defer reopened.Close()
 	for key, want := range map[string]string{
-		"1": "small",
-		"2": strings.Repeat("x", 1024),
-		"5": "base-new",
+		"0000000001": "small",
+		"0000000002": strings.Repeat("x", 1024),
+		"0000000005": "base-new",
 	} {
 		got, found, err := reopened.Get(key)
 		if err != nil {
@@ -169,7 +169,7 @@ func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 	dirty := map[int]struct{}{}
 	for i := 1; i <= 8; i++ {
 		idx, err := store.Put(
-			fmt.Sprintf("%d", i),
+			fmt.Sprintf("%010d", i),
 			fmt.Sprintf("value-%d", i),
 			uint32(i),
 		)
@@ -197,7 +197,7 @@ func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 	}
 	defer reopened.Close()
 	for i := 1; i <= 8; i++ {
-		got, found, err := reopened.Get(fmt.Sprintf("%d", i))
+		got, found, err := reopened.Get(fmt.Sprintf("%010d", i))
 		if err != nil {
 			t.Fatal(err)
 		}

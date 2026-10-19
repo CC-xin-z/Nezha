@@ -49,9 +49,6 @@ func (v *partitionVLog) Size() int64 {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.file == nil {
-		return bphsBlobRef{}, os.ErrClosed
-	}
 	return v.size
 }
 
@@ -63,6 +60,9 @@ func (v *partitionVLog) Append(value []byte) (bphsBlobRef, error) {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.file == nil {
+		return bphsBlobRef{}, os.ErrClosed
+	}
 
 	var header [partitionVLogHeaderBytes]byte
 	binary.LittleEndian.PutUint64(header[0:8], uint64(len(value)))
