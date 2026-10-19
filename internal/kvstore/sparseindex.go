@@ -233,7 +233,7 @@ func (sfi *SortedFileIndex) storeBlockHash(start int64, hash *blockHashIndex) {
 func buildBlockHash(block []byte) *blockHashIndex {
 	var entries []blockHashEntry
 	for offset := int64(0); offset < int64(len(block)); {
-		key, _, valueEnd, err := entryAtBlockOffset(block, int(offset))
+		key, _, valueEnd, _, err := entryAtBlockOffset(block, int(offset))
 		if err != nil {
 			return nil
 		}
@@ -280,7 +280,7 @@ func lookupBlockHash(block []byte, hash *blockHashIndex, key string) (*raft.Entr
 		}
 
 		probes++
-		entryKey, valueStart, valueEnd, err := entryAtBlockOffset(block, int(stored)-1)
+		entryKey, valueStart, valueEnd, index, err := entryAtBlockOffset(block, int(stored)-1)
 		if err != nil {
 			avpRecordScan(probes, int64(len(block)))
 			avpRecordHashLookup(probes)
@@ -289,7 +289,7 @@ func lookupBlockHash(block []byte, hash *blockHashIndex, key string) (*raft.Entr
 		if equalStringBytes(key, entryKey) {
 			avpRecordScan(probes, int64(len(block)))
 			avpRecordHashLookup(probes)
-			return &raft.Entry{Key: key, Value: string(block[valueStart:valueEnd])}, nil
+			return &raft.Entry{Index: index, Key: key, Value: string(block[valueStart:valueEnd])}, nil
 		}
 		slot = (slot + 1) & int(hash.mask)
 	}
@@ -302,7 +302,7 @@ func lookupBlockHash(block []byte, hash *blockHashIndex, key string) (*raft.Entr
 func scanBlockBytes(block []byte, key string) (*raft.Entry, error) {
 	scanned := 0
 	for offset := int64(0); offset < int64(len(block)); {
-		entryKey, valueStart, valueEnd, err := entryAtBlockOffset(block, int(offset))
+		entryKey, valueStart, valueEnd, index, err := entryAtBlockOffset(block, int(offset))
 		if err != nil {
 			avpRecordScan(scanned, int64(len(block)))
 			return nil, err
@@ -310,7 +310,7 @@ func scanBlockBytes(block []byte, key string) (*raft.Entry, error) {
 		scanned++
 		if equalStringBytes(key, entryKey) {
 			avpRecordScan(scanned, int64(len(block)))
-			return &raft.Entry{Key: key, Value: string(block[valueStart:valueEnd])}, nil
+			return &raft.Entry{Index: index, Key: key, Value: string(block[valueStart:valueEnd])}, nil
 		}
 		if string(entryKey) > key {
 			break
@@ -321,19 +321,20 @@ func scanBlockBytes(block []byte, key string) (*raft.Entry, error) {
 	return nil, ErrKeyAbsent
 }
 
-func entryAtBlockOffset(block []byte, offset int) (key []byte, valueStart, valueEnd int, err error) {
+func entryAtBlockOffset(block []byte, offset int) (key []byte, valueStart, valueEnd int, index uint32, err error) {
 	if offset < 0 || offset > len(block)-20 {
-		return nil, 0, 0, errors.New("block entry offset out of range")
+		return nil, 0, 0, 0, errors.New("block entry offset out of range")
 	}
+	index = binary.LittleEndian.Uint32(block[offset : offset+4])
 	keySize := int(binary.LittleEndian.Uint32(block[offset+12 : offset+16]))
 	valueSize := int(binary.LittleEndian.Uint32(block[offset+16 : offset+20]))
 	keyStart := offset + 20
 	valueStart = keyStart + keySize
 	valueEnd = valueStart + valueSize
 	if keyStart < offset || valueStart < keyStart || valueEnd < valueStart || valueEnd > len(block) {
-		return nil, 0, 0, errors.New("block entry extends past block boundary")
+		return nil, 0, 0, 0, errors.New("block entry extends past block boundary")
 	}
-	return block[keyStart:valueStart], valueStart, valueEnd, nil
+	return block[keyStart:valueStart], valueStart, valueEnd, index, nil
 }
 
 func blockKeyHashBytes(key []byte) uint32 {
