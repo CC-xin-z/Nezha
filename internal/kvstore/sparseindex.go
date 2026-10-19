@@ -416,6 +416,12 @@ type SortedFileIndex struct {
 	Lo string
 	Hi string
 
+	// OwnershipLo/OwnershipHi 是写入路由范围，语义为 [Lo, Hi)；
+	// 空字符串分别表示负无穷和正无穷。它和上面的实际数据 Lo/Hi 必须分开：
+	// 一个尚不存在的 key 只有前者能决定写入哪个分区。
+	OwnershipLo string
+	OwnershipHi string
+
 	// pool 缓存本文件的只读描述符。改造前它是 KVServer 上的一个全局单例，而
 	// scanFromSortedFile 又不看传进来的 index.FilePath——两者恰好总指向同一个文件才没出事。
 	// 分区化之后一个进程同时持有多个有序文件，描述符必须跟着文件走。

@@ -62,6 +62,36 @@ type PartitionSet struct {
 	refs atomic.Int32
 }
 
+// assignOwnershipRanges 为静态分区建立写入所有权区间。
+//
+// Lo/Hi 描述文件里"已经存在"的数据范围，不能用来决定一个新 key 该写到哪里：
+// 两个实际数据范围之间的空隙也必须属于某个分区。这里采用前缀分区语义：
+//
+//	P0 owns ["", P1.Lo)
+//	P1 owns [P1.Lo, P2.Lo)
+//	...
+//	P[n-1] owns [P[n-1].Lo, +inf)
+//
+// 空字符串分别表示负无穷和正无穷。所有范围连续且互不重叠，因此任何 padded key
+// 都能被唯一路由；如果该 key 尚不存在，后续进入对应分区的 L0。
+func (ps *PartitionSet) assignOwnershipRanges() {
+	if ps == nil {
+		return
+	}
+	for i, p := range ps.parts {
+		if i == 0 {
+			p.OwnershipLo = ""
+		} else {
+			p.OwnershipLo = p.Lo
+		}
+		if i+1 < len(ps.parts) {
+			p.OwnershipHi = ps.parts[i+1].Lo
+		} else {
+			p.OwnershipHi = ""
+		}
+	}
+}
+
 func (ps *PartitionSet) Len() int {
 	if ps == nil {
 		return 0
@@ -109,6 +139,28 @@ func (ps *PartitionSet) find(paddedKey string) *SortedFileIndex {
 		return nil // 落在两个分区之间的空隙
 	}
 	return ps.parts[i]
+}
+
+// findOwned 返回负责 paddedKey 的那个分区，不要求该 key 已经存在于 base 文件中。
+// 写入路径必须使用它，不能使用 find：find 的 Lo/Hi 是实际数据范围，会拒绝落在
+// 分区空隙中的新 key。
+func (ps *PartitionSet) findOwned(paddedKey string) (*SortedFileIndex, int, bool) {
+	if ps == nil || len(ps.parts) == 0 {
+		return nil, -1, false
+	}
+	// 最后一个分区没有上界，不参与搜索；前面每个分区的 OwnershipHi 都是下
+	// 一个分区的 OwnershipLo。
+	i := sort.Search(len(ps.parts)-1, func(j int) bool {
+		return paddedKey < ps.parts[j].OwnershipHi
+	})
+	if i >= len(ps.parts) {
+		i = len(ps.parts) - 1
+	}
+	p := ps.parts[i]
+	if p.OwnershipHi != "" && paddedKey >= p.OwnershipHi {
+		return nil, -1, false
+	}
+	return p, i, true
 }
 
 // overlapping 返回与 [lo, hi] 有交集的全部分区，按 key 升序；两端都是 padded key。
@@ -275,6 +327,7 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			Entries:      m.Entries,
 		})
 	}
+	ps.assignOwnershipRanges()
 	return ps, nil
 }
 
@@ -506,7 +559,9 @@ func (pw *partitionWriter) Finish() (*PartitionSet, error) {
 	if err := pw.seal(); err != nil {
 		return nil, err
 	}
-	return &PartitionSet{parts: pw.done, inline: pw.inline, base: pw.base}, nil
+	ps := &PartitionSet{parts: pw.done, inline: pw.inline, base: pw.base}
+	ps.assignOwnershipRanges()
+	return ps, nil
 }
 
 // Abort 丢弃已经写下的一切。搬运中途失败时调用：本轮不推进状态，半成品不能留在盘上被下一轮

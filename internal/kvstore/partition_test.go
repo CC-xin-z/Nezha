@@ -71,6 +71,42 @@ func TestPartitionFindEdgeSets(t *testing.T) {
 	}
 }
 
+func TestPartitionFindOwnedCoversDataGaps(t *testing.T) {
+	ps := mkSet(
+		[2]string{"A", "C"},
+		[2]string{"E", "H"},
+		[2]string{"J", "M"},
+	)
+	ps.assignOwnershipRanges()
+
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"0", "A"}, // 首分区负责所有小于 A 的 key
+		{"A", "A"},
+		{"C", "A"},
+		{"D", "A"}, // 实际数据空隙仍由前一个分区负责
+		{"E", "E"}, // OwnershipHi 是开区间，恰好到下一分区
+		{"I", "E"},
+		{"J", "J"},
+		{"ZZZ", "J"}, // 最后一个分区没有上界
+	}
+	for _, c := range cases {
+		got, _, ok := ps.findOwned(c.key)
+		if !ok || got == nil || got.Lo != c.want {
+			t.Errorf("findOwned(%q) = %v,%v; want 分区 %s", c.key, got, ok, c.want)
+		}
+	}
+
+	if p, _, ok := (*PartitionSet)(nil).findOwned("A"); ok || p != nil {
+		t.Error("nil PartitionSet 不应返回写入路由")
+	}
+	if p, _, ok := mkSet().findOwned("A"); ok || p != nil {
+		t.Error("空 PartitionSet 不应返回写入路由")
+	}
+}
+
 func TestPartitionOverlapping(t *testing.T) {
 	ps := mkSet([2]string{"100", "199"}, [2]string{"300", "399"}, [2]string{"500", "599"})
 
