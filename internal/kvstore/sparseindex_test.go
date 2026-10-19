@@ -1,10 +1,13 @@
 package kvstore
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
 
 func mkIndex(entries []SparseEntry, fileSize int64) *SortedFileIndex {
@@ -211,6 +214,70 @@ func TestPersistedSparseIndexMatchesRebuild(t *testing.T) {
 		}
 		if err := sameSparseIndex(persisted, p.Sparse); err != nil {
 			t.Errorf("分区 %s 的旁挂索引与内存里的不一致: %v", p.FilePath, err)
+		}
+	}
+}
+
+func TestLookupInSortedFileUsesBlockHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "part.p0")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	kvs := &KVServer{}
+
+	const count = 257
+	for i := 0; i < count; i++ {
+		entry := &raft.Entry{
+			Index: uint32(i + 1),
+			Key:   fmt.Sprintf("%010d", i*2),
+			Value: fmt.Sprintf("value-%06d", i),
+		}
+		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sparse, fileSize, err := kvs.BuildSparseIndex(path, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := &SortedFileIndex{
+		Sparse:   sparse,
+		FileSize: fileSize,
+		FilePath: path,
+	}
+
+	hashLookupsBefore := avpStats.hashLookups.Load()
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2)
+		got, err := kvs.lookupInSortedFile(index, key)
+		if err != nil {
+			t.Fatalf("lookup(%s): %v", key, err)
+		}
+		want := fmt.Sprintf("value-%06d", i)
+		if got.Key != key || got.Value != want {
+			t.Fatalf("lookup(%s) = {%q,%q}, want {%q,%q}", key, got.Key, got.Value, key, want)
+		}
+	}
+	if avpStats.hashLookups.Load() <= hashLookupsBefore {
+		t.Fatal("存在块内哈希表，但点查没有走哈希路径")
+	}
+	if len(index.blockHashes) == 0 {
+		t.Fatal("点查后未建立任何块内哈希表")
+	}
+
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2+1)
+		if _, err := kvs.lookupInSortedFile(index, key); err == nil {
+			t.Fatalf("不存在的 key %s 被错误命中", key)
 		}
 	}
 }

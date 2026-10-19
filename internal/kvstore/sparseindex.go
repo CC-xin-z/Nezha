@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
@@ -22,14 +23,26 @@ import (
 // key→offset 记录，内存随 key 数线性增长：100GB 的 64B 小值有约 10 亿个 key，
 // 光索引就要 58GB。
 //
-// 这里改为每约 blockBytes 记录一个块起点：查找时二分定位到块，再在块内顺序扫描。
-// 内存从 O(key 数) 降为 O(块数)——默认 4KB 块时同样的数据集约 1GB，降约两个数量级。
-// 代价是每次点查要顺序解析一个块内的 entry，见 defaultIndexBlockBytes 处的实测数据。
+// 外层每约 blockBytes 记录一个块起点：查找时二分定位到块。块内哈希表在首次访问
+// 该块时惰性建立并只缓存紧凑槽位，不缓存整块数据；key 仍留在文件中，哈希命中后
+// 回读一次目标记录的 key 做校验。这样既不恢复 O(key 数) 的稠密索引，也避免每次
+// 点查都顺序解析整个块。
 
 // SparseEntry 是稀疏索引的一项：一个数据块的起始偏移及块内首条 entry 的 key。
 type SparseEntry struct {
 	PaddedKey string // 块内首条 entry 的 key（padding 后，定长）
 	Offset    int64  // 块在 sortedFile 中的起始偏移
+}
+
+type blockHashIndex struct {
+	// slots 中的 0 表示空，n>0 表示块内字节偏移 n-1。
+	slots []uint16
+	mask  uint32
+}
+
+type blockHashEntry struct {
+	offset int64
+	key    []byte
 }
 
 // SparseIndexBuilder 在顺序写 sortedFile 的同时构建稀疏索引。
@@ -48,12 +61,13 @@ func NewSparseIndexBuilder(blockBytes int64) *SparseIndexBuilder {
 	return &SparseIndexBuilder{blockBytes: blockBytes}
 }
 
-// 4KB。块尺寸直接决定点查要顺序解析多少条 entry，实测（50 万条 64B value，
-// 每条 94B）GET 延迟相对稠密 map 的增幅随块内条数近似线性：
+// 4KB。块尺寸是外层稀疏索引与块内索引的内存/读放大旋钮。没有块内哈希时，
+// GET 延迟随块内条数近似线性增长（50 万条 64B value，每条 94B）：
 //
 //	4KB(~44 条) +15% | 16KB(~174 条) +21% | 64KB(~697 条) +117%
 //
-// 4KB 下 SCAN 与稠密 map 持平，是内存与读代价的合理折中。
+// 4KB 下 SCAN 仍保持顺序读优势；点查首次访问块时建立紧凑哈希表，后续查询不再
+// 顺序解析整个块。哈希槽按需分配，长期总量约为每 key 3～4 字节。
 const defaultIndexBlockBytes = 4 * 1024
 
 // Observe 记录一条刚写入的 entry。key 必须是写进文件的那个 key（已 padding），
@@ -144,7 +158,7 @@ func (kvs *KVServer) scanBlock(index *SortedFileIndex, key string, start, end in
 	return nil, ErrKeyAbsent
 }
 
-// lookupInSortedFile 通过稀疏索引查找 key 对应的 entry。
+// lookupInSortedFile 通过稀疏索引定位块，再优先使用块内哈希查找。
 func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*raft.Entry, error) {
 	if index == nil {
 		return nil, errors.New("invalid index: index is nil")
@@ -153,7 +167,203 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 	if !ok {
 		return nil, ErrKeyAbsent
 	}
-	return kvs.scanBlock(index, key, start, end)
+
+	blockLen := end - start
+	if blockLen <= 0 {
+		return nil, ErrKeyAbsent
+	}
+	if blockLen > 1<<20 {
+		avpRecordHashFallback()
+		return kvs.scanBlock(index, key, start, end)
+	}
+
+	block, err := readBlock(index.FilePath, start, blockLen)
+	if err != nil {
+		return nil, err
+	}
+
+	hash, cached := index.cachedBlockHash(start)
+	if !cached {
+		hash = buildBlockHash(block)
+		index.storeBlockHash(start, hash)
+	}
+	if hash == nil {
+		avpRecordHashFallback()
+		return scanBlockBytes(block, key)
+	}
+	return lookupBlockHash(block, hash, key)
+}
+
+func readBlock(path string, start, blockLen int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	block := make([]byte, int(blockLen))
+	n, err := file.ReadAt(block, start)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n != len(block) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return block, nil
+}
+
+func (sfi *SortedFileIndex) cachedBlockHash(start int64) (*blockHashIndex, bool) {
+	sfi.blockHashMu.Lock()
+	defer sfi.blockHashMu.Unlock()
+	hash, ok := sfi.blockHashes[start]
+	return hash, ok
+}
+
+func (sfi *SortedFileIndex) storeBlockHash(start int64, hash *blockHashIndex) {
+	sfi.blockHashMu.Lock()
+	defer sfi.blockHashMu.Unlock()
+	if sfi.blockHashes == nil {
+		sfi.blockHashes = make(map[int64]*blockHashIndex)
+	}
+	sfi.blockHashes[start] = hash
+}
+
+// buildBlockHash 为单个不可变数据块建立紧凑 open-addressing 哈希表。
+// 返回 nil 表示该块不适合建表，调用方应回退顺序扫描。
+func buildBlockHash(block []byte) *blockHashIndex {
+	var entries []blockHashEntry
+	for offset := int64(0); offset < int64(len(block)); {
+		key, _, valueEnd, err := entryAtBlockOffset(block, int(offset))
+		if err != nil {
+			return nil
+		}
+		entries = append(entries, blockHashEntry{offset: offset, key: key})
+		offset = int64(valueEnd)
+	}
+	if len(entries) < 2 {
+		return nil
+	}
+
+	capacity := 8
+	for capacity*7/10 < len(entries) {
+		capacity <<= 1
+	}
+	for _, entry := range entries {
+		if entry.offset < 0 || entry.offset >= int64(^uint16(0)) {
+			return nil
+		}
+	}
+
+	hash := &blockHashIndex{
+		slots: make([]uint16, capacity),
+		mask:  uint32(capacity - 1),
+	}
+	for _, entry := range entries {
+		slot := int(blockKeyHashBytes(entry.key) & hash.mask)
+		for hash.slots[slot] != 0 {
+			slot = (slot + 1) & int(hash.mask)
+		}
+		hash.slots[slot] = uint16(entry.offset + 1)
+	}
+	return hash
+}
+
+func lookupBlockHash(block []byte, hash *blockHashIndex, key string) (*raft.Entry, error) {
+	probes := 0
+	slot := int(blockKeyHashString(key) & hash.mask)
+	for probes < len(hash.slots) {
+		stored := hash.slots[slot]
+		if stored == 0 {
+			avpRecordScan(probes, int64(len(block)))
+			avpRecordHashLookup(probes)
+			return nil, ErrKeyAbsent
+		}
+
+		probes++
+		entryKey, valueStart, valueEnd, err := entryAtBlockOffset(block, int(stored)-1)
+		if err != nil {
+			avpRecordScan(probes, int64(len(block)))
+			avpRecordHashLookup(probes)
+			return nil, err
+		}
+		if equalStringBytes(key, entryKey) {
+			avpRecordScan(probes, int64(len(block)))
+			avpRecordHashLookup(probes)
+			return &raft.Entry{Key: key, Value: string(block[valueStart:valueEnd])}, nil
+		}
+		slot = (slot + 1) & int(hash.mask)
+	}
+
+	avpRecordScan(probes, int64(len(block)))
+	avpRecordHashLookup(probes)
+	return nil, ErrKeyAbsent
+}
+
+func scanBlockBytes(block []byte, key string) (*raft.Entry, error) {
+	scanned := 0
+	for offset := int64(0); offset < int64(len(block)); {
+		entryKey, valueStart, valueEnd, err := entryAtBlockOffset(block, int(offset))
+		if err != nil {
+			avpRecordScan(scanned, int64(len(block)))
+			return nil, err
+		}
+		scanned++
+		if equalStringBytes(key, entryKey) {
+			avpRecordScan(scanned, int64(len(block)))
+			return &raft.Entry{Key: key, Value: string(block[valueStart:valueEnd])}, nil
+		}
+		if string(entryKey) > key {
+			break
+		}
+		offset = int64(valueEnd)
+	}
+	avpRecordScan(scanned, int64(len(block)))
+	return nil, ErrKeyAbsent
+}
+
+func entryAtBlockOffset(block []byte, offset int) (key []byte, valueStart, valueEnd int, err error) {
+	if offset < 0 || offset > len(block)-20 {
+		return nil, 0, 0, errors.New("block entry offset out of range")
+	}
+	keySize := int(binary.LittleEndian.Uint32(block[offset+12 : offset+16]))
+	valueSize := int(binary.LittleEndian.Uint32(block[offset+16 : offset+20]))
+	keyStart := offset + 20
+	valueStart = keyStart + keySize
+	valueEnd = valueStart + valueSize
+	if keyStart < offset || valueStart < keyStart || valueEnd < valueStart || valueEnd > len(block) {
+		return nil, 0, 0, errors.New("block entry extends past block boundary")
+	}
+	return block[keyStart:valueStart], valueStart, valueEnd, nil
+}
+
+func blockKeyHashBytes(key []byte) uint32 {
+	h := uint32(2166136261)
+	for _, b := range key {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	return h
+}
+
+func blockKeyHashString(key string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func equalStringBytes(s string, b []byte) bool {
+	if len(s) != len(b) {
+		return false
+	}
+	for i := range b {
+		if s[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildSparseIndex 扫描整个 sortedFile 重建稀疏索引（进程重启或索引重建时使用）。
@@ -195,6 +405,11 @@ type SortedFileIndex struct {
 	// 同一组分区里的每个分区都指向同一个实例，见 PartitionSet.inline。
 	InlineValues *InlineCache
 	FilePath     string
+
+	// blockHashes 按需缓存每个 4KB 块的紧凑哈希表；nil 表示该块已尝试构建但
+	// 不适合建表，后续应保持顺序扫描。这里只缓存槽位，不缓存块数据本身。
+	blockHashMu sync.Mutex
+	blockHashes map[int64]*blockHashIndex
 
 	// Lo、Hi 是本文件内最小与最大的 padded key，即它覆盖的 key 区间（闭区间）。
 	// 同一组分区里各区间互不重叠且按 Lo 升序，读路径的二分路由完全建立在这个前提上。

@@ -24,6 +24,9 @@ var avpStats struct {
 	entriesScanned atomic.Uint64 // 块内顺序解析的 entry 总条数
 	bytesRead      atomic.Uint64 // 从 sortedFile 实际读取的字节数
 	budgetSpills   atomic.Uint64 // 够内联的小值因为额度用完而改存偏移的条数，见 takeInlineBudget
+	hashLookups    atomic.Uint64 // 使用块内哈希表的点查次数
+	hashKeyProbes  atomic.Uint64 // 哈希查找中实际回读并验证的 key 条数
+	hashFallbacks  atomic.Uint64 // 块不适合哈希、退回顺序扫描的次数
 }
 
 // avpRecordBudgetSpill 记一条因内联额度用完而改存偏移的小值。
@@ -64,6 +67,15 @@ func avpRecordScan(entries int, bytes int64) {
 	avpStats.bytesRead.Add(uint64(bytes))
 }
 
+func avpRecordHashLookup(probes int) {
+	avpStats.hashLookups.Add(1)
+	avpStats.hashKeyProbes.Add(uint64(probes))
+}
+
+func avpRecordHashFallback() {
+	avpStats.hashFallbacks.Add(1)
+}
+
 // AVPStatsLine 汇总成一行，供从节点日志里抓取。
 // 命中率和"平均每次未命中解析多少条 entry"是两个核心指标：
 // 前者说明 AVP 覆盖了多少读，后者量化它每次省下的解析工作量。
@@ -92,6 +104,9 @@ func AVPStatsLine() string {
 	bytes := avpStats.bytesRead.Load()
 	nf := avpStats.notFound.Load()
 	sbl := avpStats.servedByLog.Load()
+	hashLookups := avpStats.hashLookups.Load()
+	hashProbes := avpStats.hashKeyProbes.Load()
+	hashFallbacks := avpStats.hashFallbacks.Load()
 
 	served := h + m // 由分区答复的读
 	var hitRate float64
@@ -102,11 +117,17 @@ func AVPStatsLine() string {
 	if scans > 0 {
 		entsPerScan = float64(ents) / float64(scans)
 	}
+	var probesPerHashLookup float64
+	if hashLookups > 0 {
+		probesPerHashLookup = float64(hashProbes) / float64(hashLookups)
+	}
 	return fmt.Sprintf(
 		"[AVP-STATS] partition_reads=%d hits=%d misses=%d hit_rate=%.2f%% "+
 			"served_by_log=%d not_found=%d block_scans=%d entries_scanned=%d "+
-			"entries_per_scan=%.1f bytes_read=%d inline_budget_spills=%d",
-		served, h, m, hitRate, sbl, nf, scans, ents, entsPerScan, bytes, avpStats.budgetSpills.Load())
+			"entries_per_scan=%.1f bytes_read=%d inline_budget_spills=%d "+
+			"hash_lookups=%d hash_key_probes=%d probes_per_hash_lookup=%.1f hash_fallbacks=%d",
+		served, h, m, hitRate, sbl, nf, scans, ents, entsPerScan, bytes, avpStats.budgetSpills.Load(),
+		hashLookups, hashProbes, probesPerHashLookup, hashFallbacks)
 }
 
 // StartAVPStatsReporter 周期性把指标打进节点日志。
