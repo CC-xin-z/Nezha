@@ -929,6 +929,12 @@ func (s *bphsStore) drainLegacyTailIntoBPHS() error {
 	}
 	defer file.Close()
 
+	// Inline rows in the legacy store contain only key+value, so
+	// entryFromRecord cannot recover their original Raft index. They are all
+	// known to be covered by the current applied index, which is a safe cutoff:
+	// any post-BPHS write will carry a higher index and still win.
+	legacyCutoff := uint32(s.kvs.lastAppliedIndex)
+
 	it := s.kvs.persister.GetDb().NewIterator(grocksdb.NewDefaultReadOptions())
 	defer it.Close()
 	dirty := make(map[int]struct{})
@@ -945,13 +951,21 @@ func (s *bphsStore) drainLegacyTailIntoBPHS() error {
 		if err != nil {
 			return fmt.Errorf("migrate legacy tail into BPHS: %w", err)
 		}
-		part, err := s.Put(entry.Key, entry.Value, entry.Index)
+		version := bphsLegacyTailVersion(entry.Index, legacyCutoff)
+		part, err := s.Put(entry.Key, entry.Value, version)
 		if err != nil {
 			return err
 		}
 		dirty[part] = struct{}{}
 	}
 	return s.SyncPartitions(dirty)
+}
+
+func bphsLegacyTailVersion(entryIndex, appliedCutoff uint32) uint32 {
+	if entryIndex != 0 {
+		return entryIndex
+	}
+	return appliedCutoff
 }
 
 func (s *bphsStore) Close() error {

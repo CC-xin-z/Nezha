@@ -374,3 +374,154 @@ func TestBPHSFullPartitionCompaction(t *testing.T) {
 		}
 	}
 }
+
+func TestBPHSSortedFileReadsPreserveVersions(t *testing.T) {
+	kvs := &KVServer{indexBlockBytes: 128}
+
+	rawPath := filepath.Join(t.TempDir(), "raw.p0")
+	rawFile, err := os.Create(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawWriter := bufio.NewWriter(rawFile)
+	for _, tc := range []struct {
+		key     string
+		version uint32
+		term    uint32
+		voted   uint32
+	}{
+		{"0000000001", 31, 7, 2},
+		{"0000000002", 44, 8, 3},
+	} {
+		if err := kvs.WriteEntryToSortedFile(rawWriter, &raft.Entry{
+			Index:       tc.version,
+			CurrentTerm: tc.term,
+			VotedFor:    tc.voted,
+			Key:         tc.key,
+			Value:       "raw-" + tc.key,
+		}); err != nil {
+			rawFile.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := rawWriter.Flush(); err != nil {
+		rawFile.Close()
+		t.Fatal(err)
+	}
+	if err := rawFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := readRawSortedFile(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 || raw[0].Version != 31 || raw[1].Version != 44 {
+		t.Fatalf("raw versions = %+v, want [31 44]", raw)
+	}
+	rawReaderFile, err := os.Open(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawReaderFile.Close()
+	first, _, err := ReadEntry(bufio.NewReaderSize(rawReaderFile, 1<<20), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Index != 31 || first.CurrentTerm != 7 || first.VotedFor != 2 {
+		t.Fatalf("raw entry metadata = %+v", first)
+	}
+
+	mt := newPartitionMemtable(1 << 20)
+	mt.Put(bphsRecord{
+		Key: "0000000001", Version: 51, Kind: bphsInlineRecord, Value: "inline",
+	})
+	mt.Put(bphsRecord{
+		Key: "0000000002", Version: 62, Kind: bphsBlobRecord,
+		Blob: bphsBlobRef{Generation: 3, Offset: 7, Length: 9},
+	})
+	l0Path := filepath.Join(t.TempDir(), "p0_l0.sst")
+	l0, err := kvs.flushPartitionMemtable(mt, l0Path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l0.closePool()
+	encoded, err := readBPHSSortedFile(l0Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != 2 || encoded[0].Version != 51 || encoded[1].Version != 62 {
+		t.Fatalf("BPHS L0 versions = %+v, want [51 62]", encoded)
+	}
+}
+
+func TestBPHSFullCompactionFromL0PreservesMaxVersion(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base-old")
+	defer base.Close()
+
+	dir := filepath.Join(t.TempDir(), "bphs")
+	store, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Put("0000000001", "inline-v11", 11); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("0000000002", strings.Repeat("x", 1024), 12); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	part := store.parts[0]
+	part.mu.Lock()
+	if err := store.flushPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		t.Fatal(err)
+	}
+	if part.mem.Len() != 0 || len(part.l0) != 1 {
+		part.mu.Unlock()
+		t.Fatalf("before compaction mem=%d l0=%d", part.mem.Len(), len(part.l0))
+	}
+	if err := store.compactPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		t.Fatal(err)
+	}
+	part.mu.Unlock()
+
+	manifest, ok, err := loadBPHSPartitionManifest(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || manifest.MaxVersion != 12 {
+		t.Fatalf("manifest = %+v, ok=%v; want max_version=12", manifest, ok)
+	}
+	if got, found, err := store.Get("0000000002"); err != nil || !found ||
+		got != strings.Repeat("x", 1024) {
+		t.Fatalf("get after L0-only compaction = %q,%v,%v", got, found, err)
+	}
+}
+
+func TestBPHSLegacyTailVersionFallback(t *testing.T) {
+	for _, tc := range []struct {
+		entryIndex uint32
+		cutoff     uint32
+		want       uint32
+	}{
+		{entryIndex: 27, cutoff: 100, want: 27},
+		{entryIndex: 0, cutoff: 100, want: 100},
+		{entryIndex: 0, cutoff: 0, want: 0},
+	} {
+		if got := bphsLegacyTailVersion(tc.entryIndex, tc.cutoff); got != tc.want {
+			t.Fatalf("legacy version(%d,%d)=%d, want %d",
+				tc.entryIndex, tc.cutoff, got, tc.want)
+		}
+	}
+}

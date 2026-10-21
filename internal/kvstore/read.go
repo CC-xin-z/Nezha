@@ -503,7 +503,12 @@ func ReadEntry(reader *bufio.Reader, currentOffset int64) (*raft.Entry, int64, e
 		return nil, 0, fmt.Errorf("failed to read header: %v (read %d bytes)", err, n)
 	}
 
-	// Parse the header
+	// Parse the header. Sorted-file records carry a full raft.Entry header, not
+	// only key/value lengths; dropping the version here makes compaction unable
+	// to distinguish stale L0 records from newer ones.
+	entry.Index = binary.LittleEndian.Uint32(header[0:4])
+	entry.CurrentTerm = binary.LittleEndian.Uint32(header[4:8])
+	entry.VotedFor = binary.LittleEndian.Uint32(header[8:12])
 	keySize = binary.LittleEndian.Uint32(header[12:16])
 	valueSize = binary.LittleEndian.Uint32(header[16:20])
 
