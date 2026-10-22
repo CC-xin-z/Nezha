@@ -525,3 +525,73 @@ func TestBPHSLegacyTailVersionFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestBPHSVLogSizeTriggersCompactionBeforeMemtableFull(t *testing.T) {
+	kvs := &KVServer{
+		persister:                     &raft.Persister{},
+		inlineThreshold:               512,
+		indexBlockBytes:               128,
+		bphsPartitionGCThresholdBytes: 16 << 10,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base-old")
+	defer base.Close()
+
+	dir := filepath.Join(t.TempDir(), "bphs")
+	store, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	value := strings.Repeat("x", 4096)
+	dirty := map[int]struct{}{}
+	for i := 1; i <= 3; i++ {
+		part, err := store.Put(fmt.Sprintf("%010d", i), value, uint32(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dirty[part] = struct{}{}
+	}
+	if err := store.SyncPartitions(dirty); err != nil {
+		t.Fatal(err)
+	}
+
+	part := store.parts[0]
+	if part.mem.Full() {
+		t.Fatal("test setup is invalid: MemTable triggered before VLog threshold")
+	}
+	if part.vlog.Size() == 0 {
+		t.Fatal("4KB values did not enter the partition VLog")
+	}
+	if part.baseLocal {
+		t.Fatal("partition compacted too early")
+	}
+
+	if _, err := store.Put("0000000004", value, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !part.baseLocal {
+		t.Fatal("VLog threshold did not trigger partition compaction")
+	}
+	if part.mem.Len() != 0 || part.vlog.Size() != 0 || part.records.Size() != 0 || len(part.l0) != 0 {
+		t.Fatalf("partition delta was not reset: mem=%d vlog=%d records=%d l0=%d",
+			part.mem.Len(), part.vlog.Size(), part.records.Size(), len(part.l0))
+	}
+	manifest, ok, err := loadBPHSPartitionManifest(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || manifest.MaxVersion != 4 || manifest.Generation != 2 {
+		t.Fatalf("manifest = %+v, ok=%v; want generation=2 max_version=4", manifest, ok)
+	}
+	for i := 1; i <= 4; i++ {
+		got, found, err := store.Get(fmt.Sprintf("%010d", i))
+		if err != nil || !found || got != value {
+			t.Fatalf("get(%d) = len=%d found=%v err=%v; want full 4KB value", i, len(got), found, err)
+		}
+	}
+}

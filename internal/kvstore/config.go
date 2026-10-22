@@ -134,6 +134,10 @@ type Config struct {
 	// instead of the global tail store. Dynamic range splitting is not included.
 	BPHS           bool
 	BPHSMemtableMB int
+	// BPHSPartitionGCThresholdMB triggers partition-local compaction from the
+	// combined VLog + L0 + MemTable delta. Large BlobRecords barely increase L0
+	// size, so using L0 alone would never reclaim a growing partition VLog.
+	BPHSPartitionGCThresholdMB int
 
 	// LSM-Raft baseline (lsmraft.go): span size and idle cut.
 	SSTSpanMB int

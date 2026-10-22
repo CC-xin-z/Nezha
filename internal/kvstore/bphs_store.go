@@ -66,13 +66,14 @@ type bphsPartition struct {
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
 // 要求分区数量和 Ownership Range 保持不变；动态 Split 不在这一版范围内。
 type bphsStore struct {
-	mu               sync.RWMutex
-	kvs              *KVServer
-	base             *PartitionSet
-	parts            []*bphsPartition
-	dir              string
-	memtableBytes    int64
-	inlineCacheBytes int64
+	mu                        sync.RWMutex
+	kvs                       *KVServer
+	base                      *PartitionSet
+	parts                     []*bphsPartition
+	dir                       string
+	memtableBytes             int64
+	inlineCacheBytes          int64
+	partitionGCThresholdBytes int64
 }
 
 func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes, inlineCacheBytes int64, maxVersion uint32) (*bphsStore, error) {
@@ -83,11 +84,12 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		return nil, err
 	}
 	s := &bphsStore{
-		kvs:              kvs,
-		base:             base,
-		dir:              dir,
-		memtableBytes:    memtableBytes,
-		inlineCacheBytes: inlineCacheBytes,
+		kvs:                       kvs,
+		base:                      base,
+		dir:                       dir,
+		memtableBytes:             memtableBytes,
+		inlineCacheBytes:          inlineCacheBytes,
+		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
 	}
 	for i, basePart := range base.parts {
 		meta, hasMeta, err := loadBPHSPartitionManifest(dir, i)
@@ -272,6 +274,10 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 		if err := s.flushPartitionLocked(part); err != nil {
 			return -1, err
 		}
+	} else if s.shouldCompactPartitionLocked(part) {
+		if err := s.compactPartitionLocked(part); err != nil {
+			return -1, fmt.Errorf("partition %d VLog-triggered compaction: %w", part.index, err)
+		}
 	}
 	return part.index, nil
 }
@@ -306,14 +312,17 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 }
 
 func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
-	if part == nil || len(part.l0) == 0 {
+	if part == nil {
 		return false
 	}
-	var delta int64
+	delta := part.vlog.Size() + part.mem.Bytes()
 	for _, run := range part.l0 {
 		delta += run.FileSize
 	}
-	threshold := int64(16 << 20)
+	threshold := s.partitionGCThresholdBytes
+	if threshold <= 0 {
+		threshold = int64(16 << 20)
+	}
 	if part.base != nil {
 		if want := part.base.FileSize / 4; want > threshold {
 			threshold = want

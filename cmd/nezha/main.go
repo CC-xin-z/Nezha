@@ -71,6 +71,7 @@ func main() {
 	flag.Float64Var(&cfg.AbsorbRatio, "absorbRatio", 0.25, "start a GC round once the tail log reaches this fraction of the partitions' total size")
 	flag.BoolVar(&cfg.BPHS, "bphs", false, "enable the static Bootstrap-Partitioned Hybrid Storage prototype after the first partitioned GC")
 	flag.IntVar(&cfg.BPHSMemtableMB, "bphsMemtableMB", 4, "logical MemTable budget in MB per BPHS partition; 0 keeps all latest records")
+	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
 	// and throughput is decided by the slowest goroutine, so the value shapes the
 	// stability of throughput numbers more than the speed of the system does.
