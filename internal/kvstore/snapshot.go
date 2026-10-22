@@ -53,7 +53,8 @@ import (
 // 也就是本文件做的事。
 
 const (
-	// snapshotWorkDir 是 leader 侧放导出产物的目录（只有 store.sst 与 snapshot.json）。
+	// snapshotWorkDir 是 leader 侧放导出产物父目录；每次 Snapshot 在它下面建立独立的
+	// snap-* 子目录。不同 Snapshot 的 release 不能互相删除文件。
 	// 进程启动时清空：传输不可续传，重启后半成品一律作废（三家业界实现都选幂等可重来
 	// 而不是可续传，见 notes/REF-raft-snapshot.md）。
 	snapshotWorkDir      = "snapshot"
@@ -120,6 +121,14 @@ func (kvs *KVServer) snapshotWorkPath() string {
 	return filepath.Join(kvs.dataDir, "data", snapshotWorkDir)
 }
 
+func (kvs *KVServer) createSnapshotWorkDir() (string, error) {
+	root := kvs.snapshotWorkPath()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(root, "snap-")
+}
+
 // clearSnapshotWork 清空 leader 侧的导出目录。进程启动时调用一次：上次留下的 store.sst
 // 属于一次没走完的传输，而传输是幂等重来的，半成品没有任何用处，留着只占盘。
 func (kvs *KVServer) clearSnapshotWork() {
@@ -159,8 +168,8 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	manifest := kvs.lastPartitions.manifest()
 	kvs.mu.Unlock()
 
-	dir := kvs.snapshotWorkPath()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := kvs.createSnapshotWorkDir()
+	if err != nil {
 		releasePins()
 		return nil, fmt.Errorf("snapshot work dir: %w", err)
 	}
@@ -420,7 +429,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	// commitIndex 重设为快照里的 applied，于是那一段已提交的条目被丢掉。
 	// 必须在换任何指针之前问：InstallSnapshotState 走到一半失败没法回滚，
 	// 调用方只能 log.Fatalf。
-	if regress, why := kvs.raft.SnapshotRegresses(sm.LastIncludedIndex, sm.LastIndex); regress {
+	if regress, why := kvs.raft.SnapshotRegresses(sm.LastIndex); regress {
 		util.DPrintf("[SNAPSHOT] 拒绝会让本节点后退的快照：%s", why)
 		return kvs.appliedIndexNow(), raftrpc.InstallSSTableStatus_SKIPPED
 	}
