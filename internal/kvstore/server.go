@@ -327,8 +327,8 @@ func New(cfg Config) (*KVServer, error) {
 		FirstGC:           true,
 		dataDir:           cfg.DataDir,
 
-		partitionTargetBytes: int64(cfg.PartitionTargetMB) << 20,
-		absorbRatio:          cfg.AbsorbRatio,
+		partitionTargetBytes:          int64(cfg.PartitionTargetMB) << 20,
+		absorbRatio:                   cfg.AbsorbRatio,
 		bphsEnabled:                   cfg.BPHS,
 		bphsMemtableBytes:             int64(cfg.BPHSMemtableMB) << 20,
 		bphsPartitionGCThresholdBytes: int64(cfg.BPHSPartitionGCThresholdMB) << 20,
