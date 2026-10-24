@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	bphsL0CompactionTrigger       = 4
-	bphsBaseCompactionL0Rounds    = 8
+	bphsL0CompactionTrigger      = 4
+	bphsBaseCompactionL0Rounds   = 8
 	bphsPartitionSyncConcurrency = 8
 )
 
