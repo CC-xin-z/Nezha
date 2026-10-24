@@ -27,6 +27,15 @@ func TestPartitionVLogAppendReadAndReopen(t *testing.T) {
 		}
 		refs = append(refs, ref)
 	}
+	for i, ref := range refs {
+		got, err := vlog.Read(ref)
+		if err != nil {
+			t.Fatalf("read buffered ref %d: %v", i, err)
+		}
+		if !bytes.Equal(got, values[i]) {
+			t.Fatalf("buffered value %d mismatch", i)
+		}
+	}
 	if err := vlog.Sync(); err != nil {
 		t.Fatal(err)
 	}

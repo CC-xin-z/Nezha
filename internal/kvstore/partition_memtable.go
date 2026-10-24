@@ -107,6 +107,13 @@ type partitionMemtable struct {
 	records map[string]bphsRecord
 	bytes   int64
 	limit   int64
+
+	// sortedCache is rebuilt only after a mutation. SCAN used to copy and sort
+	// the entire partition map for every range query, even when only a hundred
+	// keys were requested. All callers access a memtable under its partition
+	// lock, so caching the immutable sorted snapshot here is safe.
+	sortedCache []bphsRecord
+	sortedValid bool
 }
 
 func newPartitionMemtable(limitBytes int64) *partitionMemtable {
@@ -147,6 +154,8 @@ func (mt *partitionMemtable) Put(rec bphsRecord) bool {
 	}
 	mt.records[rec.Key] = rec
 	mt.bytes += bphsRecordBytes(rec)
+	mt.sortedCache = nil
+	mt.sortedValid = false
 	return true
 }
 
@@ -162,11 +171,16 @@ func (mt *partitionMemtable) Sorted() []bphsRecord {
 	if mt == nil {
 		return nil
 	}
+	if mt.sortedValid {
+		return mt.sortedCache
+	}
 	out := make([]bphsRecord, 0, len(mt.records))
 	for _, rec := range mt.records {
 		out = append(out, rec)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	mt.sortedCache = out
+	mt.sortedValid = true
 	return out
 }
 
@@ -176,6 +190,8 @@ func (mt *partitionMemtable) Reset() {
 	}
 	mt.records = make(map[string]bphsRecord)
 	mt.bytes = 0
+	mt.sortedCache = nil
+	mt.sortedValid = false
 }
 
 func bphsRecordBytes(rec bphsRecord) int64 {

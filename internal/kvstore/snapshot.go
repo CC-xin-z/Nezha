@@ -584,6 +584,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 			store.Close()
 			return fail("装载快照的 BPHS 状态: %v", err)
 		}
+		newBPHS.markLegacyCovered()
 	}
 
 	// 5) 换掉内存里的状态机指针，再让 Raft 接上新日志。

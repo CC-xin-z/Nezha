@@ -29,6 +29,27 @@ func TestPartitionMemtableKeepsNewestVersion(t *testing.T) {
 	}
 }
 
+func TestPartitionMemtableSortedCacheInvalidatesOnWrite(t *testing.T) {
+	mt := newPartitionMemtable(1 << 20)
+	mt.Put(bphsRecord{Key: "0000000002", Version: 1, Kind: bphsInlineRecord, Value: "b"})
+	mt.Put(bphsRecord{Key: "0000000001", Version: 2, Kind: bphsInlineRecord, Value: "a"})
+
+	first := mt.Sorted()
+	second := mt.Sorted()
+	if len(first) != 2 || len(second) != 2 || first[0].Key != "0000000001" {
+		t.Fatalf("sorted records = %+v, %+v", first, second)
+	}
+	if &first[0] != &second[0] {
+		t.Fatal("unchanged memtable should reuse its sorted snapshot")
+	}
+
+	mt.Put(bphsRecord{Key: "0000000000", Version: 3, Kind: bphsInlineRecord, Value: "z"})
+	updated := mt.Sorted()
+	if len(updated) != 3 || updated[0].Key != "0000000000" {
+		t.Fatalf("sorted cache was not invalidated: %+v", updated)
+	}
+}
+
 func TestFlushPartitionMemtableRoundTrip(t *testing.T) {
 	mt := newPartitionMemtable(1 << 20)
 	const count = 257

@@ -24,9 +24,6 @@ func TestPartitionRecordLogRoundTripAndScan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := log.Sync(); err != nil {
-		t.Fatal(err)
-	}
 	for i := range want {
 		got, err := log.ReadAt(offsets[i])
 		if err != nil {
@@ -36,6 +33,9 @@ func TestPartitionRecordLogRoundTripAndScan(t *testing.T) {
 		if got != want[i] {
 			t.Fatalf("record %d = %+v, want %+v", i, got, want[i])
 		}
+	}
+	if err := log.Sync(); err != nil {
+		t.Fatal(err)
 	}
 	if err := log.Close(); err != nil {
 		t.Fatal(err)
@@ -100,5 +100,46 @@ func TestPartitionRecordLogDetectsCorruption(t *testing.T) {
 	defer reopened.Close()
 	if _, err := reopened.ReadAt(offset); err == nil {
 		t.Fatal("corrupted record should fail checksum validation")
+	}
+}
+
+func TestPartitionRecordLogReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p0.records")
+	log, err := openPartitionRecordLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	if _, err := log.Append(bphsRecord{
+		Key: "0000000001", Version: 1, Kind: bphsInlineRecord, Value: "payload",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if log.Size() != 0 {
+		t.Fatalf("record log size after reset = %d, want 0", log.Size())
+	}
+	records, err := log.ScanAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records after reset = %+v, want empty", records)
+	}
+	offset, err := log.Append(bphsRecord{
+		Key: "0000000002", Version: 2, Kind: bphsInlineRecord, Value: "after-reset",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := log.ReadAt(offset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != "0000000002" || got.Value != "after-reset" {
+		t.Fatalf("record after reset = %+v", got)
 	}
 }

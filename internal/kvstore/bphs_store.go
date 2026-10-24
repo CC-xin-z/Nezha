@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +18,11 @@ import (
 	"github.com/linxGnu/grocksdb"
 )
 
-const bphsL0CompactionTrigger = 4
+const (
+	bphsL0CompactionTrigger       = 4
+	bphsBaseCompactionL0Rounds    = 8
+	bphsPartitionSyncConcurrency = 8
+)
 
 type bphsPartitionManifest struct {
 	Generation uint64 `json:"generation"`
@@ -52,15 +59,19 @@ func loadBPHSPartitionManifest(dir string, partition int) (bphsPartitionManifest
 // 新版本。MemTable 达到预算后刷成 L0，l0 数量达到阈值时只在本分区内合并；
 // records 仍是持久化 WAL，重启时只重放比最新 L0 更新的版本。
 type bphsPartition struct {
-	mu        sync.RWMutex
-	index     int
-	base      *SortedFileIndex
-	baseLocal bool
-	mem       *partitionMemtable
-	records   *partitionRecordLog
-	vlog      *partitionVLog
-	l0        []*SortedFileIndex // 从旧到新
-	gen       uint64
+	mu           sync.RWMutex
+	index        int
+	base         *SortedFileIndex
+	baseLocal    bool
+	mem          *partitionMemtable
+	records      *partitionRecordLog
+	vlog         *partitionVLog
+	l0           []*SortedFileIndex // 从旧到新
+	gen          uint64
+	recordsDirty bool
+	vlogDirty    bool
+	compacting   bool
+	l0Merges     int
 }
 
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
@@ -72,8 +83,17 @@ type bphsStore struct {
 	parts                     []*bphsPartition
 	dir                       string
 	memtableBytes             int64
-	inlineCacheBytes          int64
+	inline                    *InlineCache
 	partitionGCThresholdBytes int64
+	legacyCovered             bool
+
+	compactCh   chan int
+	compactStop chan struct{}
+	compactWG   sync.WaitGroup
+	compactJobs sync.WaitGroup
+	closeOnce   sync.Once
+	errMu       sync.Mutex
+	compactErr  error
 }
 
 func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes, inlineCacheBytes int64, maxVersion uint32) (*bphsStore, error) {
@@ -83,14 +103,28 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	var inline *InlineCache
+	for _, basePart := range base.parts {
+		if basePart.InlineValues != nil {
+			inline = basePart.InlineValues
+			break
+		}
+	}
+	if inline == nil && inlineCacheBytes > 0 {
+		inline = NewInlineCache(inlineCacheBytes)
+	}
 	s := &bphsStore{
 		kvs:                       kvs,
 		base:                      base,
 		dir:                       dir,
 		memtableBytes:             memtableBytes,
-		inlineCacheBytes:          inlineCacheBytes,
+		inline:                    inline,
 		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
+		compactCh:                 make(chan int, base.Len()),
+		compactStop:               make(chan struct{}),
 	}
+	s.compactWG.Add(1)
+	go s.compactLoop()
 	for i, basePart := range base.parts {
 		meta, hasMeta, err := loadBPHSPartitionManifest(dir, i)
 		if err != nil {
@@ -110,6 +144,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 					s.Close()
 					return nil, fmt.Errorf("load partition %d BPHS base: %w", i, err)
 				}
+				localBase.InlineValues = inline
 				localBaseLoaded = true
 			}
 		}
@@ -159,6 +194,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 				}
 				continue
 			}
+			loaded.file.InlineValues = inline
 			part.l0 = append(part.l0, loaded.file)
 			if loaded.maxVersion > maxCoveredVersion {
 				maxCoveredVersion = loaded.maxVersion
@@ -185,7 +221,149 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		}
 		s.parts = append(s.parts, part)
 	}
+	if err := cleanupUnreferencedBPHSFiles(s); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+var bphsPartitionFileName = regexp.MustCompile(`^p[0-9]{6}(\.(records|vlog)|_(l0|base)_[^/]+\.sst)$`)
+var bphsPartitionManifestName = regexp.MustCompile(`^p([0-9]{6})\.manifest\.json$`)
+
+func cleanupUnreferencedBPHSFiles(s *bphsStore) error {
+	keep := make(map[string]struct{})
+	for _, part := range s.parts {
+		keep[filepath.Base(part.records.Path())] = struct{}{}
+		keep[filepath.Base(part.vlog.Path())] = struct{}{}
+		if part.baseLocal && part.base != nil {
+			keep[filepath.Base(part.base.FilePath)] = struct{}{}
+		}
+		for _, l0 := range part.l0 {
+			keep[filepath.Base(l0.FilePath)] = struct{}{}
+		}
+	}
+
+	removeIfUnreferenced := func(path string) error {
+		name := filepath.Base(path)
+		if !bphsPartitionFileName.MatchString(name) {
+			return nil
+		}
+		if _, ok := keep[name]; ok {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Remove(sparseIndexPath(path)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		fmt.Printf("[RECOVER] removed stale BPHS file %s\n", path)
+		return nil
+	}
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if match := bphsPartitionManifestName.FindStringSubmatch(name); match != nil {
+			idx, err := strconv.Atoi(match[1])
+			if err != nil {
+				return err
+			}
+			if idx < len(s.parts) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			fmt.Printf("[RECOVER] removed stale BPHS manifest %s\n", name)
+			continue
+		}
+		if !strings.HasSuffix(name, ".sst") &&
+			!strings.HasSuffix(name, ".records") &&
+			!strings.HasSuffix(name, ".vlog") {
+			continue
+		}
+		if err := removeIfUnreferenced(filepath.Join(s.dir, name)); err != nil {
+			return fmt.Errorf("cleanup BPHS file %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (s *bphsStore) compactLoop() {
+	defer s.compactWG.Done()
+	for {
+		select {
+		case <-s.compactStop:
+			return
+		case idx := <-s.compactCh:
+			part := s.parts[idx]
+			part.mu.Lock()
+			var err error
+			t0 := time.Now()
+			if part.compacting {
+				err = s.compactPartitionLocked(part)
+				fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
+					idx, time.Since(t0), part.gen, err)
+				part.compacting = false
+			}
+			part.mu.Unlock()
+			if err != nil {
+				s.errMu.Lock()
+				if s.compactErr == nil {
+					s.compactErr = err
+				}
+				s.errMu.Unlock()
+				fmt.Printf("BPHS background compaction partition %d failed: %v\n", idx, err)
+			}
+			s.compactJobs.Done()
+		}
+	}
+}
+
+func (s *bphsStore) scheduleCompactionLocked(part *bphsPartition) {
+	if s == nil || part == nil || part.compacting {
+		return
+	}
+	select {
+	case <-s.compactStop:
+		return
+	default:
+	}
+	part.compacting = true
+	s.compactJobs.Add(1)
+	select {
+	case s.compactCh <- part.index:
+	default:
+		part.compacting = false
+		s.compactJobs.Done()
+	}
+}
+
+func (s *bphsStore) compactionError() error {
+	if s == nil {
+		return nil
+	}
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.compactErr
+}
+
+// WaitForCompactions is used by tests and maintenance tools that need a stable
+// on-disk view. Normal request handling never waits for background compaction.
+func (s *bphsStore) WaitForCompactions() error {
+	if s == nil {
+		return nil
+	}
+	s.compactJobs.Wait()
+	return s.compactionError()
 }
 
 func (s *bphsStore) SetBase(base *PartitionSet) error {
@@ -240,9 +418,30 @@ func (s *bphsStore) Dir() string {
 	return s.dir
 }
 
+// CoversLegacy reports whether the activation-time tail was fully imported
+// into BPHS. From that point on, BPHS is the authoritative data path and SCAN
+// no longer needs to merge the frozen global partition set on every query.
+func (s *bphsStore) CoversLegacy() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.legacyCovered
+}
+
+func (s *bphsStore) markLegacyCovered() {
+	s.mu.Lock()
+	s.legacyCovered = true
+	s.mu.Unlock()
+}
+
 // Put 把一条已提交的 Raft PUT 写入目标分区。返回分区 id，调用方应把它加入 dirty
 // 集合并在这批 applied index 落库之前调用 SyncPartitions。
 func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
+	if err := s.compactionError(); err != nil {
+		return -1, fmt.Errorf("background partition compaction: %w", err)
+	}
 	part, err := s.route(key)
 	if err != nil {
 		return -1, err
@@ -263,11 +462,13 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 		ref.Generation = part.gen
 		rec.Kind = bphsBlobRecord
 		rec.Blob = ref
+		part.vlogDirty = true
 	}
 	offset, err := part.records.Append(rec)
 	if err != nil {
 		return -1, fmt.Errorf("append partition %d record: %w", part.index, err)
 	}
+	part.recordsDirty = true
 	rec.LogOffset = offset
 	part.mem.Put(rec)
 	if part.mem.Full() {
@@ -275,9 +476,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 			return -1, err
 		}
 	} else if s.shouldCompactPartitionLocked(part) {
-		if err := s.compactPartitionLocked(part); err != nil {
-			return -1, fmt.Errorf("partition %d VLog-triggered compaction: %w", part.index, err)
-		}
+		s.scheduleCompactionLocked(part)
 	}
 	return part.index, nil
 }
@@ -288,7 +487,7 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 	}
 	name := fmt.Sprintf("p%06d_l0_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
-	l0, err := s.kvs.flushPartitionMemtable(part.mem, path, s.inlineCacheBytes)
+	l0, err := s.kvs.flushPartitionMemtable(part.mem, path, 0)
 	if err != nil {
 		return fmt.Errorf("flush partition %d memtable: %w", part.index, err)
 	}
@@ -296,17 +495,23 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 		part.mem.Reset()
 		return nil
 	}
+	l0.InlineValues = s.inline
 	part.l0 = append(part.l0, l0)
 	part.mem.Reset()
+	// The L0 file was fsynced by flushPartitionMemtable and contains the latest
+	// value for every key in this memtable. Older records are no longer needed
+	// for recovery, so do not let this per-partition WAL grow forever.
+	if err := part.records.Reset(); err != nil {
+		return fmt.Errorf("reset partition %d record log after L0: %w", part.index, err)
+	}
+	part.recordsDirty = false
 	if len(part.l0) >= bphsL0CompactionTrigger {
 		if err := s.compactL0Locked(part); err != nil {
 			return fmt.Errorf("compact partition %d L0: %w", part.index, err)
 		}
 	}
 	if s.shouldCompactPartitionLocked(part) {
-		if err := s.compactPartitionLocked(part); err != nil {
-			return fmt.Errorf("compact partition %d base: %w", part.index, err)
-		}
+		s.scheduleCompactionLocked(part)
 	}
 	return nil
 }
@@ -315,10 +520,14 @@ func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
 	if part == nil {
 		return false
 	}
-	delta := part.vlog.Size() + part.mem.Bytes()
-	for _, run := range part.l0 {
-		delta += run.FileSize
+	// Inline records are bounded by partition-local L0 compaction. Rewriting
+	// the whole Base for every L0 batch is pure write amplification, so inline
+	// partitions merge into a local Base only after several L0 merge rounds.
+	// VLog growth still triggers earlier because it is reclaimable Blob space.
+	if part.vlog.Size() == 0 {
+		return part.l0Merges >= bphsBaseCompactionL0Rounds
 	}
+	delta := part.vlog.Size()
 	threshold := s.partitionGCThresholdBytes
 	if threshold <= 0 {
 		threshold = int64(16 << 20)
@@ -335,11 +544,17 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	if part == nil || (len(part.l0) == 0 && part.mem.Len() == 0) {
 		return nil
 	}
-	if err := part.vlog.Sync(); err != nil {
-		return err
+	if part.vlogDirty {
+		if err := part.vlog.Sync(); err != nil {
+			return err
+		}
+		part.vlogDirty = false
 	}
-	if err := part.records.Sync(); err != nil {
-		return err
+	if part.recordsDirty {
+		if err := part.records.Sync(); err != nil {
+			return err
+		}
+		part.recordsDirty = false
 	}
 
 	merged := make(map[string]bphsRecord)
@@ -396,13 +611,14 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 
 	name := fmt.Sprintf("p%06d_base_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
-	newBase, err := s.kvs.flushBPHSBaseFile(records, path, s.inlineCacheBytes)
+	newBase, err := s.kvs.flushBPHSBaseFile(records, path, 0)
 	if err != nil {
 		return err
 	}
 	if newBase == nil {
 		return nil
 	}
+	newBase.InlineValues = s.inline
 
 	nextGen := part.gen + 1
 	meta := bphsPartitionManifest{
@@ -434,6 +650,7 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	part.baseLocal = true
 	part.gen = nextGen
 	part.l0 = nil
+	part.l0Merges = 0
 	part.mem.Reset()
 
 	for _, run := range oldL0 {
@@ -453,6 +670,7 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	if err != nil {
 		return err
 	}
+	part.recordsDirty = false
 
 	if err := part.vlog.Close(); err != nil {
 		return err
@@ -465,6 +683,7 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	if err != nil {
 		return err
 	}
+	part.vlogDirty = false
 
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
 		oldBase.closePool()
@@ -478,8 +697,13 @@ func (s *bphsStore) compactL0Locked(part *bphsPartition) error {
 	if part == nil || len(part.l0) < 2 {
 		return nil
 	}
+	mergeCount := bphsL0CompactionTrigger
+	if mergeCount > len(part.l0) {
+		mergeCount = len(part.l0)
+	}
+	old := append([]*SortedFileIndex(nil), part.l0[:mergeCount]...)
 	merged := newPartitionMemtable(0)
-	for _, run := range part.l0 {
+	for _, run := range old {
 		records, err := readBPHSSortedFile(run.FilePath)
 		if err != nil {
 			return err
@@ -488,23 +712,22 @@ func (s *bphsStore) compactL0Locked(part *bphsPartition) error {
 			merged.Put(rec)
 		}
 	}
-	for _, rec := range part.mem.Sorted() {
-		merged.Put(rec)
-	}
 
 	name := fmt.Sprintf("p%06d_l0_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
-	l0, err := s.kvs.flushPartitionMemtable(merged, path, s.inlineCacheBytes)
+	l0, err := s.kvs.flushPartitionMemtable(merged, path, 0)
 	if err != nil {
 		return err
 	}
 	if l0 == nil {
 		return nil
 	}
+	l0.InlineValues = s.inline
 
-	old := part.l0
-	part.l0 = []*SortedFileIndex{l0}
-	part.mem.Reset()
+	part.l0 = append([]*SortedFileIndex{l0}, part.l0[mergeCount:]...)
+	part.l0Merges++
+	fmt.Printf("[BPHS-L0] partition=%d merged=%d remaining=%d l0_merge_rounds=%d\n",
+		part.index, mergeCount, len(part.l0), part.l0Merges)
 	for _, run := range old {
 		run.closePool()
 		for _, p := range []string{run.FilePath, sparseIndexPath(run.FilePath)} {
@@ -740,6 +963,9 @@ func loadBPHSBaseFile(kvs *KVServer, dir string, meta bphsPartitionManifest, inl
 }
 
 func (s *bphsStore) Get(key string) (value string, found bool, err error) {
+	if err := s.compactionError(); err != nil {
+		return "", false, fmt.Errorf("background partition compaction: %w", err)
+	}
 	part, err := s.route(key)
 	if err != nil {
 		return "", false, err
@@ -764,7 +990,8 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 		}
 	}
 
-	// L0 目前不会自动产生；保留从新到旧的查找顺序，供局部 Compaction 接入。
+	// L0 按从新到旧查找；后台分区 Compaction 合入 base 前，这里必须继续
+	// 覆盖所有仍在文件中的版本。
 	for i := len(part.l0) - 1; i >= 0; i-- {
 		entry, err := s.kvs.lookupInSortedFile(part.l0[i], key)
 		if err != nil {
@@ -802,6 +1029,9 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 	if startKey > endKey {
 		return nil, nil
+	}
+	if err := s.compactionError(); err != nil {
+		return nil, fmt.Errorf("background partition compaction: %w", err)
 	}
 
 	s.mu.RLock()
@@ -909,21 +1139,55 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 	if s == nil || len(indices) == 0 {
 		return nil
 	}
+	if err := s.compactionError(); err != nil {
+		return fmt.Errorf("background partition compaction: %w", err)
+	}
 	for idx := range indices {
 		if idx < 0 || idx >= len(s.parts) {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
-		part := s.parts[idx]
-		part.mu.Lock()
-		if err := part.vlog.Sync(); err != nil {
-			part.mu.Unlock()
-			return fmt.Errorf("sync partition %d vlog: %w", idx, err)
+	}
+
+	type syncResult struct {
+		idx int
+		err error
+	}
+	results := make(chan syncResult, len(indices))
+	sem := make(chan struct{}, bphsPartitionSyncConcurrency)
+	var wg sync.WaitGroup
+	for idx := range indices {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			part := s.parts[idx]
+			part.mu.Lock()
+			defer part.mu.Unlock()
+			if part.vlogDirty {
+				if err := part.vlog.Sync(); err != nil {
+					results <- syncResult{idx: idx, err: fmt.Errorf("sync partition %d vlog: %w", idx, err)}
+					return
+				}
+				part.vlogDirty = false
+			}
+			if part.recordsDirty {
+				if err := part.records.Sync(); err != nil {
+					results <- syncResult{idx: idx, err: fmt.Errorf("sync partition %d records: %w", idx, err)}
+					return
+				}
+				part.recordsDirty = false
+			}
+			results <- syncResult{idx: idx}
+		}(idx)
+	}
+	wg.Wait()
+	close(results)
+
+	for result := range results {
+		if result.err != nil {
+			return result.err
 		}
-		if err := part.records.Sync(); err != nil {
-			part.mu.Unlock()
-			return fmt.Errorf("sync partition %d records: %w", idx, err)
-		}
-		part.mu.Unlock()
 	}
 	return nil
 }
@@ -981,26 +1245,37 @@ func (s *bphsStore) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var first error
-	for _, part := range s.parts {
-		part.mu.Lock()
-		if err := part.records.Close(); err != nil && first == nil {
-			first = err
+	s.closeOnce.Do(func() {
+		// Let already queued compactions finish so they cannot race the file
+		// close below. New compactions are expected to stop before Close.
+		s.compactJobs.Wait()
+		close(s.compactStop)
+		s.compactWG.Wait()
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, part := range s.parts {
+			part.mu.Lock()
+			if err := part.records.Close(); err != nil && first == nil {
+				first = err
+			}
+			if err := part.vlog.Close(); err != nil && first == nil {
+				first = err
+			}
+			for _, l0 := range part.l0 {
+				l0.closePool()
+			}
+			if part.baseLocal && part.base != nil {
+				part.base.closePool()
+			}
+			part.mu.Unlock()
 		}
-		if err := part.vlog.Close(); err != nil && first == nil {
-			first = err
-		}
-		for _, l0 := range part.l0 {
-			l0.closePool()
-		}
-		if part.baseLocal && part.base != nil {
-			part.base.closePool()
-		}
-		part.mu.Unlock()
+		s.parts = nil
+	})
+	if first == nil {
+		first = s.compactionError()
 	}
-	s.parts = nil
 	return first
 }
 
@@ -1028,6 +1303,7 @@ func (kvs *KVServer) enableOrUpdateBPHS(base *PartitionSet) error {
 			return err
 		}
 	}
+	store.markLegacyCovered()
 	kvs.bphs = store
 	kvs.bphsDir = dir
 	return nil

@@ -1,6 +1,7 @@
 package kvstore
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -17,10 +18,11 @@ const partitionRecordHeaderBytes = 44
 // 它是 BPHS 覆盖写的持久化来源：MemTable 只是内存索引，崩溃后 ScanAll 可以重建。
 // 记录一旦合法就只追加；覆盖版本在局部 Compaction 时删除。
 type partitionRecordLog struct {
-	mu   sync.Mutex
-	file *os.File
-	path string
-	size int64
+	mu     sync.Mutex
+	file   *os.File
+	writer *bufio.Writer
+	path   string
+	size   int64
 }
 
 func openPartitionRecordLog(path string) (*partitionRecordLog, error) {
@@ -33,7 +35,9 @@ func openPartitionRecordLog(path string) (*partitionRecordLog, error) {
 		file.Close()
 		return nil, err
 	}
-	return &partitionRecordLog{file: file, path: path, size: st.Size()}, nil
+	return &partitionRecordLog{
+		file: file, writer: bufio.NewWriterSize(file, 256<<10), path: path, size: st.Size(),
+	}, nil
 }
 
 func (l *partitionRecordLog) Path() string {
@@ -82,13 +86,13 @@ func (l *partitionRecordLog) Append(rec bphsRecord) (int64, error) {
 		return 0, os.ErrClosed
 	}
 	offset := l.size
-	if err := writeFull(l.file, header[:]); err != nil {
+	if err := writeFull(l.writer, header[:]); err != nil {
 		return 0, err
 	}
-	if err := writeFull(l.file, key); err != nil {
+	if err := writeFull(l.writer, key); err != nil {
 		return 0, err
 	}
-	if err := writeFull(l.file, value); err != nil {
+	if err := writeFull(l.writer, value); err != nil {
 		return 0, err
 	}
 	l.size += int64(len(header) + len(key) + len(value))
@@ -104,7 +108,39 @@ func (l *partitionRecordLog) Sync() error {
 	if l.file == nil {
 		return os.ErrClosed
 	}
+	if err := l.writer.Flush(); err != nil {
+		return err
+	}
 	return l.file.Sync()
+}
+
+// Reset drops records that have already been made durable in an L0 or base.
+// The caller must hold the partition lock, ensure the replacement data is
+// fsynced, and only then call Reset.
+func (l *partitionRecordLog) Reset() error {
+	if l == nil {
+		return fmt.Errorf("nil partition record log")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		l.writer = nil
+		if err := l.file.Close(); err != nil {
+			return err
+		}
+		l.file = nil
+	}
+	if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	l.file = file
+	l.writer = bufio.NewWriterSize(file, 256<<10)
+	l.size = 0
+	return nil
 }
 
 func (l *partitionRecordLog) ReadAt(offset int64) (bphsRecord, error) {
@@ -115,6 +151,9 @@ func (l *partitionRecordLog) ReadAt(offset int64) (bphsRecord, error) {
 	defer l.mu.Unlock()
 	if l.file == nil {
 		return bphsRecord{}, os.ErrClosed
+	}
+	if err := l.writer.Flush(); err != nil {
+		return bphsRecord{}, err
 	}
 	return l.readAtLocked(offset)
 }
@@ -192,6 +231,9 @@ func (l *partitionRecordLog) ScanAll() ([]bphsRecord, error) {
 	if l.file == nil {
 		return nil, os.ErrClosed
 	}
+	if err := l.writer.Flush(); err != nil {
+		return nil, err
+	}
 	var records []bphsRecord
 	for offset := int64(0); offset < l.size; {
 		rec, err := l.readAtLocked(offset)
@@ -216,9 +258,18 @@ func (l *partitionRecordLog) Close() error {
 	if l.file == nil {
 		return nil
 	}
-	err := l.file.Close()
+	var first error
+	if l.writer != nil {
+		if err := l.writer.Flush(); err != nil {
+			first = err
+		}
+		l.writer = nil
+	}
+	if err := l.file.Close(); err != nil && first == nil {
+		first = err
+	}
 	l.file = nil
-	return err
+	return first
 }
 
 func writeFull(w io.Writer, data []byte) error {

@@ -109,15 +109,20 @@ func (kvs *KVServer) ScanRangeInRaft(ctx context.Context, in *kvrpc.ScanRangeReq
 	}
 
 	if st.bphs != nil {
-		legacy, err := kvs.anotherGCScan(st, in.StartKey, in.EndKey)
-		if err != nil {
-			fmt.Printf("[SCAN] BPHS 查询旧尾部失败: %v\n", err)
-			reply.Err = "error in scan"
-			return reply, nil
-		}
 		bphsResult, err := st.bphs.Scan(in.StartKey, in.EndKey)
 		if err != nil {
 			fmt.Printf("[SCAN] BPHS 范围查询失败: %v\n", err)
+			reply.Err = "error in scan"
+			return reply, nil
+		}
+		if st.bphs.CoversLegacy() {
+			reply.KeyValuePairs = bphsResult
+			return reply, nil
+		}
+
+		legacy, err := kvs.anotherGCScan(st, in.StartKey, in.EndKey)
+		if err != nil {
+			fmt.Printf("[SCAN] BPHS 查询旧尾部失败: %v\n", err)
 			reply.Err = "error in scan"
 			return reply, nil
 		}
@@ -243,9 +248,14 @@ func (kvs *KVServer) StartGet(st stateSnapshot, args *kvrpc.GetInRaftRequest) *k
 			return reply
 		}
 		if !found {
-			// Bootstrap is allowed to overlap the tail of the transition GC. Those
-			// writes live in the legacy currentLog/currentStore and are not part of the
-			// base partitions yet, so fall through to the old read path.
+			if st.bphs.CoversLegacy() {
+				reply.Err = raft.ErrNoKey
+				reply.Value = raft.NoKey
+				return reply
+			}
+			// Before the activation-time legacy tail is fully imported, writes can
+			// still live in the old currentLog/currentStore. Fall through only during
+			// that transition window.
 		} else {
 			reply.Value = value
 			return reply

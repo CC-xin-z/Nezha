@@ -1,6 +1,7 @@
 package kvstore
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -17,10 +18,11 @@ const partitionVLogHeaderBytes = 16
 // bphsBlobRef.Offset 指向记录头，Length 是 payload 长度；读取时校验长度和 CRC，
 // 把截断或错位变成显式错误，而不是静默返回错误 value。
 type partitionVLog struct {
-	mu   sync.Mutex
-	file *os.File
-	path string
-	size int64
+	mu     sync.Mutex
+	file   *os.File
+	writer *bufio.Writer
+	path   string
+	size   int64
 }
 
 func openPartitionVLog(path string) (*partitionVLog, error) {
@@ -33,7 +35,9 @@ func openPartitionVLog(path string) (*partitionVLog, error) {
 		file.Close()
 		return nil, err
 	}
-	return &partitionVLog{file: file, path: path, size: st.Size()}, nil
+	return &partitionVLog{
+		file: file, writer: bufio.NewWriterSize(file, 256<<10), path: path, size: st.Size(),
+	}, nil
 }
 
 func (v *partitionVLog) Path() string {
@@ -68,7 +72,7 @@ func (v *partitionVLog) Append(value []byte) (bphsBlobRef, error) {
 	binary.LittleEndian.PutUint64(header[0:8], uint64(len(value)))
 	binary.LittleEndian.PutUint32(header[8:12], crc32.ChecksumIEEE(value))
 	offset := v.size
-	n, err := v.file.Write(header[:])
+	n, err := v.writer.Write(header[:])
 	if err != nil || n != len(header) {
 		if err == nil {
 			err = io.ErrShortWrite
@@ -76,7 +80,7 @@ func (v *partitionVLog) Append(value []byte) (bphsBlobRef, error) {
 		return bphsBlobRef{}, err
 	}
 	if len(value) > 0 {
-		n, err := v.file.Write(value)
+		n, err := v.writer.Write(value)
 		if err != nil || n != len(value) {
 			if err == nil {
 				err = io.ErrShortWrite
@@ -97,6 +101,9 @@ func (v *partitionVLog) Sync() error {
 	if v.file == nil {
 		return os.ErrClosed
 	}
+	if err := v.writer.Flush(); err != nil {
+		return err
+	}
 	return v.file.Sync()
 }
 
@@ -108,6 +115,9 @@ func (v *partitionVLog) Read(ref bphsBlobRef) ([]byte, error) {
 	defer v.mu.Unlock()
 	if v.file == nil {
 		return nil, os.ErrClosed
+	}
+	if err := v.writer.Flush(); err != nil {
+		return nil, err
 	}
 	if ref.Offset < 0 || ref.Length < 0 ||
 		ref.Offset > v.size-partitionVLogHeaderBytes {
@@ -145,7 +155,16 @@ func (v *partitionVLog) Close() error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	err := v.file.Close()
+	var first error
+	if v.writer != nil {
+		if err := v.writer.Flush(); err != nil {
+			first = err
+		}
+		v.writer = nil
+	}
+	if err := v.file.Close(); err != nil && first == nil {
+		first = err
+	}
 	v.file = nil
-	return err
+	return first
 }

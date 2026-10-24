@@ -120,6 +120,12 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "p000001.records"), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "p000001.manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	reopened, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
 	if err != nil {
@@ -150,6 +156,52 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 			names = append(names, fmt.Sprint(entry.Name()))
 		}
 		t.Fatalf("BPHS files = %v, want records+vlog", names)
+	}
+}
+
+func TestBPHSSyncTracksDirtyFiles(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(kvs, base, filepath.Join(t.TempDir(), "bphs"), 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	partID, err := store.Put("0000000001", "inline", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := store.parts[partID]
+	if !part.recordsDirty || part.vlogDirty {
+		t.Fatalf("inline dirty flags = records:%v vlog:%v", part.recordsDirty, part.vlogDirty)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{partID: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+	if part.recordsDirty || part.vlogDirty {
+		t.Fatalf("dirty flags after inline sync = records:%v vlog:%v", part.recordsDirty, part.vlogDirty)
+	}
+
+	partID, err = store.Put("0000000002", strings.Repeat("x", 1024), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part = store.parts[partID]
+	if !part.recordsDirty || !part.vlogDirty {
+		t.Fatalf("blob dirty flags = records:%v vlog:%v", part.recordsDirty, part.vlogDirty)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{partID: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+	if part.recordsDirty || part.vlogDirty {
+		t.Fatalf("dirty flags after blob sync = records:%v vlog:%v", part.recordsDirty, part.vlogDirty)
 	}
 }
 
@@ -187,6 +239,9 @@ func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 	}
 	if len(store.parts[0].l0) >= bphsL0CompactionTrigger {
 		t.Fatalf("L0 compaction 未触发：仍有 %d 个 run", len(store.parts[0].l0))
+	}
+	if got := store.parts[0].records.Size(); got != 0 {
+		t.Fatalf("L0 durable 后 records 仍保留 %d 字节", got)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -571,6 +626,9 @@ func TestBPHSVLogSizeTriggersCompactionBeforeMemtableFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WaitForCompactions(); err != nil {
 		t.Fatal(err)
 	}
 
