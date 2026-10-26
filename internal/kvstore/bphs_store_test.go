@@ -57,6 +57,31 @@ func newBPHSTestBase(t *testing.T, kvs *KVServer, key, value string) *PartitionS
 	return ps
 }
 
+func TestBPHSScanSkipsDisjointL0Range(t *testing.T) {
+	store := &bphsStore{}
+	index := &SortedFileIndex{
+		Sparse: []SparseEntry{{PaddedKey: "0000000100", Offset: 0}},
+		Lo:     "0000000100",
+		Hi:     "0000000199",
+	}
+
+	result := make(map[string]string)
+	if err := store.scanBPHSSortedFileInto(
+		result, "0000000200", "0000000299", nil, index,
+	); err != nil {
+		t.Fatalf("disjoint L0 scan should skip before opening the file: %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatalf("disjoint L0 scan returned %v", result)
+	}
+
+	if err := store.scanBPHSSortedFileInto(
+		result, "0000000100", "0000000100", nil, index,
+	); err == nil {
+		t.Fatal("overlapping L0 scan should reach the missing descriptor pool")
+	}
+}
+
 func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},

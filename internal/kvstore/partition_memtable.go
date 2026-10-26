@@ -184,6 +184,26 @@ func (mt *partitionMemtable) Sorted() []bphsRecord {
 	return out
 }
 
+// SortedRange returns only records whose keys fall in the inclusive range
+// [startKey, endKey]. The sorted snapshot is immutable while callers hold the
+// owning partition lock, so binary-searching and returning a subslice is safe.
+func (mt *partitionMemtable) SortedRange(startKey, endKey string) []bphsRecord {
+	if mt == nil || startKey > endKey {
+		return nil
+	}
+	records := mt.Sorted()
+	lo := sort.Search(len(records), func(i int) bool {
+		return records[i].Key >= startKey
+	})
+	hi := sort.Search(len(records), func(i int) bool {
+		return records[i].Key > endKey
+	})
+	if lo >= hi {
+		return nil
+	}
+	return records[lo:hi]
+}
+
 func (mt *partitionMemtable) Reset() {
 	if mt == nil {
 		return

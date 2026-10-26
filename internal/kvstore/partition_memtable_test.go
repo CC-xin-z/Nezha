@@ -50,6 +50,29 @@ func TestPartitionMemtableSortedCacheInvalidatesOnWrite(t *testing.T) {
 	}
 }
 
+func TestPartitionMemtableSortedRange(t *testing.T) {
+	mt := newPartitionMemtable(1 << 20)
+	for _, key := range []string{
+		"0000000000",
+		"0000000002",
+		"0000000004",
+		"0000000006",
+	} {
+		mt.Put(bphsRecord{Key: key, Version: 1, Kind: bphsInlineRecord, Value: key})
+	}
+
+	got := mt.SortedRange("0000000002", "0000000004")
+	if len(got) != 2 || got[0].Key != "0000000002" || got[1].Key != "0000000004" {
+		t.Fatalf("sorted range = %+v, want keys 0000000002 and 0000000004", got)
+	}
+	if got := mt.SortedRange("0000000005", "0000000001"); got != nil {
+		t.Fatalf("reversed range = %+v, want nil", got)
+	}
+	if got := mt.SortedRange("0000000007", "0000000009"); got != nil {
+		t.Fatalf("disjoint range = %+v, want nil", got)
+	}
+}
+
 func TestFlushPartitionMemtableRoundTrip(t *testing.T) {
 	mt := newPartitionMemtable(1 << 20)
 	const count = 257

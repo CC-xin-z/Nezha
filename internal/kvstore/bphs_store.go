@@ -1061,10 +1061,7 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 				return nil, err
 			}
 		}
-		for _, rec := range part.mem.Sorted() {
-			if rec.Key < startKey || rec.Key > endKey {
-				continue
-			}
+		for _, rec := range part.mem.SortedRange(startKey, endKey) {
 			value, err := s.recordValue(part, rec)
 			if err != nil {
 				part.mu.RUnlock()
@@ -1078,6 +1075,14 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 }
 
 func (s *bphsStore) scanBPHSSortedFileInto(result map[string]string, startKey, endKey string, part *bphsPartition, index *SortedFileIndex) error {
+	if index == nil {
+		return fmt.Errorf("BPHS L0 index is nil")
+	}
+	// L0 files are immutable and carry their exact key bounds. Avoid opening a
+	// descriptor or parsing any rows when the requested range cannot overlap.
+	if (index.Hi != "" && startKey > index.Hi) || (index.Lo != "" && endKey < index.Lo) {
+		return nil
+	}
 	offset, ok := index.firstBlockAtOrAfter(startKey)
 	if !ok {
 		return nil
