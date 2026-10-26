@@ -63,6 +63,40 @@ func TestFirstBlockAtOrAfter(t *testing.T) {
 	}
 }
 
+func TestBoundedScanRange(t *testing.T) {
+	idx := mkIndex([]SparseEntry{
+		{PaddedKey: "0000000100", Offset: 0},
+		{PaddedKey: "0000000200", Offset: 1000},
+		{PaddedKey: "0000000300", Offset: 2000},
+	}, 3000)
+
+	cases := []struct {
+		startKey, endKey string
+		wantStart        int64
+		wantEnd          int64
+		wantOK           bool
+	}{
+		{"0000000050", "0000000150", 0, 1000, true},
+		{"0000000150", "0000000250", 0, 2000, true},
+		{"0000000150", "0000000200", 0, 2000, true},
+		{"0000000200", "0000000300", 1000, 3000, true},
+		{"0000000200", "0000000200", 1000, 2000, true},
+		{"0000000250", "0000000350", 1000, 3000, true},
+		{"0000000050", "0000000050", 0, 0, false},
+		{"0000000250", "0000000150", 0, 0, false},
+	}
+	for _, tc := range cases {
+		start, end, ok := idx.boundedScanRange(tc.startKey, tc.endKey)
+		if ok != tc.wantOK || (ok && (start != tc.wantStart || end != tc.wantEnd)) {
+			t.Errorf("boundedScanRange(%s,%s) = %d,%d,%v; want %d,%d,%v",
+				tc.startKey, tc.endKey, start, end, ok, tc.wantStart, tc.wantEnd, tc.wantOK)
+		}
+	}
+	if _, _, ok := mkIndex(nil, 0).boundedScanRange("a", "z"); ok {
+		t.Error("empty index should return ok=false")
+	}
+}
+
 // 构建器：每块一项，且首条必建索引点
 func TestSparseIndexBuilder(t *testing.T) {
 	b := NewSparseIndexBuilder(100) // 100 字节一块

@@ -119,6 +119,32 @@ func (sfi *SortedFileIndex) firstBlockAtOrAfter(key string) (int64, bool) {
 	return sfi.Sparse[0].Offset, true
 }
 
+// boundedScanRange returns the byte interval that can contain keys in
+// [startKey, endKey]. The end offset is the start of the first sparse block
+// whose first key is greater than endKey, or FileSize when no such block exists.
+// All offsets are entry boundaries, so reading the half-open interval cannot
+// truncate an entry that belongs to the requested range.
+func (sfi *SortedFileIndex) boundedScanRange(startKey, endKey string) (int64, int64, bool) {
+	if sfi == nil || startKey > endKey || len(sfi.Sparse) == 0 {
+		return 0, 0, false
+	}
+	start, ok := sfi.firstBlockAtOrAfter(startKey)
+	if !ok {
+		return 0, 0, false
+	}
+	end := sfi.FileSize
+	i := sort.Search(len(sfi.Sparse), func(i int) bool {
+		return sfi.Sparse[i].PaddedKey > endKey
+	})
+	if i < len(sfi.Sparse) {
+		end = sfi.Sparse[i].Offset
+	}
+	if end <= start {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
 // scanBlock 在 [start, end) 内顺序查找 key。
 // 找到返回其 entry；块内 key 已超过目标说明不存在，返回 raft.ErrNoKey。
 func (kvs *KVServer) scanBlock(index *SortedFileIndex, key string, start, end int64) (*raft.Entry, error) {

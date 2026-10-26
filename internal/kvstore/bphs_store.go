@@ -1083,7 +1083,7 @@ func (s *bphsStore) scanBPHSSortedFileInto(result map[string]string, startKey, e
 	if (index.Hi != "" && startKey > index.Hi) || (index.Lo != "" && endKey < index.Lo) {
 		return nil
 	}
-	offset, ok := index.firstBlockAtOrAfter(startKey)
+	startOffset, endOffset, ok := index.boundedScanRange(startKey, endKey)
 	if !ok {
 		return nil
 	}
@@ -1095,10 +1095,11 @@ func (s *bphsStore) scanBPHSSortedFileInto(result map[string]string, startKey, e
 		return err
 	}
 	defer index.pool.Put(file)
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-	reader := bufio.NewReaderSize(file, 1<<20)
+	length := endOffset - startOffset
+	reader := bufio.NewReaderSize(
+		io.NewSectionReader(file, startOffset, length),
+		boundedScanBufferBytes(length),
+	)
 	for {
 		entry, _, err := ReadEntry(reader, 0)
 		if err == io.EOF {

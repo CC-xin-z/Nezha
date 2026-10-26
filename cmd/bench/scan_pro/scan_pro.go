@@ -20,7 +20,7 @@ import (
 
 var (
 	ser   = flag.String("servers", "", "the Server, Client Connects to")
-	cnums = flag.Int("cnums", 1, "Client Threads Number")
+	cnums = flag.Int("cnums", 16, "Client Threads Number")
 	dnums = flag.Int("dnums", 1000000, "data num")
 	// 扫描长度。原先写死为 4000000——那比任何一次实验的数据量都大，于是每轮
 	// SCAN 都在扫全库，测的是"顺序读整个数据集有多快"，而不是 range query。
@@ -75,16 +75,39 @@ type TestResult struct {
 	scanCount     int
 }
 
+func splitScanRequests(total, clients int) []int {
+	if clients <= 0 {
+		clients = 1
+	}
+	counts := make([]int, clients)
+	base := total / clients
+	remainder := total % clients
+	for i := range counts {
+		counts[i] = base
+		if i < remainder {
+			counts[i]++
+		}
+	}
+	return counts
+}
+
 func (kvc *KVClient) scan(gapkey int) (float64, time.Duration, float64) {
 	wg := sync.WaitGroup{}
-	base := *dnums / *cnums
-	wg.Add(*cnums)
+	clients := *cnums
+	if clients <= 0 {
+		clients = 1
+	}
+	if clients > *dnums && *dnums > 0 {
+		clients = *dnums
+	}
+	requestCounts := splitScanRequests(*dnums, clients)
+	wg.Add(clients)
 	kvc.goodPut = 0
 	kvc.goodscan = 0
 
-	results := make(chan scanResult, *cnums)
+	results := make(chan scanResult, clients)
 
-	for i := 0; i < *cnums; i++ {
+	for i := 0; i < clients; i++ {
 		go func(i int) {
 			defer wg.Done()
 			localResult := scanResult{}
@@ -94,9 +117,9 @@ func (kvc *KVClient) scan(gapkey int) (float64, time.Duration, float64) {
 			// var totalActualLatency time.Duration
 
 			// 每次范围查询单独计时，攒在本地切片里，本 goroutine 跑完一次性交出去。
-			samples := make([]time.Duration, 0, base)
+			samples := make([]time.Duration, 0, requestCounts[i])
 
-			for j := 0; j < base; j++ {
+			for j := 0; j < requestCounts[i]; j++ {
 				// 起点上界要留出一个 gapkey，否则区间尾部越过数据末端，
 				// 扫回来的条数比 gapkey 少，吞吐被系统性低估。
 				upper := *keyspaceArg - gapkey
@@ -196,7 +219,7 @@ func (kvc *KVClient) scan(gapkey int) (float64, time.Duration, float64) {
 	kvc.goodscan = totalScanCount
 	kvc.valuesize = valueSize
 
-	avgLatency := totalAvgLatency / time.Duration(*cnums)
+	avgLatency := totalAvgLatency / time.Duration(clients)
 	// maxDuration 为零意味着这一轮没有任何一次 range query 返回数据——除下去得到
 	// NaN，再被后续的平均值传染，整份汇总就都成了 NaN。把这种轮次记为 0 吞吐，
 	// 汇总里才看得出"有几轮扫空了"，而不是整列不可用。

@@ -13,7 +13,6 @@ import (
 
 	"gitee.com/dong-shuishui/FlexSync/api/kvrpc"
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
-	"github.com/edsrzf/mmap-go"
 	"github.com/linxGnu/grocksdb"
 )
 
@@ -360,7 +359,7 @@ func (kvs *KVServer) scanNewFile(startKey, endKey string, persister *raft.Persis
 	// 整段扫描只开一次 valuelog。原先是 decodeScanValue → ReadValueFromOffset，
 	// 里面每个 key 都 os.Open + bufio.NewReader + Close 一遍：一次 1000 条的扫描就是
 	// 1000 次开关文件加 1000 个 4KB 缓冲区，而这一切还发生在 kvs.mu 之内。
-	// 有序文件那条路早就用描述符池 + mmap 避开了这件事，valuelog 这条路没有。
+	// 有序文件那条路使用描述符池和有界区间读取，valuelog 这条路没有。
 	// 惰性打开：baseline（无标记裸 value）与全内联的情形一次都不需要碰这个文件。
 	lr := &logReader{path: logLocation}
 	defer lr.Close()
@@ -872,8 +871,8 @@ func (kvs *KVServer) getFromPartitions(key string, ps *PartitionSet) (_ string, 
 // 按 key 序依次扫描并拼接。
 //
 // 分区内部仍是一段连续读——范围查询的最优路径没有变，变的只是它可能横跨若干个文件。
-// 窄范围通常只落在一个分区里，走单分区快路径；全范围扫描会触及全部分区，多出的代价是
-// 每个分区一次打开与 mmap。
+// 窄范围通常只落在一个分区里，走单分区快路径；全范围扫描会触及全部分区，每个分区
+// 只按稀疏索引读取查询真正覆盖的字节区间。
 func (kvs *KVServer) scanFromPartitions(startKey, endKey string, ps *PartitionSet) (map[string]string, error) {
 	if ps == nil {
 		return nil, nil
@@ -963,6 +962,18 @@ func ReadEntryFromMMap(data []byte) (*raft.Entry, int, error) {
 	return &entry, entrySize, nil
 }
 
+const maxBoundedScanBufferBytes = 64 << 10
+
+func boundedScanBufferBytes(length int64) int {
+	if length <= 0 {
+		return 1
+	}
+	if length < maxBoundedScanBufferBytes {
+		return int(length)
+	}
+	return maxBoundedScanBufferBytes
+}
+
 // scanFromSortedFileInto 把命中的键值写进调用方给的 map，供跨分区扫描共用一个结果集。
 func (kvs *KVServer) scanFromSortedFileInto(result map[string]string, startKey, endKey string, index *SortedFileIndex) error {
 
@@ -971,31 +982,13 @@ func (kvs *KVServer) scanFromSortedFileInto(result map[string]string, startKey, 
 	// 与查询范围无关，小值场景下会让窄范围 scan 退化。
 	// 用稀疏索引二分定位扫描起点。原先是从 startKey 起逐个 +1 试探直到命中，
 	// 复杂度随键空间稀疏程度恶化；二分与之无关。
-	startOffset, ok := index.firstBlockAtOrAfter(startKey)
+	startOffset, endOffset, ok := index.boundedScanRange(startKey, endKey)
 	if !ok { // 索引为空，文件里没有数据
 		return nil
 	}
 
-	// 找到大于等于 startKey 的最小索引项
-	// startOffset, exists := index.GetOffset(startKey)
-	// if !exists {
-	//     // 如果精确的startKey不存在，找到下一个最近的键
-	//     for key, offset := range index.Entries {
-	//         if key >= startKey {
-	//             startOffset = offset
-	//             break
-	//         }
-	//     }
-	// }
-
-	// 打开文件
-	// file, err := os.Open(index.FilePath)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// defer file.Close()
-	// 由直接打开文件替换为从池中获取文件描述符。池跟着 index 走而不是挂在 KVServer 上：
-	// 分区化之后一个进程同时持有多个有序文件，全局单例会读错文件。
+	// 描述符池跟着 index 走。分区化之后一个进程同时持有多个有序文件，
+	// 不能使用 KVServer 级别的全局文件描述符。
 	if index.pool == nil {
 		return fmt.Errorf("sorted file %s has no descriptor pool", index.FilePath)
 	}
@@ -1005,24 +998,13 @@ func (kvs *KVServer) scanFromSortedFileInto(result map[string]string, startKey, 
 	}
 	defer index.pool.Put(file) // 使用完毕后归还到池中
 
-	// 获取文件信息
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	fileSize := fileInfo.Size()
-
-	// 创建内存映射
-	mmap, err := mmap.Map(file, mmap.RDONLY, 0)
-
-	if err != nil {
-		return err
-	}
-	defer mmap.Unmap()
-
-	// 从startOffset开始读取和处理数据
-	for offset := startOffset; offset < fileSize; {
-		entry, entrySize, err := ReadEntryFromMMap(mmap[offset:])
+	length := endOffset - startOffset
+	reader := bufio.NewReaderSize(
+		io.NewSectionReader(file, startOffset, length),
+		boundedScanBufferBytes(length),
+	)
+	for {
+		entry, _, err := ReadEntry(reader, 0)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -1038,8 +1020,6 @@ func (kvs *KVServer) scanFromSortedFileInto(result map[string]string, startKey, 
 			unpadKey := entry.Key
 			result[unpadKey] = entry.Value
 		}
-
-		offset += int64(entrySize)
 	}
 
 	return nil
