@@ -19,9 +19,9 @@ import (
 )
 
 const (
-	bphsL0CompactionTrigger      = 4
-	bphsBaseCompactionL0Rounds   = 8
-	bphsPartitionSyncConcurrency = 8
+	bphsL0CompactionTrigger             = 4
+	bphsBaseCompactionL0Rounds          = 8
+	bphsDefaultPartitionSyncConcurrency = 8
 )
 
 type bphsPartitionManifest struct {
@@ -83,6 +83,7 @@ type bphsStore struct {
 	parts                     []*bphsPartition
 	dir                       string
 	memtableBytes             int64
+	syncConcurrency           int
 	inline                    *InlineCache
 	partitionGCThresholdBytes int64
 	legacyCovered             bool
@@ -113,11 +114,16 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	if inline == nil && inlineCacheBytes > 0 {
 		inline = NewInlineCache(inlineCacheBytes)
 	}
+	syncConcurrency := kvs.bphsSyncConcurrency
+	if syncConcurrency <= 0 {
+		syncConcurrency = bphsDefaultPartitionSyncConcurrency
+	}
 	s := &bphsStore{
 		kvs:                       kvs,
 		base:                      base,
 		dir:                       dir,
 		memtableBytes:             memtableBytes,
+		syncConcurrency:           syncConcurrency,
 		inline:                    inline,
 		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
 		compactCh:                 make(chan int, base.Len()),
@@ -310,6 +316,7 @@ func (s *bphsStore) compactLoop() {
 			t0 := time.Now()
 			if part.compacting {
 				err = s.compactPartitionLocked(part)
+				recordBPHSBaseCompaction(time.Since(t0))
 				fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
 					idx, time.Since(t0), part.gen, err)
 				part.compacting = false
@@ -447,8 +454,10 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 		return -1, err
 	}
 
+	lockStart := time.Now()
 	part.mu.Lock()
 	defer part.mu.Unlock()
+	lockWait := time.Since(lockStart)
 
 	rec := bphsRecord{Key: key, Version: version}
 	if s.kvs.shouldInline(len(value)) {
@@ -478,6 +487,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	} else if s.shouldCompactPartitionLocked(part) {
 		s.scheduleCompactionLocked(part)
 	}
+	recordBPHSPut(len(value), lockWait)
 	return part.index, nil
 }
 
@@ -487,7 +497,10 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 	}
 	name := fmt.Sprintf("p%06d_l0_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
+	memBytes := part.mem.Bytes()
+	flushStart := time.Now()
 	l0, err := s.kvs.flushPartitionMemtable(part.mem, path, 0)
+	recordBPHSMemtableFlush(time.Since(flushStart), memBytes)
 	if err != nil {
 		return fmt.Errorf("flush partition %d memtable: %w", part.index, err)
 	}
@@ -506,9 +519,12 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 	}
 	part.recordsDirty = false
 	if len(part.l0) >= bphsL0CompactionTrigger {
+		mergeStart := time.Now()
 		if err := s.compactL0Locked(part); err != nil {
+			recordBPHSL0Merge(time.Since(mergeStart))
 			return fmt.Errorf("compact partition %d L0: %w", part.index, err)
 		}
+		recordBPHSL0Merge(time.Since(mergeStart))
 	}
 	if s.shouldCompactPartitionLocked(part) {
 		s.scheduleCompactionLocked(part)
@@ -1153,13 +1169,21 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
 	}
+	syncConcurrency := s.syncConcurrency
+	if syncConcurrency <= 0 {
+		syncConcurrency = bphsDefaultPartitionSyncConcurrency
+	}
+	syncStart := time.Now()
+	defer func() {
+		recordBPHSSyncBatch(len(indices), syncConcurrency, time.Since(syncStart))
+	}()
 
 	type syncResult struct {
 		idx int
 		err error
 	}
 	results := make(chan syncResult, len(indices))
-	sem := make(chan struct{}, bphsPartitionSyncConcurrency)
+	sem := make(chan struct{}, syncConcurrency)
 	var wg sync.WaitGroup
 	for idx := range indices {
 		wg.Add(1)
@@ -1168,20 +1192,28 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			part := s.parts[idx]
+			lockStart := time.Now()
 			part.mu.Lock()
 			defer part.mu.Unlock()
+			recordBPHSPartitionLockWait(time.Since(lockStart))
 			if part.vlogDirty {
+				syncStart := time.Now()
 				if err := part.vlog.Sync(); err != nil {
+					recordBPHSVLogSync(time.Since(syncStart))
 					results <- syncResult{idx: idx, err: fmt.Errorf("sync partition %d vlog: %w", idx, err)}
 					return
 				}
+				recordBPHSVLogSync(time.Since(syncStart))
 				part.vlogDirty = false
 			}
 			if part.recordsDirty {
+				syncStart := time.Now()
 				if err := part.records.Sync(); err != nil {
+					recordBPHSRecordSync(time.Since(syncStart))
 					results <- syncResult{idx: idx, err: fmt.Errorf("sync partition %d records: %w", idx, err)}
 					return
 				}
+				recordBPHSRecordSync(time.Since(syncStart))
 				part.recordsDirty = false
 			}
 			results <- syncResult{idx: idx}

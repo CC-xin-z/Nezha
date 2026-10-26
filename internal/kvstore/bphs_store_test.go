@@ -83,6 +83,44 @@ func TestBPHSScanSkipsDisjointL0Range(t *testing.T) {
 	}
 }
 
+func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 512,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs-default"),
+		1<<20, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.syncConcurrency != bphsDefaultPartitionSyncConcurrency {
+		t.Fatalf("default sync concurrency = %d, want %d",
+			store.syncConcurrency, bphsDefaultPartitionSyncConcurrency)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	kvs.bphsSyncConcurrency = 3
+	store, err = openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs-override"),
+		1<<20, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if store.syncConcurrency != 3 {
+		t.Fatalf("configured sync concurrency = %d, want 3", store.syncConcurrency)
+	}
+}
+
 func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},

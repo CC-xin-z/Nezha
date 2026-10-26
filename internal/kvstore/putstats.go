@@ -176,6 +176,7 @@ func StartWriteStatsReporter(interval time.Duration) {
 				fmt.Println(PutStatsLine())
 				fmt.Println(ApplyLoopStatsLine())
 				fmt.Println(ApplyRaceStatsLine())
+				fmt.Println(bphsWriteStatsLine())
 				fmt.Println(raft.RaftWriteStatsLine())
 				fmt.Println(raft.GroupCommitStatsLine())
 			}

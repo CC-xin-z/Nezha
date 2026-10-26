@@ -71,6 +71,7 @@ func main() {
 	flag.Float64Var(&cfg.AbsorbRatio, "absorbRatio", 0.25, "start a GC round once the tail log reaches this fraction of the partitions' total size")
 	flag.BoolVar(&cfg.BPHS, "bphs", false, "enable the static Bootstrap-Partitioned Hybrid Storage prototype after the first partitioned GC")
 	flag.IntVar(&cfg.BPHSMemtableMB, "bphsMemtableMB", 4, "logical MemTable budget in MB per BPHS partition; 0 keeps all latest records")
+	flag.IntVar(&cfg.BPHSSyncConcurrency, "bphsSyncConcurrency", 8, "maximum number of dirty BPHS partitions fsynced in parallel after one apply batch")
 	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
 	// and throughput is decided by the slowest goroutine, so the value shapes the
@@ -139,6 +140,9 @@ func main() {
 	}
 	if cfg.InlineThreshold < 0 {
 		log.Fatalf("nezha: -inlineThreshold=%d 不能为负", cfg.InlineThreshold)
+	}
+	if cfg.BPHS && cfg.BPHSSyncConcurrency <= 0 {
+		log.Fatalf("nezha: -bphsSyncConcurrency=%d 必须是正整数", cfg.BPHSSyncConcurrency)
 	}
 
 	// 先把 fd 软上限抬到硬上限，再建节点。必须在 New 之前：New 会装载分区组，

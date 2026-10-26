@@ -134,6 +134,9 @@ type Config struct {
 	// instead of the global tail store. Dynamic range splitting is not included.
 	BPHS           bool
 	BPHSMemtableMB int
+	// BPHSSyncConcurrency bounds how many dirty partitions are fsynced in
+	// parallel after one apply batch. The default preserves the original value.
+	BPHSSyncConcurrency int
 	// BPHSPartitionGCThresholdMB triggers partition-local compaction from the
 	// combined VLog + L0 + MemTable delta. Large BlobRecords barely increase L0
 	// size, so using L0 alone would never reclaim a growing partition VLog.
