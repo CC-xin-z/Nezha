@@ -60,9 +60,10 @@ func newBPHSTestBase(t *testing.T, kvs *KVServer, key, value string) *PartitionS
 func TestBPHSScanSkipsDisjointL0Range(t *testing.T) {
 	store := &bphsStore{}
 	index := &SortedFileIndex{
-		Sparse: []SparseEntry{{PaddedKey: "0000000100", Offset: 0}},
-		Lo:     "0000000100",
-		Hi:     "0000000199",
+		Sparse:   []SparseEntry{{PaddedKey: "0000000100", Offset: 0}},
+		FileSize: 1000,
+		Lo:       "0000000100",
+		Hi:       "0000000199",
 	}
 
 	result := make(map[string]string)
