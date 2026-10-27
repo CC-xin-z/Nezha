@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
@@ -122,7 +121,7 @@ func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
+func TestBPHSSyncPartitionsFastDefersPartitionRecords(t *testing.T) {
 	kvs := &KVServer{
 		persister:           &raft.Persister{},
 		inlineThreshold:     512,
@@ -152,21 +151,11 @@ func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 	if store.wal.Size() == 0 {
 		t.Fatal("shared WAL is empty after fast sync")
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	recordsDirty := func() bool {
-		store.parts[part].mu.RLock()
-		defer store.parts[part].mu.RUnlock()
-		return store.parts[part].recordsDirty
-	}
-	for recordsDirty() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if recordsDirty() {
-		t.Fatal("background record sync did not complete")
-	}
-	if err := store.durableSyncError(); err != nil {
-		t.Fatalf("background sync: %v", err)
+	store.parts[part].mu.RLock()
+	dirtyAfterFast := store.parts[part].recordsDirty
+	store.parts[part].mu.RUnlock()
+	if !dirtyAfterFast {
+		t.Fatal("fast sync should defer the partition record fsync")
 	}
 	store.walMaxBytes = 1
 	if err := store.checkpointSharedWAL(); err != nil {
@@ -174,6 +163,12 @@ func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 	}
 	if store.wal.Size() != 0 {
 		t.Fatalf("shared WAL size after checkpoint = %d, want 0", store.wal.Size())
+	}
+	store.parts[part].mu.RLock()
+	dirtyAfterCheckpoint := store.parts[part].recordsDirty
+	store.parts[part].mu.RUnlock()
+	if dirtyAfterCheckpoint {
+		t.Fatal("checkpoint did not sync partition records")
 	}
 }
 

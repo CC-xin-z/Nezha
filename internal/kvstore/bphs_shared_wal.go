@@ -25,7 +25,7 @@ type bphsSharedWALRecord struct {
 // bphsSharedWAL is the node-wide durability path for one apply batch. It
 // contains records from all touched partitions and is fsynced once per batch.
 // Per-partition record logs remain the checkpoint/recovery representation and
-// are synced asynchronously after the shared WAL has made the batch durable.
+// are synced when the shared WAL reaches its checkpoint threshold.
 type bphsSharedWAL struct {
 	file   *os.File
 	writer *bufio.Writer
