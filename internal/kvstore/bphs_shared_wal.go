@@ -65,7 +65,7 @@ func (w *bphsSharedWAL) Size() int64 {
 	return w.size
 }
 
-func encodeBPHSSharedWALRecord(dst []byte, partition int, rec bphsRecord) (int, error) {
+func encodeBPHSSharedWALRecord(dst []byte, partition int, rec bphsRecord) ([]byte, error) {
 	key := []byte(rec.Key)
 	value := []byte(nil)
 	switch rec.Kind {
@@ -73,13 +73,13 @@ func encodeBPHSSharedWALRecord(dst []byte, partition int, rec bphsRecord) (int, 
 		value = []byte(rec.Value)
 	case bphsBlobRecord:
 		if rec.Value != "" {
-			return 0, fmt.Errorf("blob record %q unexpectedly embeds a value", rec.Key)
+			return nil, fmt.Errorf("blob record %q unexpectedly embeds a value", rec.Key)
 		}
 	default:
-		return 0, fmt.Errorf("unknown BPHS record kind %d", rec.Kind)
+		return nil, fmt.Errorf("unknown BPHS record kind %d", rec.Kind)
 	}
 	if partition < 0 || partition > int(^uint32(0)) {
-		return 0, fmt.Errorf("invalid BPHS partition %d", partition)
+		return nil, fmt.Errorf("invalid BPHS partition %d", partition)
 	}
 	total := bphsSharedRecordHeader + len(key) + len(value)
 	if cap(dst) < total {
@@ -107,7 +107,7 @@ func encodeBPHSSharedWALRecord(dst []byte, partition int, rec bphsRecord) (int, 
 	_, _ = crc.Write(key)
 	_, _ = crc.Write(value)
 	binary.LittleEndian.PutUint32(dst[44:48], crc.Sum32())
-	return total, nil
+	return dst, nil
 }
 
 func (w *bphsSharedWAL) AppendBatch(records []bphsSharedWALRecord) (int64, error) {
@@ -120,15 +120,15 @@ func (w *bphsSharedWAL) AppendBatch(records []bphsSharedWALRecord) (int64, error
 	start := w.size
 	var scratch []byte
 	for _, item := range records {
-		n, err := encodeBPHSSharedWALRecord(scratch, item.Partition, item.Record)
+		encoded, err := encodeBPHSSharedWALRecord(scratch, item.Partition, item.Record)
 		if err != nil {
 			return 0, err
 		}
-		scratch = scratch[:n]
-		if err := writeFull(w.writer, scratch); err != nil {
+		scratch = encoded
+		if err := writeFull(w.writer, encoded); err != nil {
 			return 0, err
 		}
-		w.size += int64(n)
+		w.size += int64(len(encoded))
 	}
 	return w.size - start, nil
 }
