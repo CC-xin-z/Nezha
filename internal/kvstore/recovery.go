@@ -354,6 +354,17 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 		}
 		fmt.Printf("[RECOVER] GC round %d was interrupted; its migration will be redone (old log %s)\n", st.NumGC, st.OldLog)
 	}
+	if kvs.bphsRaftLogWAL && kvs.bphs != nil {
+		durable := kvs.bphs.DurableIndex()
+		if durable == 0 {
+			log.Fatalf("[RECOVER] BPHS Raft-WAL mode requires a durable index")
+		}
+		if applied > int(durable) {
+			fmt.Printf("[RECOVER] BPHS Raft-WAL: replay from durable=%d instead of applied=%d\n",
+				durable, applied)
+			applied = int(durable)
+		}
+	}
 	files = append(files, raft.LogFile{Path: st.CurrentLog, Version: int32(st.NumGC)})
 	fmt.Printf("[RECOVER] applied=%d; rebuilding the Raft log from %d file(s)\n", applied, len(files))
 	return files, applied

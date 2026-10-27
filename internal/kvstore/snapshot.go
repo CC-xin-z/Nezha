@@ -628,6 +628,11 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		// 而状态文件还没写，所以恢复出来的是**原来**的状态，leader 会重发。
 		log.Fatalf("[SNAPSHOT] 接上快照的日志失败，状态已半换、无法回滚: %v", err)
 	}
+	if kvs.bphsRaftLogWAL && newBPHS != nil {
+		if durable := newBPHS.DurableIndex(); durable > 0 {
+			kvs.raft.SetCompactFloor(int(durable))
+		}
+	}
 
 	// 6) 最后写状态文件——这一步之前崩，等于这份快照没装过。
 	snapshotInstallPauseWindow()

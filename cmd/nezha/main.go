@@ -73,6 +73,7 @@ func main() {
 	flag.IntVar(&cfg.BPHSMemtableMB, "bphsMemtableMB", 4, "logical MemTable budget in MB per BPHS partition; 0 keeps all latest records")
 	flag.IntVar(&cfg.BPHSSyncConcurrency, "bphsSyncConcurrency", 8, "maximum number of dirty BPHS partitions fsynced in parallel after one apply batch")
 	flag.IntVar(&cfg.BPHSRecordSyncConcurrency, "bphsRecordSyncConcurrency", 8, "maximum number of BPHS partition record logs synced by the background worker")
+	flag.BoolVar(&cfg.BPHSRaftLogWAL, "bphsRaftLogWAL", false, "use the durable Raft log as BPHS's WAL and materialize partitions asynchronously")
 	flag.IntVar(&cfg.BPHSWALMB, "bphsWALMB", 256, "size in MB at which the node-wide BPHS WAL is checkpointed and reset")
 	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
 	// A request that hits this timeout stalls its client goroutine for the whole period,

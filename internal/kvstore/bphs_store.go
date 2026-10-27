@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
@@ -73,6 +74,7 @@ type bphsPartition struct {
 	vlogDirty    bool
 	compacting   bool
 	l0Merges     int
+	durableIndex atomic.Uint32
 }
 
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
@@ -88,6 +90,10 @@ type bphsStore struct {
 	wal                       *bphsSharedWAL
 	walPending                []bphsSharedWALRecord
 	walMaxBytes               int64
+	durablePath               string
+	durableMu                 sync.Mutex
+	durableIndex              uint32
+	raftLogWAL                bool
 	recordSyncConcurrency     int
 	recordSyncMu              sync.Mutex
 	recordSyncPending         map[int]struct{}
@@ -150,6 +156,8 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		syncConcurrency:           syncConcurrency,
 		wal:                       wal,
 		walMaxBytes:               walMaxBytes,
+		durablePath:               filepath.Join(dir, "durable_index.json"),
+		raftLogWAL:                kvs.bphsRaftLogWAL,
 		recordSyncConcurrency:     recordSyncConcurrency,
 		recordSyncPending:         make(map[int]struct{}),
 		recordSyncSignal:          make(chan struct{}, 1),
@@ -158,6 +166,16 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
 		compactCh:                 make(chan int, base.Len()),
 		compactStop:               make(chan struct{}),
+	}
+	durableState, hasDurable, err := readBPHSDurableState(dir)
+	if err != nil {
+		wal.Close()
+		return nil, fmt.Errorf("read BPHS durable index: %w", err)
+	}
+	if hasDurable && len(durableState.Partitions) != base.Len() {
+		wal.Close()
+		return nil, fmt.Errorf("BPHS durable index has %d partitions, want %d",
+			len(durableState.Partitions), base.Len())
 	}
 	s.compactWG.Add(1)
 	go s.compactLoop()
@@ -263,8 +281,35 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			}
 			part.mem.Put(rec)
 		}
+		durableVersion := maxCoveredVersion
+		if hasDurable {
+			durableVersion = durableState.Partitions[i]
+		}
+		part.durableIndex.Store(durableVersion)
 		coveredVersions[i] = maxCoveredVersion
 		s.parts = append(s.parts, part)
+	}
+	if hasDurable {
+		s.durableIndex = durableState.DurableIndex
+	}
+	if !hasDurable && maxVersion > 0 {
+		state := bphsDurableState{
+			Partitions:   make([]uint32, len(s.parts)),
+			DurableIndex: maxVersion,
+		}
+		for i, part := range s.parts {
+			part.durableIndex.Store(maxVersion)
+			state.Partitions[i] = maxVersion
+		}
+		path := s.durablePath
+		if path == "" {
+			path = filepath.Join(s.dir, bphsDurableIndexName)
+		}
+		if err := writeBPHSDurableState(path, state); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("write snapshot BPHS durable index: %w", err)
+		}
+		s.durableIndex = maxVersion
 	}
 	walRecords, err := s.wal.ScanAll()
 	if err != nil {
@@ -539,10 +584,12 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	}
 	part.recordsDirty = true
 	rec.LogOffset = offset
-	s.walPending = append(s.walPending, bphsSharedWALRecord{
-		Partition: part.index,
-		Record:    rec,
-	})
+	if !s.raftLogWAL {
+		s.walPending = append(s.walPending, bphsSharedWALRecord{
+			Partition: part.index,
+			Record:    rec,
+		})
+	}
 	part.mem.Put(rec)
 	if part.mem.Full() {
 		if err := s.flushPartitionLocked(part); err != nil {
@@ -561,6 +608,7 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 	}
 	name := fmt.Sprintf("p%06d_l0_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
+	flushedVersion := part.mem.MaxVersion()
 	memBytes := part.mem.Bytes()
 	flushStart := time.Now()
 	l0, err := s.kvs.flushPartitionMemtable(part.mem, path, 0)
@@ -575,6 +623,9 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 	l0.InlineValues = s.inline
 	part.l0 = append(part.l0, l0)
 	part.mem.Reset()
+	if err := s.advancePartitionDurable(part, flushedVersion); err != nil {
+		return fmt.Errorf("advance partition %d durable index: %w", part.index, err)
+	}
 	// The L0 file was fsynced by flushPartitionMemtable and contains the latest
 	// value for every key in this memtable. Older records are no longer needed
 	// for recovery, so do not let this per-partition WAL grow forever.
@@ -732,6 +783,9 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	part.l0 = nil
 	part.l0Merges = 0
 	part.mem.Reset()
+	if err := s.advancePartitionDurable(part, cutVersion); err != nil {
+		return err
+	}
 
 	for _, run := range oldL0 {
 		run.closePool()
@@ -1404,6 +1458,10 @@ func (s *bphsStore) SyncPartitionsFast(indices map[int]struct{}) error {
 	defer func() {
 		recordBPHSSyncBatch(len(indices), syncConcurrency, time.Since(syncStart))
 	}()
+	if s.raftLogWAL {
+		s.queueRecordSync(indices)
+		return nil
+	}
 
 	// Blob refs in the shared WAL are usable only after their partition VLogs
 	// are durable. Inline-only workloads skip this loop entirely.
@@ -1646,6 +1704,10 @@ func (kvs *KVServer) enableOrUpdateBPHS(base *PartitionSet) error {
 		if err := store.drainLegacyTailIntoBPHS(); err != nil {
 			store.Close()
 			return err
+		}
+		if err := store.MarkAllDurable(uint32(kvs.lastAppliedIndex)); err != nil {
+			store.Close()
+			return fmt.Errorf("mark initial BPHS durable index: %w", err)
 		}
 	}
 	store.markLegacyCovered()

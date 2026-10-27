@@ -140,6 +140,9 @@ type Config struct {
 	// BPHSRecordSyncConcurrency bounds the independent background worker that
 	// persists partition record logs after the shared WAL has made a batch durable.
 	BPHSRecordSyncConcurrency int
+	// BPHSRaftLogWAL uses the already-fsynced Raft log as BPHS's write-ahead log.
+	// Partition data is materialized asynchronously up to a durable frontier.
+	BPHSRaftLogWAL bool
 	// BPHSWALMB bounds the node-wide BPHS WAL. Once it grows past this size,
 	// dirty partition records are synchronously made durable and the WAL resets.
 	BPHSWALMB int

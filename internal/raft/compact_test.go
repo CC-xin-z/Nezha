@@ -304,6 +304,22 @@ func TestTruncationTierThreeCapsActivePeer(t *testing.T) {
 	}
 }
 
+func TestMaterializedCompactFloorBoundsTruncation(t *testing.T) {
+	rf := leaderForTruncTest(1 << 30)
+	rf.matchIndex[1] = 1100
+	rf.matchIndex[2] = 1100
+
+	rf.SetCompactFloor(1030)
+	if d := rf.compactDecisionLocked(5); d.point != 1030 {
+		t.Fatalf("compact point = %d, want materialized floor 1030", d.point)
+	}
+
+	rf.SetCompactFloor(0)
+	if d := rf.compactDecisionLocked(5); d.point != 1095 {
+		t.Fatalf("compact point without floor = %d, want 1095", d.point)
+	}
+}
+
 // follower 上没有 matchIndex，压缩只受 lastApplied 约束；单节点同理（循环为空）。
 // 预算比 catchUpEntries 那个固定窗口更紧时，压缩点必须由预算决定。
 //

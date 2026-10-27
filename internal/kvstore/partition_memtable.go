@@ -184,6 +184,19 @@ func (mt *partitionMemtable) Sorted() []bphsRecord {
 	return out
 }
 
+func (mt *partitionMemtable) MaxVersion() uint32 {
+	if mt == nil {
+		return 0
+	}
+	var maxVersion uint32
+	for _, rec := range mt.records {
+		if rec.Version > maxVersion {
+			maxVersion = rec.Version
+		}
+	}
+	return maxVersion
+}
+
 // SortedRange returns only records whose keys fall in the inclusive range
 // [startKey, endKey]. The sorted snapshot is immutable while callers hold the
 // owning partition lock, so binary-searching and returning a subslice is safe.

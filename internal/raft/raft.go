@@ -180,6 +180,9 @@ type Raft struct {
 	// logBudgetBytes 是内存日志的字节预算，超过它落后副本就不再被无条件保护。
 	// 0 表示用 defaultLogBudgetBytes。
 	logBudgetBytes int64
+	// compactFloor is the highest index the state machine has materialized
+	// durably. Log compaction may not move past it.
+	compactFloor atomic.Int64
 	// sendSnapshotFn 是传输的测试接缝（生产路径上为 nil，走 SendSSTable）。
 	sendSnapshotFn func(peerId int, span SSTableSpan) (*raftrpc.InstallSSTableResponse, error)
 

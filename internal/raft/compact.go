@@ -273,6 +273,15 @@ func (rf *Raft) SetLogBudget(bytes int64) {
 	rf.logBudgetBytes = bytes
 }
 
+// SetCompactFloor sets the highest index that the KV state machine has already
+// materialized in its own durable files. Zero disables the additional bound.
+func (rf *Raft) SetCompactFloor(index int) {
+	if index < 0 {
+		index = 0
+	}
+	rf.compactFloor.Store(int64(index))
+}
+
 // compactDecision 是一次压缩点判定的结果。把它独立出来是为了能直接测那三档规则——
 // 它们是这次改造里最容易静默出错的地方：定得太紧会把一个只是稍慢的活跃副本推去走快照
 // （比补日志贵得多），定得太松内存就又无界了，而两种错都不报错。
@@ -342,6 +351,10 @@ func (rf *Raft) compactDecisionLocked(catchUpEntries int) compactDecision {
 		d.point = d.floor
 		d.pinnedAt = d.point
 		d.budgetCapsWindow = true
+	}
+	if materialized := int(rf.compactFloor.Load()); materialized > 0 && d.point > materialized {
+		d.point = materialized
+		d.pinnedAt = d.point
 	}
 
 	// matchIndex 仅在成为 leader 时分配；follower 上为 nil，此时无需 peer 约束。

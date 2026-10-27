@@ -321,7 +321,13 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 		if err := kvs.bphs.SyncPartitionsFast(bphsDirty); err != nil {
 			log.Fatalf("sync BPHS before applied=%d: %v", applied, err)
 		}
-		rows = kvs.flushApplyRows(rows, applied)
+		if kvs.bphs != nil && kvs.bphs.raftLogWAL {
+			if len(rows) != 0 {
+				log.Fatalf("BPHS Raft-WAL mode produced %d global store rows", len(rows))
+			}
+		} else {
+			rows = kvs.flushApplyRows(rows, applied)
+		}
 	}
 	kvs.applyRowsBuf, kvs.applyWakeBuf = rows, wake
 	// 唤醒挂起的RPC——**在落库之后**，理由见 wake 的声明处。
