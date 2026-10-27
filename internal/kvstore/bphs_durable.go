@@ -66,6 +66,44 @@ func (s *bphsStore) DurableIndex() uint32 {
 	return s.durableIndex
 }
 
+// MaterializeAll writes every in-memory partition delta to an fsynced L0 and
+// advances the partition durable indexes. It is used after a Raft-WAL restart:
+// replay installs the authoritative log into MemTables first, then this call
+// turns that complete recovered view into BPHS-local durable files before the
+// node accepts clients.
+func (s *bphsStore) MaterializeAll() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	parts := append([]*bphsPartition(nil), s.parts...)
+	s.mu.RUnlock()
+
+	for _, part := range parts {
+		part.mu.Lock()
+		if part.vlogDirty {
+			if err := part.vlog.Sync(); err != nil {
+				part.mu.Unlock()
+				return fmt.Errorf("sync partition %d vlog: %w", part.index, err)
+			}
+			part.vlogDirty = false
+		}
+		if part.recordsDirty {
+			if err := part.records.Sync(); err != nil {
+				part.mu.Unlock()
+				return fmt.Errorf("sync partition %d records: %w", part.index, err)
+			}
+			part.recordsDirty = false
+		}
+		err := s.flushPartitionLocked(part)
+		part.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return s.compactionError()
+}
+
 func (s *bphsStore) MarkAllDurable(index uint32) error {
 	if s == nil {
 		return nil

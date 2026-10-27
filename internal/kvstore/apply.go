@@ -330,6 +330,7 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 		}
 	}
 	kvs.applyRowsBuf, kvs.applyWakeBuf = rows, wake
+	kvs.noteRecoveryApplied(kvs.lastAppliedIndex)
 	// 唤醒挂起的RPC——**在落库之后**，理由见 wake 的声明处。
 	for _, c := range wake {
 		close(c.committed)

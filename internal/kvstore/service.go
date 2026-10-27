@@ -86,6 +86,20 @@ func (kvs *KVServer) requireLeader() (string, int32, bool) {
 // 宽：apply 落后通常是写入正忙，等一会儿就追上了，直接拒绝反而把一次能成的读打掉。
 const readIndexApplyWait = 2 * time.Second
 
+// noteRecoveryApplied releases the startup gate only after the KV state machine,
+// not merely the Raft delivery loop, has applied the recovered log prefix.
+// Caller holds kvs.mu.
+func (kvs *KVServer) noteRecoveryApplied(applied int) {
+	if kvs == nil || kvs.recoveryTarget <= 0 || applied < kvs.recoveryTarget {
+		return
+	}
+	kvs.recoveryOnce.Do(func() {
+		if kvs.recoveryDone != nil {
+			close(kvs.recoveryDone)
+		}
+	})
+}
+
 func (kvs *KVServer) ScanRangeInRaft(ctx context.Context, in *kvrpc.ScanRangeRequest) (*kvrpc.ScanRangeResponse, error) {
 	// 一次读要同时用到 persister、当前日志和分区组三样，而装快照会把三样一起换掉。
 	// **这里不再整段持 stateMu 的读锁**：那样会让装快照排在一次长扫描后面，而

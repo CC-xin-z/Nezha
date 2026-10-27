@@ -201,7 +201,15 @@ type KVServer struct {
 	bphsRaftLogWAL                bool
 	bphsWALBytes                  int64
 	bphsPartitionGCThresholdBytes int64
-	bphsDir                       string
+
+	// recoveryTarget is the last Raft index that must be materialized by the KV
+	// layer before this restarted Raft-WAL node starts accepting clients.
+	// raft.lastApplied advances when entries are handed to applyCh, not when the
+	// KV state machine has installed them, so it cannot be used as the read gate.
+	recoveryTarget int
+	recoveryDone   chan struct{}
+	recoveryOnce   sync.Once
+	bphsDir        string
 }
 
 func (kv *KVServer) Kill() {
@@ -311,6 +319,7 @@ func New(cfg Config) (*KVServer, error) {
 		// Room for one applyLogLoop batch (maxApplyBatch=64) and then some: a full
 		// channel used to block Raft's apply loop while it held its lock.
 		applyCh:          make(chan raft.ApplyMsg, 256),
+		recoveryDone:     make(chan struct{}),
 		reqMap:           make(map[int]*OpContext),
 		seqMap:           make(map[int64]int64),
 		cfg:              cfg,
@@ -442,8 +451,12 @@ func New(cfg Config) (*KVServer, error) {
 		kvs.raft.EnableGroupCommit(time.Duration(cfg.GroupCommitUs) * time.Microsecond)
 	}
 	if len(recoveredFiles) > 0 {
-		if _, err := kvs.raft.RecoverLog(recoveredFiles, recoveredApplied); err != nil {
+		recoveredLast, err := kvs.raft.RecoverLog(recoveredFiles, recoveredApplied)
+		if err != nil {
 			return nil, fmt.Errorf("rebuild Raft log: %w", err)
+		}
+		if cfg.BPHSRaftLogWAL && kvs.bphs != nil && recoveredLast > recoveredApplied {
+			kvs.recoveryTarget = recoveredLast
 		}
 	}
 	if cfg.BPHSRaftLogWAL && kvs.bphs != nil {
@@ -479,11 +492,26 @@ func (kvs *KVServer) Run(ctx context.Context) {
 	kvs.mu.Unlock()
 
 	go kvs.applyLoop()
-	go kvs.gcLoop(ctx)
 	kvs.raft.StartLoops(ctx)
 	if kvs.lsm != nil {
 		go kvs.lsmTicker()
 	}
+	if kvs.recoveryTarget > 0 {
+		fmt.Printf("[RECOVER] BPHS Raft-WAL: waiting for KV replay through index %d\n",
+			kvs.recoveryTarget)
+		select {
+		case <-kvs.recoveryDone:
+		case <-ctx.Done():
+			kvs.Kill()
+			return
+		}
+		if err := kvs.bphs.MaterializeAll(); err != nil {
+			log.Fatalf("[RECOVER] materialize BPHS after Raft-WAL replay: %v", err)
+		}
+		fmt.Printf("[RECOVER] BPHS Raft-WAL: replay complete through index %d, durable=%d\n",
+			kvs.recoveryTarget, kvs.bphs.DurableIndex())
+	}
+	go kvs.gcLoop(ctx)
 	go kvs.RegisterKVServer(ctx, kvs.address)
 	if resumeGC {
 		go kvs.resumeInterruptedGC()
