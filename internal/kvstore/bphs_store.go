@@ -84,6 +84,14 @@ type bphsStore struct {
 	dir                       string
 	memtableBytes             int64
 	syncConcurrency           int
+	wal                       *bphsSharedWAL
+	walPending                []bphsSharedWALRecord
+	walMaxBytes               int64
+	recordSyncCh              chan map[int]struct{}
+	recordSyncStop            chan struct{}
+	recordSyncWG              sync.WaitGroup
+	durableErrMu              sync.Mutex
+	durableErr                error
 	inline                    *InlineCache
 	partitionGCThresholdBytes int64
 	legacyCovered             bool
@@ -118,12 +126,24 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	if syncConcurrency <= 0 {
 		syncConcurrency = bphsDefaultPartitionSyncConcurrency
 	}
+	walMaxBytes := kvs.bphsWALBytes
+	if walMaxBytes <= 0 {
+		walMaxBytes = 256 << 20
+	}
+	wal, err := openBPHSSharedWAL(filepath.Join(dir, bphsSharedWALName))
+	if err != nil {
+		return nil, fmt.Errorf("open BPHS shared WAL: %w", err)
+	}
 	s := &bphsStore{
 		kvs:                       kvs,
 		base:                      base,
 		dir:                       dir,
 		memtableBytes:             memtableBytes,
 		syncConcurrency:           syncConcurrency,
+		wal:                       wal,
+		walMaxBytes:               walMaxBytes,
+		recordSyncCh:              make(chan map[int]struct{}, 256),
+		recordSyncStop:            make(chan struct{}),
 		inline:                    inline,
 		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
 		compactCh:                 make(chan int, base.Len()),
@@ -131,6 +151,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	}
 	s.compactWG.Add(1)
 	go s.compactLoop()
+	coveredVersions := make([]uint32, len(base.parts))
 	for i, basePart := range base.parts {
 		meta, hasMeta, err := loadBPHSPartitionManifest(dir, i)
 		if err != nil {
@@ -208,13 +229,20 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		}
 		replayed, err := records.ScanAll()
 		if err != nil {
-			records.Close()
-			vlog.Close()
-			if localBaseLoaded {
-				localBase.closePool()
+			if s.wal.Size() == 0 {
+				records.Close()
+				vlog.Close()
+				if localBaseLoaded {
+					localBase.closePool()
+				}
+				s.Close()
+				return nil, fmt.Errorf("replay partition %d records: %w", i, err)
 			}
-			s.Close()
-			return nil, fmt.Errorf("replay partition %d records: %w", i, err)
+			// records are synced asynchronously in the fast path. A crash can
+			// leave a torn tail there while the shared WAL holds the complete
+			// durable batch; replay every complete prefix record and let the WAL
+			// cover the rest.
+			fmt.Printf("[RECOVER] partition %d record tail ignored; shared WAL will replay it: %v\n", i, err)
 		}
 		for _, rec := range replayed {
 			if rec.Version <= maxCoveredVersion {
@@ -225,8 +253,30 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			}
 			part.mem.Put(rec)
 		}
+		coveredVersions[i] = maxCoveredVersion
 		s.parts = append(s.parts, part)
 	}
+	walRecords, err := s.wal.ScanAll()
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("replay BPHS shared WAL: %w", err)
+	}
+	for _, item := range walRecords {
+		if item.Partition < 0 || item.Partition >= len(s.parts) {
+			s.Close()
+			return nil, fmt.Errorf("BPHS shared WAL references invalid partition %d", item.Partition)
+		}
+		rec := item.Record
+		if rec.Version <= coveredVersions[item.Partition] {
+			continue
+		}
+		if maxVersion > 0 && rec.Version > maxVersion {
+			continue
+		}
+		s.parts[item.Partition].mem.Put(rec)
+	}
+	s.recordSyncWG.Add(1)
+	go s.recordSyncLoop()
 	if err := cleanupUnreferencedBPHSFiles(s); err != nil {
 		s.Close()
 		return nil, err
@@ -479,6 +529,10 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	}
 	part.recordsDirty = true
 	rec.LogOffset = offset
+	s.walPending = append(s.walPending, bphsSharedWALRecord{
+		Partition: part.index,
+		Record:    rec,
+	})
 	part.mem.Put(rec)
 	if part.mem.Full() {
 		if err := s.flushPartitionLocked(part); err != nil {
@@ -1157,6 +1211,220 @@ func (s *bphsStore) recordValue(part *bphsPartition, rec bphsRecord) (string, er
 	return string(raw), nil
 }
 
+func (s *bphsStore) durableSyncError() error {
+	s.durableErrMu.Lock()
+	defer s.durableErrMu.Unlock()
+	return s.durableErr
+}
+
+func (s *bphsStore) setDurableSyncError(err error) {
+	if err == nil {
+		return
+	}
+	s.durableErrMu.Lock()
+	if s.durableErr == nil {
+		s.durableErr = err
+	}
+	s.durableErrMu.Unlock()
+}
+
+func (s *bphsStore) appendPendingSharedWAL() error {
+	if len(s.walPending) == 0 {
+		return nil
+	}
+	batch := s.walPending
+	written, err := s.wal.AppendBatch(batch)
+	if err != nil {
+		return fmt.Errorf("append BPHS shared WAL: %w", err)
+	}
+	s.walPending = nil
+	syncStart := time.Now()
+	err = s.wal.Sync()
+	recordBPHSSharedWAL(written, time.Since(syncStart))
+	if err != nil {
+		return fmt.Errorf("sync BPHS shared WAL: %w", err)
+	}
+	return nil
+}
+
+func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	for idx := range indices {
+		if idx < 0 || idx >= len(s.parts) {
+			return fmt.Errorf("invalid BPHS partition id %d", idx)
+		}
+	}
+	concurrency := s.syncConcurrency
+	if concurrency <= 0 {
+		concurrency = bphsDefaultPartitionSyncConcurrency
+	}
+	sem := make(chan struct{}, concurrency)
+	results := make(chan error, len(indices))
+	var wg sync.WaitGroup
+	for idx := range indices {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			part := s.parts[idx]
+			lockStart := time.Now()
+			part.mu.Lock()
+			defer part.mu.Unlock()
+			recordBPHSPartitionLockWait(time.Since(lockStart))
+			if !part.recordsDirty {
+				return
+			}
+			syncStart := time.Now()
+			err := part.records.Sync()
+			recordBPHSRecordSync(time.Since(syncStart))
+			if err != nil {
+				results <- fmt.Errorf("sync partition %d records: %w", idx, err)
+				return
+			}
+			part.recordsDirty = false
+		}(idx)
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *bphsStore) recordSyncLoop() {
+	defer s.recordSyncWG.Done()
+	for {
+		select {
+		case <-s.recordSyncStop:
+			return
+		case indices := <-s.recordSyncCh:
+			if err := s.syncRecordPartitions(indices); err != nil {
+				s.setDurableSyncError(err)
+			}
+		}
+	}
+}
+
+func (s *bphsStore) queueRecordSync(indices map[int]struct{}) error {
+	if len(indices) == 0 {
+		return nil
+	}
+	queued := make(map[int]struct{}, len(indices))
+	for idx := range indices {
+		queued[idx] = struct{}{}
+	}
+	select {
+	case s.recordSyncCh <- queued:
+		return nil
+	default:
+		// The queue is bounded. Falling back to the caller preserves durability
+		// rather than blocking the apply loop indefinitely.
+		return s.syncRecordPartitions(queued)
+	}
+}
+
+func (s *bphsStore) checkpointSharedWAL() error {
+	if s.walMaxBytes <= 0 || s.wal.Size() < s.walMaxBytes {
+		return nil
+	}
+	all := make(map[int]struct{}, len(s.parts))
+	for i := range s.parts {
+		all[i] = struct{}{}
+	}
+	if err := s.syncRecordPartitions(all); err != nil {
+		return err
+	}
+	if err := s.wal.Reset(); err != nil {
+		return fmt.Errorf("reset BPHS shared WAL: %w", err)
+	}
+	recordBPHSSharedWALReset()
+	return nil
+}
+
+// SyncPartitionsFast is the apply-loop path: one shared WAL fsync makes the
+// whole batch durable, while per-partition record logs are synced in a
+// background worker. The existing synchronous SyncPartitions remains the
+// compatibility path used by recovery/import and tests.
+func (s *bphsStore) SyncPartitionsFast(indices map[int]struct{}) error {
+	if s == nil || len(indices) == 0 {
+		return nil
+	}
+	if err := s.compactionError(); err != nil {
+		return fmt.Errorf("background partition compaction: %w", err)
+	}
+	if err := s.durableSyncError(); err != nil {
+		return fmt.Errorf("background BPHS record sync: %w", err)
+	}
+	for idx := range indices {
+		if idx < 0 || idx >= len(s.parts) {
+			return fmt.Errorf("invalid BPHS partition id %d", idx)
+		}
+	}
+	syncConcurrency := s.syncConcurrency
+	if syncConcurrency <= 0 {
+		syncConcurrency = bphsDefaultPartitionSyncConcurrency
+	}
+	syncStart := time.Now()
+	defer func() {
+		recordBPHSSyncBatch(len(indices), syncConcurrency, time.Since(syncStart))
+	}()
+
+	// Blob refs in the shared WAL are usable only after their partition VLogs
+	// are durable. Inline-only workloads skip this loop entirely.
+	type syncResult struct {
+		idx int
+		err error
+	}
+	results := make(chan syncResult, len(indices))
+	sem := make(chan struct{}, syncConcurrency)
+	var wg sync.WaitGroup
+	for idx := range indices {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			part := s.parts[idx]
+			lockStart := time.Now()
+			part.mu.Lock()
+			defer part.mu.Unlock()
+			recordBPHSPartitionLockWait(time.Since(lockStart))
+			if !part.vlogDirty {
+				return
+			}
+			syncStart := time.Now()
+			err := part.vlog.Sync()
+			recordBPHSVLogSync(time.Since(syncStart))
+			if err != nil {
+				results <- syncResult{idx: idx, err: fmt.Errorf("sync partition %d vlog: %w", idx, err)}
+				return
+			}
+			part.vlogDirty = false
+		}(idx)
+	}
+	wg.Wait()
+	close(results)
+	for result := range results {
+		if result.err != nil {
+			return result.err
+		}
+	}
+
+	if err := s.appendPendingSharedWAL(); err != nil {
+		return err
+	}
+	if err := s.queueRecordSync(indices); err != nil {
+		return err
+	}
+	return s.checkpointSharedWAL()
+}
+
 func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 	if s == nil || len(indices) == 0 {
 		return nil
@@ -1227,7 +1495,10 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 			return result.err
 		}
 	}
-	return nil
+	if err := s.appendPendingSharedWAL(); err != nil {
+		return err
+	}
+	return s.checkpointSharedWAL()
 }
 
 // drainLegacyTailIntoBPHS 把首次启用前落在 currentDB/currentLog 的尾部记录导入
@@ -1290,6 +1561,8 @@ func (s *bphsStore) Close() error {
 		s.compactJobs.Wait()
 		close(s.compactStop)
 		s.compactWG.Wait()
+		close(s.recordSyncStop)
+		s.recordSyncWG.Wait()
 
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -1309,10 +1582,16 @@ func (s *bphsStore) Close() error {
 			}
 			part.mu.Unlock()
 		}
+		if err := s.wal.Close(); first == nil {
+			first = err
+		}
 		s.parts = nil
 	})
 	if first == nil {
 		first = s.compactionError()
+	}
+	if first == nil {
+		first = s.durableSyncError()
 	}
 	return first
 }

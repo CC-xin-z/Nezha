@@ -72,6 +72,7 @@ func main() {
 	flag.BoolVar(&cfg.BPHS, "bphs", false, "enable the static Bootstrap-Partitioned Hybrid Storage prototype after the first partitioned GC")
 	flag.IntVar(&cfg.BPHSMemtableMB, "bphsMemtableMB", 4, "logical MemTable budget in MB per BPHS partition; 0 keeps all latest records")
 	flag.IntVar(&cfg.BPHSSyncConcurrency, "bphsSyncConcurrency", 8, "maximum number of dirty BPHS partitions fsynced in parallel after one apply batch")
+	flag.IntVar(&cfg.BPHSWALMB, "bphsWALMB", 256, "size in MB at which the node-wide BPHS WAL is checkpointed and reset")
 	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
 	// and throughput is decided by the slowest goroutine, so the value shapes the
@@ -143,6 +144,9 @@ func main() {
 	}
 	if cfg.BPHS && cfg.BPHSSyncConcurrency <= 0 {
 		log.Fatalf("nezha: -bphsSyncConcurrency=%d 必须是正整数", cfg.BPHSSyncConcurrency)
+	}
+	if cfg.BPHS && cfg.BPHSWALMB <= 0 {
+		log.Fatalf("nezha: -bphsWALMB=%d 必须是正整数", cfg.BPHSWALMB)
 	}
 
 	// 先把 fd 软上限抬到硬上限，再建节点。必须在 New 之前：New 会装载分区组，

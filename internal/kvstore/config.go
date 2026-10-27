@@ -137,6 +137,9 @@ type Config struct {
 	// BPHSSyncConcurrency bounds how many dirty partitions are fsynced in
 	// parallel after one apply batch. The default preserves the original value.
 	BPHSSyncConcurrency int
+	// BPHSWALMB bounds the node-wide BPHS WAL. Once it grows past this size,
+	// dirty partition records are synchronously made durable and the WAL resets.
+	BPHSWALMB int
 	// BPHSPartitionGCThresholdMB triggers partition-local compaction from the
 	// combined VLog + L0 + MemTable delta. Large BlobRecords barely increase L0
 	// size, so using L0 alone would never reclaim a growing partition VLog.

@@ -197,6 +197,7 @@ type KVServer struct {
 	bphs                          *bphsStore
 	bphsMemtableBytes             int64
 	bphsSyncConcurrency           int
+	bphsWALBytes                  int64
 	bphsPartitionGCThresholdBytes int64
 	bphsDir                       string
 }
@@ -333,6 +334,7 @@ func New(cfg Config) (*KVServer, error) {
 		bphsEnabled:                   cfg.BPHS,
 		bphsMemtableBytes:             int64(cfg.BPHSMemtableMB) << 20,
 		bphsSyncConcurrency:           cfg.BPHSSyncConcurrency,
+		bphsWALBytes:                  int64(cfg.BPHSWALMB) << 20,
 		bphsPartitionGCThresholdBytes: int64(cfg.BPHSPartitionGCThresholdMB) << 20,
 	}
 	// PASV switches off the storage engine's WAL. RocksDB reads that option once, when
@@ -375,11 +377,12 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
 		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.BPHS,
-		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsPartitionGCThresholdBytes>>20,
+		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsWALBytes>>20,
+		kvs.bphsPartitionGCThresholdBytes>>20,
 		kvs.partitionTargetBytes>>20)
 
 	// A fresh node opens the initial store; a restarted node restores GC state, the

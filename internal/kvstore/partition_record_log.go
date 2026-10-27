@@ -238,7 +238,7 @@ func (l *partitionRecordLog) ScanAll() ([]bphsRecord, error) {
 	for offset := int64(0); offset < l.size; {
 		rec, err := l.readAtLocked(offset)
 		if err != nil {
-			return nil, err
+			return records, err
 		}
 		records = append(records, rec)
 		offset += int64(partitionRecordHeaderBytes + len(rec.Key))

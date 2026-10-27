@@ -318,7 +318,7 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 	}
 
 	if pending {
-		if err := kvs.bphs.SyncPartitions(bphsDirty); err != nil {
+		if err := kvs.bphs.SyncPartitionsFast(bphsDirty); err != nil {
 			log.Fatalf("sync BPHS before applied=%d: %v", applied, err)
 		}
 		rows = kvs.flushApplyRows(rows, applied)

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
@@ -121,6 +122,61 @@ func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
+	kvs := &KVServer{
+		persister:           &raft.Persister{},
+		inlineThreshold:     512,
+		indexBlockBytes:     512,
+		bphsSyncConcurrency: 2,
+		bphsWALBytes:        1 << 20,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs"),
+		1<<20, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	part, err := store.Put("0000000001", "shared-wal-value", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitionsFast(map[int]struct{}{part: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+	if store.wal.Size() == 0 {
+		t.Fatal("shared WAL is empty after fast sync")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	recordsDirty := func() bool {
+		store.parts[part].mu.RLock()
+		defer store.parts[part].mu.RUnlock()
+		return store.parts[part].recordsDirty
+	}
+	for recordsDirty() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if recordsDirty() {
+		t.Fatal("background record sync did not complete")
+	}
+	if err := store.durableSyncError(); err != nil {
+		t.Fatalf("background sync: %v", err)
+	}
+	store.walMaxBytes = 1
+	if err := store.checkpointSharedWAL(); err != nil {
+		t.Fatal(err)
+	}
+	if store.wal.Size() != 0 {
+		t.Fatalf("shared WAL size after checkpoint = %d, want 0", store.wal.Size())
+	}
+}
+
 func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},
@@ -214,12 +270,12 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 { // one records log + one vlog
+	if len(entries) != 3 { // partition records + vlog + shared WAL
 		names := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			names = append(names, fmt.Sprint(entry.Name()))
 		}
-		t.Fatalf("BPHS files = %v, want records+vlog", names)
+		t.Fatalf("BPHS files = %v, want records+vlog+shared WAL", names)
 	}
 }
 

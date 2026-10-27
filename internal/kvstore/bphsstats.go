@@ -21,6 +21,10 @@ var bphsWriteStats struct {
 	recordSyncNs     atomic.Uint64
 	vlogSyncCalls    atomic.Uint64
 	vlogSyncNs       atomic.Uint64
+	walSyncCalls     atomic.Uint64
+	walSyncNs        atomic.Uint64
+	walBytes         atomic.Uint64
+	walResets        atomic.Uint64
 	syncTotalNs      atomic.Uint64
 	memtableFlushes  atomic.Uint64
 	memtableFlushNs  atomic.Uint64
@@ -63,6 +67,18 @@ func recordBPHSRecordSync(elapsed time.Duration) {
 func recordBPHSVLogSync(elapsed time.Duration) {
 	bphsWriteStats.vlogSyncCalls.Add(1)
 	bphsWriteStats.vlogSyncNs.Add(uint64(elapsed))
+}
+
+func recordBPHSSharedWAL(bytes int64, elapsed time.Duration) {
+	bphsWriteStats.walSyncCalls.Add(1)
+	bphsWriteStats.walSyncNs.Add(uint64(elapsed))
+	if bytes > 0 {
+		bphsWriteStats.walBytes.Add(uint64(bytes))
+	}
+}
+
+func recordBPHSSharedWALReset() {
+	bphsWriteStats.walResets.Add(1)
 }
 
 func recordBPHSMemtableFlush(elapsed time.Duration, bytes int64) {
@@ -108,6 +124,7 @@ func bphsWriteStatsLine() string {
 		"[BPHS-WRITE] puts=%d puts_per_sync_batch=%.1f dirty_per_batch=%.2f sync_rounds_per_batch=%.2f "+
 			"put_lock_wait=%.4fms partition_lock_wait=%.4fms sync_total=%.4fms/batch "+
 			"record_sync_calls=%d record_sync=%.4fms/call vlog_sync_calls=%d vlog_sync=%.4fms/call "+
+			"wal_sync_calls=%d wal_sync=%.4fms/call wal_mib=%.2f wal_resets=%d "+
 			"mem_flushes=%d flush=%.4fms/call flush_mib=%.2f "+
 			"l0_merges=%d l0_merge=%.4fms/call base_compactions=%d base_compact=%.4fms/call avg_value=%.1fB",
 		puts,
@@ -121,6 +138,10 @@ func bphsWriteStatsLine() string {
 		avgMs(bphsWriteStats.recordSyncNs.Load(), bphsWriteStats.recordSyncCalls.Load()),
 		bphsWriteStats.vlogSyncCalls.Load(),
 		avgMs(bphsWriteStats.vlogSyncNs.Load(), bphsWriteStats.vlogSyncCalls.Load()),
+		bphsWriteStats.walSyncCalls.Load(),
+		avgMs(bphsWriteStats.walSyncNs.Load(), bphsWriteStats.walSyncCalls.Load()),
+		float64(bphsWriteStats.walBytes.Load())/(1<<20),
+		bphsWriteStats.walResets.Load(),
 		bphsWriteStats.memtableFlushes.Load(),
 		avgMs(bphsWriteStats.memtableFlushNs.Load(), bphsWriteStats.memtableFlushes.Load()),
 		float64(bphsWriteStats.memtableFlushB.Load())/(1<<20),
