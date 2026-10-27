@@ -137,6 +137,9 @@ type Config struct {
 	// BPHSSyncConcurrency bounds how many dirty partitions are fsynced in
 	// parallel after one apply batch. The default preserves the original value.
 	BPHSSyncConcurrency int
+	// BPHSRecordSyncConcurrency bounds the independent background worker that
+	// persists partition record logs after the shared WAL has made a batch durable.
+	BPHSRecordSyncConcurrency int
 	// BPHSWALMB bounds the node-wide BPHS WAL. Once it grows past this size,
 	// dirty partition records are synchronously made durable and the WAL resets.
 	BPHSWALMB int

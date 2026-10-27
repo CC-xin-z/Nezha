@@ -10,29 +10,32 @@ import (
 // path. The key values are dirty partitions per apply batch and the resulting
 // number of partition fsync rounds.
 var bphsWriteStats struct {
-	puts             atomic.Uint64
-	putBytes         atomic.Uint64
-	putLockWaitNs    atomic.Uint64
-	syncBatches      atomic.Uint64
-	dirtyPartitions  atomic.Uint64
-	syncRounds       atomic.Uint64
-	partitionLockNs  atomic.Uint64
-	recordSyncCalls  atomic.Uint64
-	recordSyncNs     atomic.Uint64
-	vlogSyncCalls    atomic.Uint64
-	vlogSyncNs       atomic.Uint64
-	walSyncCalls     atomic.Uint64
-	walSyncNs        atomic.Uint64
-	walBytes         atomic.Uint64
-	walResets        atomic.Uint64
-	syncTotalNs      atomic.Uint64
-	memtableFlushes  atomic.Uint64
-	memtableFlushNs  atomic.Uint64
-	memtableFlushB   atomic.Uint64
-	l0Merges         atomic.Uint64
-	l0MergeNs        atomic.Uint64
-	baseCompactions  atomic.Uint64
-	baseCompactionNs atomic.Uint64
+	puts                atomic.Uint64
+	putBytes            atomic.Uint64
+	putLockWaitNs       atomic.Uint64
+	syncBatches         atomic.Uint64
+	dirtyPartitions     atomic.Uint64
+	syncRounds          atomic.Uint64
+	partitionLockNs     atomic.Uint64
+	recordSyncBatches   atomic.Uint64
+	recordSyncRequested atomic.Uint64
+	recordSyncDeduped   atomic.Uint64
+	recordSyncCalls     atomic.Uint64
+	recordSyncNs        atomic.Uint64
+	vlogSyncCalls       atomic.Uint64
+	vlogSyncNs          atomic.Uint64
+	walSyncCalls        atomic.Uint64
+	walSyncNs           atomic.Uint64
+	walBytes            atomic.Uint64
+	walResets           atomic.Uint64
+	syncTotalNs         atomic.Uint64
+	memtableFlushes     atomic.Uint64
+	memtableFlushNs     atomic.Uint64
+	memtableFlushB      atomic.Uint64
+	l0Merges            atomic.Uint64
+	l0MergeNs           atomic.Uint64
+	baseCompactions     atomic.Uint64
+	baseCompactionNs    atomic.Uint64
 }
 
 func recordBPHSPut(valueBytes int, lockWait time.Duration) {
@@ -62,6 +65,15 @@ func recordBPHSPartitionLockWait(elapsed time.Duration) {
 func recordBPHSRecordSync(elapsed time.Duration) {
 	bphsWriteStats.recordSyncCalls.Add(1)
 	bphsWriteStats.recordSyncNs.Add(uint64(elapsed))
+}
+
+func recordBPHSRecordSyncBatch(_ int) {
+	bphsWriteStats.recordSyncBatches.Add(1)
+}
+
+func recordBPHSRecordSyncQueued(requested, deduped int) {
+	bphsWriteStats.recordSyncRequested.Add(uint64(requested))
+	bphsWriteStats.recordSyncDeduped.Add(uint64(deduped))
 }
 
 func recordBPHSVLogSync(elapsed time.Duration) {
@@ -123,6 +135,7 @@ func bphsWriteStatsLine() string {
 	return fmt.Sprintf(
 		"[BPHS-WRITE] puts=%d puts_per_sync_batch=%.1f dirty_per_batch=%.2f sync_rounds_per_batch=%.2f "+
 			"put_lock_wait=%.4fms partition_lock_wait=%.4fms sync_total=%.4fms/batch "+
+			"record_sync_batches=%d record_sync_requested=%d record_sync_deduped=%d "+
 			"record_sync_calls=%d record_sync=%.4fms/call vlog_sync_calls=%d vlog_sync=%.4fms/call "+
 			"wal_sync_calls=%d wal_sync=%.4fms/call wal_mib=%.2f wal_resets=%d "+
 			"mem_flushes=%d flush=%.4fms/call flush_mib=%.2f "+
@@ -134,6 +147,9 @@ func bphsWriteStatsLine() string {
 		avgMs(bphsWriteStats.putLockWaitNs.Load(), puts),
 		avgMs(bphsWriteStats.partitionLockNs.Load(), bphsWriteStats.dirtyPartitions.Load()),
 		avgMs(bphsWriteStats.syncTotalNs.Load(), batches),
+		bphsWriteStats.recordSyncBatches.Load(),
+		bphsWriteStats.recordSyncRequested.Load(),
+		bphsWriteStats.recordSyncDeduped.Load(),
 		bphsWriteStats.recordSyncCalls.Load(),
 		avgMs(bphsWriteStats.recordSyncNs.Load(), bphsWriteStats.recordSyncCalls.Load()),
 		bphsWriteStats.vlogSyncCalls.Load(),

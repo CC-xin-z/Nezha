@@ -104,11 +104,16 @@ func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("default sync concurrency = %d, want %d",
 			store.syncConcurrency, bphsDefaultPartitionSyncConcurrency)
 	}
+	if store.recordSyncConcurrency != bphsDefaultRecordSyncConcurrency {
+		t.Fatalf("default record sync concurrency = %d, want %d",
+			store.recordSyncConcurrency, bphsDefaultRecordSyncConcurrency)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	kvs.bphsSyncConcurrency = 3
+	kvs.bphsRecordSyncConcurrency = 4
 	store, err = openBPHSStore(
 		kvs, base, filepath.Join(t.TempDir(), "bphs-override"),
 		1<<20, 0, 0,
@@ -119,6 +124,9 @@ func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 	defer store.Close()
 	if store.syncConcurrency != 3 {
 		t.Fatalf("configured sync concurrency = %d, want 3", store.syncConcurrency)
+	}
+	if store.recordSyncConcurrency != 4 {
+		t.Fatalf("configured record sync concurrency = %d, want 4", store.recordSyncConcurrency)
 	}
 }
 
@@ -174,6 +182,25 @@ func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 	}
 	if store.wal.Size() != 0 {
 		t.Fatalf("shared WAL size after checkpoint = %d, want 0", store.wal.Size())
+	}
+}
+
+func TestBPHSRecordSyncQueueCoalescesPartitions(t *testing.T) {
+	store := &bphsStore{
+		recordSyncPending: make(map[int]struct{}),
+		recordSyncSignal:  make(chan struct{}, 1),
+	}
+	store.queueRecordSync(map[int]struct{}{0: {}, 1: {}})
+	store.queueRecordSync(map[int]struct{}{1: {}, 2: {}})
+
+	if len(store.recordSyncPending) != 3 {
+		t.Fatalf("pending record sync partitions = %d, want 3: %+v",
+			len(store.recordSyncPending), store.recordSyncPending)
+	}
+	for _, idx := range []int{0, 1, 2} {
+		if _, ok := store.recordSyncPending[idx]; !ok {
+			t.Fatalf("partition %d missing from pending record sync set", idx)
+		}
 	}
 }
 

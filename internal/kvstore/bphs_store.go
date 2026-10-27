@@ -22,6 +22,7 @@ const (
 	bphsL0CompactionTrigger             = 4
 	bphsBaseCompactionL0Rounds          = 8
 	bphsDefaultPartitionSyncConcurrency = 8
+	bphsDefaultRecordSyncConcurrency    = 8
 )
 
 type bphsPartitionManifest struct {
@@ -87,7 +88,10 @@ type bphsStore struct {
 	wal                       *bphsSharedWAL
 	walPending                []bphsSharedWALRecord
 	walMaxBytes               int64
-	recordSyncCh              chan map[int]struct{}
+	recordSyncConcurrency     int
+	recordSyncMu              sync.Mutex
+	recordSyncPending         map[int]struct{}
+	recordSyncSignal          chan struct{}
 	recordSyncStop            chan struct{}
 	recordSyncWG              sync.WaitGroup
 	durableErrMu              sync.Mutex
@@ -130,6 +134,10 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	if walMaxBytes <= 0 {
 		walMaxBytes = 256 << 20
 	}
+	recordSyncConcurrency := kvs.bphsRecordSyncConcurrency
+	if recordSyncConcurrency <= 0 {
+		recordSyncConcurrency = bphsDefaultRecordSyncConcurrency
+	}
 	wal, err := openBPHSSharedWAL(filepath.Join(dir, bphsSharedWALName))
 	if err != nil {
 		return nil, fmt.Errorf("open BPHS shared WAL: %w", err)
@@ -142,7 +150,9 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		syncConcurrency:           syncConcurrency,
 		wal:                       wal,
 		walMaxBytes:               walMaxBytes,
-		recordSyncCh:              make(chan map[int]struct{}, 256),
+		recordSyncConcurrency:     recordSyncConcurrency,
+		recordSyncPending:         make(map[int]struct{}),
+		recordSyncSignal:          make(chan struct{}, 1),
 		recordSyncStop:            make(chan struct{}),
 		inline:                    inline,
 		partitionGCThresholdBytes: kvs.bphsPartitionGCThresholdBytes,
@@ -1247,7 +1257,7 @@ func (s *bphsStore) appendPendingSharedWAL() error {
 	return nil
 }
 
-func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}) error {
+func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}, concurrency int) error {
 	if len(indices) == 0 {
 		return nil
 	}
@@ -1256,9 +1266,8 @@ func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}) error {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
 	}
-	concurrency := s.syncConcurrency
 	if concurrency <= 0 {
-		concurrency = bphsDefaultPartitionSyncConcurrency
+		concurrency = bphsDefaultRecordSyncConcurrency
 	}
 	sem := make(chan struct{}, concurrency)
 	results := make(chan error, len(indices))
@@ -1303,29 +1312,50 @@ func (s *bphsStore) recordSyncLoop() {
 		select {
 		case <-s.recordSyncStop:
 			return
-		case indices := <-s.recordSyncCh:
-			if err := s.syncRecordPartitions(indices); err != nil {
-				s.setDurableSyncError(err)
+		case <-s.recordSyncSignal:
+			for {
+				indices := s.takePendingRecordSync()
+				if len(indices) == 0 {
+					break
+				}
+				recordBPHSRecordSyncBatch(len(indices))
+				if err := s.syncRecordPartitions(indices, s.recordSyncConcurrency); err != nil {
+					s.setDurableSyncError(err)
+				}
 			}
 		}
 	}
 }
 
-func (s *bphsStore) queueRecordSync(indices map[int]struct{}) error {
+func (s *bphsStore) takePendingRecordSync() map[int]struct{} {
+	s.recordSyncMu.Lock()
+	defer s.recordSyncMu.Unlock()
+	if len(s.recordSyncPending) == 0 {
+		return nil
+	}
+	out := s.recordSyncPending
+	s.recordSyncPending = make(map[int]struct{})
+	return out
+}
+
+func (s *bphsStore) queueRecordSync(indices map[int]struct{}) {
 	if len(indices) == 0 {
-		return nil
+		return
 	}
-	queued := make(map[int]struct{}, len(indices))
+	s.recordSyncMu.Lock()
+	deduped := 0
 	for idx := range indices {
-		queued[idx] = struct{}{}
+		if _, exists := s.recordSyncPending[idx]; exists {
+			deduped++
+			continue
+		}
+		s.recordSyncPending[idx] = struct{}{}
 	}
+	s.recordSyncMu.Unlock()
+	recordBPHSRecordSyncQueued(len(indices), deduped)
 	select {
-	case s.recordSyncCh <- queued:
-		return nil
+	case s.recordSyncSignal <- struct{}{}:
 	default:
-		// The queue is bounded. Falling back to the caller preserves durability
-		// rather than blocking the apply loop indefinitely.
-		return s.syncRecordPartitions(queued)
 	}
 }
 
@@ -1337,7 +1367,7 @@ func (s *bphsStore) checkpointSharedWAL() error {
 	for i := range s.parts {
 		all[i] = struct{}{}
 	}
-	if err := s.syncRecordPartitions(all); err != nil {
+	if err := s.syncRecordPartitions(all, s.syncConcurrency); err != nil {
 		return err
 	}
 	if err := s.wal.Reset(); err != nil {
@@ -1419,9 +1449,7 @@ func (s *bphsStore) SyncPartitionsFast(indices map[int]struct{}) error {
 	if err := s.appendPendingSharedWAL(); err != nil {
 		return err
 	}
-	if err := s.queueRecordSync(indices); err != nil {
-		return err
-	}
+	s.queueRecordSync(indices)
 	return s.checkpointSharedWAL()
 }
 
