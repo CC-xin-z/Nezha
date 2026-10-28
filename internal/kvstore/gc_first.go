@@ -62,6 +62,7 @@ func (kvs *KVServer) entryFromRecord(paddedKey string, raw []byte, logFile *os.F
 }
 
 func (kvs *KVServer) FirstGarbageCollection() error {
+	kvs.tailSealBoundary = kvs.tailFilter.SealSegment()
 	fmt.Println("Starting garbage collection...")
 	startTime := time.Now()
 

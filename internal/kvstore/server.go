@@ -159,7 +159,9 @@ type KVServer struct {
 	lastGCFinish        bool
 
 	// AVP: adaptive value placement
-	kvSeparation bool // false 时退化为 standard Raft+RocksDB 基线
+	kvSeparation     bool // false 时退化为 standard Raft+RocksDB 基线
+	tailFilter       *TailFilter
+	tailSealBoundary int
 	// gcEnabled 把"要不要跑 GC"从阈值大小里分离出来。
 	// 原先只能靠调大 gcThresholdGB 让 GC 永不触发来模拟 Nezha-NoGC，
 	// 阈值算错就会静默变成另一个被测系统。
@@ -378,6 +380,10 @@ func New(cfg Config) (*KVServer, error) {
 	kvs.clearSnapshotWork()
 	kvs.InitialRaftStateLog = filepath.Join(cfg.DataDir, "data", "valuelog", "RaftState.log")
 	kvs.currentLog = kvs.InitialRaftStateLog
+	kvs.tailSealBoundary = -1
+	if cfg.TailRoute {
+		kvs.tailFilter = NewTailFilter(0, 0)
+	}
 	InitGCPaths(cfg.DataDir)
 	InitAnotherGCPaths(cfg.DataDir)
 
@@ -385,6 +391,7 @@ func New(cfg Config) (*KVServer, error) {
 	StartAVPStatsReporter(15 * time.Second)
 	StartWriteStatsReporter(15 * time.Second)
 	StartAVPViz(cfg.VizAddr, cfg.systemName(), kvs.inlineThreshold)
+	kvs.StartTailRouteStatsReporter(15 * time.Second)
 	// One line that says which system this log measured: the switches can come from the
 	// preset or be set individually, and results must be attributable afterwards.
 	cq := cfg.CommitQuorum
@@ -393,10 +400,10 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d tailRoute=%v bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
-		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.BPHS,
+		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.TailRoute, cfg.BPHS,
 		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsRecordSyncConcurrency,
 		kvs.bphsRaftLogWAL, kvs.bphsLogCheckpointBytes>>20, kvs.bphsWALBytes>>20,
 		kvs.bphsPartitionGCThresholdBytes>>20,
@@ -469,6 +476,15 @@ func New(cfg Config) (*KVServer, error) {
 		}
 		kvs.persister.SetApplied(int(durable))
 		kvs.raft.SetCompactFloor(int(durable))
+	}
+	if kvs.tailFilter != nil {
+		if len(recoveredFiles) == 0 {
+			kvs.tailFilter.MarkExact()
+			fmt.Println("[TAIL-FILTER] tail empty; exact routing enabled")
+		} else {
+			fmt.Printf("[TAIL-FILTER] recovered %d log files; routing remains conservative\n",
+				len(recoveredFiles))
+		}
 	}
 	// Attach the current log file with its version; appends continue at its end.
 	kvs.raft.SetCurrentLogVersioned(kvs.currentLog, int32(kvs.numGC))

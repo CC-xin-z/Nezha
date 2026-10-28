@@ -633,6 +633,9 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 			kvs.raft.SetCompactFloor(int(durable))
 		}
 	}
+	// The installed snapshot replaces the value-log tail. Existing segmented
+	// Bloom data no longer describes it, so fall back to conservative routing.
+	kvs.tailFilter.Invalidate()
 
 	// 6) 最后写状态文件——这一步之前崩，等于这份快照没装过。
 	snapshotInstallPauseWindow()

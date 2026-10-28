@@ -112,6 +112,7 @@ func (st *kvState) rebase(dataDir string) {
 // first, delete the old file last. A crash in between leaves the old file on disk with
 // the state already pointing at the new one, which is merely an unreferenced file.
 func (kvs *KVServer) finishFirstGC(startTime time.Time) {
+	kvs.tailFilter.DropThrough(kvs.tailSealBoundary)
 	fmt.Printf("垃圾回收完成，共花费了%v\n", time.Since(startTime))
 	kvs.raft.PersistLogBase()
 	kvs.mu.Lock()
@@ -148,6 +149,7 @@ func (kvs *KVServer) finishFirstGC(startTime time.Time) {
 
 // finishAnotherGC completes the second (merging) round after a successful migration.
 func (kvs *KVServer) finishAnotherGC(startTime time.Time) {
+	kvs.tailFilter.DropThrough(kvs.tailSealBoundary)
 	fmt.Printf("垃圾回收完成，共花费了%v\n", time.Since(startTime))
 	kvs.raft.PersistLogBase()
 	kvs.mu.Lock()

@@ -62,6 +62,7 @@ func ensurePathExists(path string) error {
 }
 
 func (kvs *KVServer) AnotherGarbageCollection() error {
+	kvs.tailSealBoundary = kvs.tailFilter.SealSegment()
 	err := kvs.MergedGarbageCollection()
 	return err
 }

@@ -62,6 +62,7 @@ func main() {
 	// threshold go straight into the store, and the next GC round moves them into the
 	// partitions along with everything else in that store (absorbTail iterates it).
 	flag.BoolVar(&cfg.InlinePlacement, "inlinePlacement", false, "store values smaller than inlineThreshold directly in the store (true AVP)")
+	flag.BoolVar(&cfg.TailRoute, "tailRoute", false, "maintain a tail-side set filter and skip the value-log path when a key cannot be in the tail")
 	flag.IntVar(&cfg.InlineThreshold, "inlineThreshold", 512, "value size threshold in bytes for inline placement and the inline cache")
 	flag.IntVar(&cfg.InlineCacheMB, "inlineCacheMB", 256, "memory budget in MB for the inline small-value cache (0 disables it)")
 	flag.IntVar(&cfg.InlineBudgetMB, "inlineBudgetMB", 0, "with -inlinePlacement: at most this many MB (key+value) are inlined per store generation, the rest stored as offsets (0 = unlimited, the default; a budget measured net negative, see results/avp-inline-budget/)")

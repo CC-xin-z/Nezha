@@ -69,8 +69,12 @@ type Config struct {
 
 	// AVP (adaptive value placement) is orthogonal to System.
 	InlinePlacement bool // values below InlineThreshold are stored inline in the store
-	InlineThreshold int  // bytes
-	InlineCacheMB   int  // memory budget of the inline cache per sorted-file index
+	// TailRoute maintains a segmented no-false-negative filter for the current
+	// value-log tail and uses it to skip the value-log lookup when a key is
+	// already known to exist only in a sorted partition.
+	TailRoute       bool
+	InlineThreshold int // bytes
+	InlineCacheMB   int // memory budget of the inline cache per sorted-file index
 	// InlineBudgetMB 是每一代库（每轮 GC 换一个新库）最多内联多少字节，0 表示不限（历史行为）。
 	//
 	// 为什么要有上限：内联把小值整段写进 valuelog 一侧的库。库的内存表默认 64MB，

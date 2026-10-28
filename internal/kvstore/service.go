@@ -276,6 +276,19 @@ func (kvs *KVServer) StartGet(st stateSnapshot, args *kvrpc.GetInRaftRequest) *k
 			return reply
 		}
 	}
+	// If the segmented tail filter proves that the key is no longer in the
+	// current value-log tail, the sorted partition set is the only possible
+	// source. This skips the doomed RocksDB/valuelog probe before it starts.
+	if target := kvs.tailRouteTarget(st); target != nil && kvs.tailRouteShortcut(key) {
+		value, hit, err := kvs.getFromPartitions(key, target)
+		if err == nil {
+			avpRecordPartitionRead(hit)
+			reply.Value = value
+			return reply
+		}
+		// A filter false positive or an actual read error falls back to the
+		// regular multi-path lookup, so correctness never depends on the filter.
+	}
 	// **这里不再预查一次"是不是内联"。**
 	//
 	// 原先这个位置有一段 `if kvs.inlinePlacement { GetInline(key) }`：小值内联时它
