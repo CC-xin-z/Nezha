@@ -586,6 +586,48 @@ func TestBPHSFullPartitionCompaction(t *testing.T) {
 	}
 }
 
+func TestBPHSCompactForReadCollapsesResidualDelta(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000001", "old")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs"), 1<<20, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	partID, err := store.Put("0000000001", "new", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{partID: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	compacted, err := store.CompactForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compacted != 1 {
+		t.Fatalf("compacted partitions = %d, want 1", compacted)
+	}
+
+	part := store.parts[partID]
+	part.mu.RLock()
+	defer part.mu.RUnlock()
+	if !part.baseLocal || len(part.l0) != 0 || part.mem.Len() != 0 {
+		t.Fatalf("idle compaction state = local:%v l0:%d mem:%d, want true/0/0",
+			part.baseLocal, len(part.l0), part.mem.Len())
+	}
+}
+
 func TestBPHSSortedFileReadsPreserveVersions(t *testing.T) {
 	kvs := &KVServer{indexBlockBytes: 128}
 

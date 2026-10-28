@@ -13,6 +13,8 @@ const (
 	bphsCheckpointPoll   = 5 * time.Second
 	bphsCheckpointIdle   = 30 * time.Second
 	bphsCheckpointMinLog = 256 << 20
+	bphsIdleCompactPoll  = 5 * time.Second
+	bphsIdleCompactQuiet = 10 * time.Second
 )
 
 func (kvs *KVServer) noteClientActivity() {
@@ -98,6 +100,52 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 				filepath.Base(oldLog), index, filepath.Base(activeLog))
 			debug.FreeOSMemory()
 			idleSince = time.Time{}
+		}
+	}
+}
+
+// bphsIdleCompactionLoop collapses residual per-partition MemTables and L0
+// runs after a write burst has gone quiet. This is intentionally separate from
+// the checkpoint loop: checkpointing bounds the Raft log, while this loop
+// bounds the number of local runs observed by subsequent GET and SCAN calls.
+func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
+	if kvs == nil || !kvs.bphsEnabled {
+		return
+	}
+	ticker := time.NewTicker(bphsIdleCompactPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			// Keep the store lifecycle stable while compacting. Taking the
+			// read lock before inspecting kvs.bphs prevents a concurrent
+			// snapshot/GC replacement from closing the store underneath us.
+			kvs.storeRetireMu.RLock()
+			kvs.mu.Lock()
+			store := kvs.bphs
+			active := store != nil &&
+				!kvs.installing && !kvs.gcActive && !kvs.gcInProgress &&
+				now.Sub(kvs.lastPutTime) >= bphsIdleCompactQuiet &&
+				now.Sub(time.Unix(0, kvs.lastClientActivity.Load())) >= bphsIdleCompactQuiet
+			kvs.mu.Unlock()
+			if !active {
+				kvs.storeRetireMu.RUnlock()
+				continue
+			}
+
+			start := time.Now()
+			compacted, err := store.CompactForRead()
+			kvs.storeRetireMu.RUnlock()
+			if err != nil {
+				fmt.Printf("[BPHS-IDLE-COMPACT] failed: %v\n", err)
+				continue
+			}
+			if compacted > 0 {
+				fmt.Printf("[BPHS-IDLE-COMPACT] partitions=%d elapsed=%v\n",
+					compacted, time.Since(start))
+			}
 		}
 	}
 }

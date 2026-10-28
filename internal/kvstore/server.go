@@ -224,7 +224,11 @@ func (kv *KVServer) Kill() {
 	kv.bphsEnabled = false
 	kv.mu.Unlock()
 	if bphs != nil {
+		// Idle compaction holds the read side of storeRetireMu for the lifetime
+		// of the store it is compacting. Wait for it before closing the files.
+		kv.storeRetireMu.Lock()
 		_ = bphs.Close()
+		kv.storeRetireMu.Unlock()
 	}
 	kv.raft.Kill()
 }
@@ -530,6 +534,7 @@ func (kvs *KVServer) Run(ctx context.Context) {
 		fmt.Printf("[RECOVER] BPHS Raft-WAL: replay complete through index %d, durable=%d\n",
 			kvs.recoveryTarget, kvs.bphs.DurableIndex())
 	}
+	go kvs.bphsIdleCompactionLoop(ctx)
 	go kvs.bphsLogCheckpointLoop(ctx)
 	go kvs.gcLoop(ctx)
 	go kvs.RegisterKVServer(ctx, kvs.address)

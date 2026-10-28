@@ -488,6 +488,45 @@ func (s *bphsStore) WaitForCompactions() error {
 	return s.compactionError()
 }
 
+// CompactForRead collapses the current local MemTable and L0 runs into the
+// partition base after writes have gone idle. It is called outside kvs.mu;
+// partition locks preserve the normal apply/read ordering.
+func (s *bphsStore) CompactForRead() (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	s.mu.RLock()
+	parts := append([]*bphsPartition(nil), s.parts...)
+	s.mu.RUnlock()
+
+	compacted := 0
+	for _, part := range parts {
+		part.mu.Lock()
+		if part.mem.Len() > 0 {
+			if err := s.flushPartitionLocked(part); err != nil {
+				part.mu.Unlock()
+				return compacted, err
+			}
+		}
+		// A flush may have scheduled the normal background compaction. Let
+		// that worker finish instead of compacting the same partition twice.
+		if part.compacting || (len(part.l0) == 0 && part.mem.Len() == 0) {
+			part.mu.Unlock()
+			continue
+		}
+		if err := s.compactPartitionLocked(part); err != nil {
+			part.mu.Unlock()
+			return compacted, err
+		}
+		compacted++
+		part.mu.Unlock()
+	}
+	if err := s.WaitForCompactions(); err != nil {
+		return compacted, err
+	}
+	return compacted, s.compactionError()
+}
+
 func (s *bphsStore) SetBase(base *PartitionSet) error {
 	if s == nil {
 		return nil
