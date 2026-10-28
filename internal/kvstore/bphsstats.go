@@ -38,6 +38,13 @@ var bphsWriteStats struct {
 	baseCompactionNs    atomic.Uint64
 	bloomProbes         atomic.Uint64
 	bloomSkips          atomic.Uint64
+	memHits             atomic.Uint64
+	l0Hits              atomic.Uint64
+	baseHits            atomic.Uint64
+	readMisses          atomic.Uint64
+	scanQueries         atomic.Uint64
+	scanPartitions      atomic.Uint64
+	scanL0Runs          atomic.Uint64
 }
 
 func recordBPHSPut(valueBytes int, lockWait time.Duration) {
@@ -118,6 +125,66 @@ func recordBPHSBloomProbe(skipped bool) {
 	if skipped {
 		bphsWriteStats.bloomSkips.Add(1)
 	}
+}
+
+type bphsReadSource uint8
+
+const (
+	bphsReadMem bphsReadSource = iota
+	bphsReadL0
+	bphsReadBase
+	bphsReadMiss
+)
+
+func recordBPHSRead(source bphsReadSource) {
+	switch source {
+	case bphsReadMem:
+		bphsWriteStats.memHits.Add(1)
+	case bphsReadL0:
+		bphsWriteStats.l0Hits.Add(1)
+	case bphsReadBase:
+		bphsWriteStats.baseHits.Add(1)
+	case bphsReadMiss:
+		bphsWriteStats.readMisses.Add(1)
+	}
+}
+
+func recordBPHSScan(partitions, l0Runs int) {
+	bphsWriteStats.scanQueries.Add(1)
+	if partitions > 0 {
+		bphsWriteStats.scanPartitions.Add(uint64(partitions))
+	}
+	if l0Runs > 0 {
+		bphsWriteStats.scanL0Runs.Add(uint64(l0Runs))
+	}
+}
+
+func bphsReadStatsLine() string {
+	memHits := bphsWriteStats.memHits.Load()
+	l0Hits := bphsWriteStats.l0Hits.Load()
+	baseHits := bphsWriteStats.baseHits.Load()
+	misses := bphsWriteStats.readMisses.Load()
+	gets := memHits + l0Hits + baseHits + misses
+	scanQueries := bphsWriteStats.scanQueries.Load()
+	if gets == 0 && scanQueries == 0 {
+		return "[BPHS-READ] 无数据"
+	}
+	avg := func(total, count uint64) float64 {
+		if count == 0 {
+			return 0
+		}
+		return float64(total) / float64(count)
+	}
+	return fmt.Sprintf(
+		"[BPHS-READ] gets=%d mem_hits=%d l0_hits=%d base_hits=%d misses=%d "+
+			"mem_ratio=%.4f l0_ratio=%.4f base_ratio=%.4f | "+
+			"scan_queries=%d scan_partitions_per_query=%.2f scan_l0_runs_per_query=%.2f",
+		gets, memHits, l0Hits, baseHits, misses,
+		avg(memHits, gets), avg(l0Hits, gets), avg(baseHits, gets),
+		scanQueries,
+		avg(bphsWriteStats.scanPartitions.Load(), scanQueries),
+		avg(bphsWriteStats.scanL0Runs.Load(), scanQueries),
+	)
 }
 
 func bphsWriteStatsLine() string {

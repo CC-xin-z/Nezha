@@ -1122,6 +1122,7 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if rec, ok := part.mem.Get(key); ok {
 		switch rec.Kind {
 		case bphsInlineRecord:
+			recordBPHSRead(bphsReadMem)
 			return rec.Value, true, nil
 		case bphsBlobRecord:
 			if rec.Blob.Generation != part.gen {
@@ -1132,6 +1133,7 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 			if err != nil {
 				return "", false, err
 			}
+			recordBPHSRead(bphsReadMem)
 			return string(raw), true, nil
 		}
 	}
@@ -1156,24 +1158,28 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 			return "", false, err
 		}
 		if rec.Kind == bphsInlineRecord {
+			recordBPHSRead(bphsReadL0)
 			return rec.Value, true, nil
 		}
 		raw, err := part.vlog.Read(rec.Blob)
 		if err != nil {
 			return "", false, err
 		}
+		recordBPHSRead(bphsReadL0)
 		return string(raw), true, nil
 	}
 
 	if part.base != nil {
 		entry, err := s.kvs.lookupInSortedFile(part.base, key)
 		if err == nil {
+			recordBPHSRead(bphsReadBase)
 			return entry.Value, true, nil
 		}
 		if err != ErrKeyAbsent {
 			return "", false, err
 		}
 	}
+	recordBPHSRead(bphsReadMiss)
 	return "", false, nil
 }
 
@@ -1189,6 +1195,10 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 
 	result := make(map[string]string)
 	first, last := base.ownedOverlapBounds(startKey, endKey)
+	l0Runs := 0
+	defer func() {
+		recordBPHSScan(max(last-first, 0), l0Runs)
+	}()
 	for i := first; i < last; i++ {
 		part := s.parts[i]
 		part.mu.RLock()
@@ -1200,6 +1210,7 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 			}
 		}
 		for _, l0 := range part.l0 {
+			l0Runs++
 			if err := s.scanBPHSSortedFileInto(result, startKey, endKey, part, l0); err != nil {
 				part.mu.RUnlock()
 				return nil, err
