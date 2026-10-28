@@ -352,6 +352,57 @@ func TestBPHSSyncTracksDirtyFiles(t *testing.T) {
 	}
 }
 
+func TestBPHSInlineCacheInvalidatedOnPut(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000001", "old")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs"), 1<<20, 1<<20, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	key := "0000000001"
+	got, found, err := store.Get(key)
+	if err != nil || !found || got != "old" {
+		t.Fatalf("initial get = %q,%v,%v; want old,true,nil", got, found, err)
+	}
+	if _, ok := store.inline.Get(key); !ok {
+		t.Fatal("base read did not populate the inline cache")
+	}
+
+	partID, err := store.Put(key, "new", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.inline.Get(key); ok {
+		t.Fatal("overwrite did not invalidate the cached value")
+	}
+	if err := store.SyncPartitions(map[int]struct{}{partID: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	part := store.parts[partID]
+	part.mu.Lock()
+	err = store.flushPartitionLocked(part)
+	part.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err = store.Get(key)
+	if err != nil || !found || got != "new" {
+		t.Fatalf("get after flush = %q,%v,%v; want new,true,nil", got, found, err)
+	}
+}
+
 func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},

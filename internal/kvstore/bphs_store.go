@@ -600,6 +600,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 		})
 	}
 	part.mem.Put(rec)
+	s.inline.Remove(key)
 	if part.mem.Full() {
 		if err := s.flushPartitionLocked(part); err != nil {
 			return -1, err
@@ -1122,6 +1123,9 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if rec, ok := part.mem.Get(key); ok {
 		switch rec.Kind {
 		case bphsInlineRecord:
+			if s.kvs.shouldInline(len(rec.Value)) {
+				s.inline.Add(key, rec.Value)
+			}
 			return rec.Value, true, nil
 		case bphsBlobRecord:
 			if rec.Blob.Generation != part.gen {
@@ -1134,6 +1138,9 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 			}
 			return string(raw), true, nil
 		}
+	}
+	if value, ok := s.inline.Get(key); ok {
+		return string(value), true, nil
 	}
 
 	// L0 按从新到旧查找；后台分区 Compaction 合入 base 前，这里必须继续
@@ -1156,6 +1163,9 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 			return "", false, err
 		}
 		if rec.Kind == bphsInlineRecord {
+			if s.kvs.shouldInline(len(rec.Value)) {
+				s.inline.Add(key, rec.Value)
+			}
 			return rec.Value, true, nil
 		}
 		raw, err := part.vlog.Read(rec.Blob)
@@ -1168,6 +1178,9 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if part.base != nil {
 		entry, err := s.kvs.lookupInSortedFile(part.base, key)
 		if err == nil {
+			if s.kvs.shouldInline(len(entry.Value)) {
+				s.inline.Add(key, entry.Value)
+			}
 			return entry.Value, true, nil
 		}
 		if err != ErrKeyAbsent {

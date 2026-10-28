@@ -100,6 +100,20 @@ func (c *InlineCache) Add(key string, val string) {
 	}
 }
 
+// Remove invalidates a cached value after an overwrite. lru.Remove invokes the
+// eviction callback, which keeps curBytes in sync with the retained entries.
+func (c *InlineCache) Remove(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lru.Remove(key)
+	if c.lru.Len() == 0 {
+		c.curBytes = 0
+	}
+}
+
 // Stats 返回命中数、未命中数、当前字节数、条目数
 func (c *InlineCache) Stats() (hits, misses uint64, bytes int64, entries int) {
 	if c == nil {
