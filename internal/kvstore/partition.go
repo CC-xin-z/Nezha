@@ -163,6 +163,23 @@ func (ps *PartitionSet) findOwned(paddedKey string) (*SortedFileIndex, int, bool
 	return p, i, true
 }
 
+// ownedOverlapBounds returns the half-open partition index range whose static
+// ownership ranges overlap the inclusive key range [startKey, endKey].
+func (ps *PartitionSet) ownedOverlapBounds(startKey, endKey string) (int, int) {
+	if ps == nil || len(ps.parts) == 0 || startKey > endKey {
+		return 0, 0
+	}
+	first := sort.Search(len(ps.parts), func(i int) bool {
+		hi := ps.parts[i].OwnershipHi
+		return hi == "" || startKey < hi
+	})
+	last := sort.Search(len(ps.parts), func(i int) bool {
+		lo := ps.parts[i].OwnershipLo
+		return lo != "" && endKey < lo
+	})
+	return first, last
+}
+
 // overlapping 返回与 [lo, hi] 有交集的全部分区，按 key 升序；两端都是 padded key。
 func (ps *PartitionSet) overlapping(lo, hi string) []*SortedFileIndex {
 	if ps == nil || len(ps.parts) == 0 || lo > hi {

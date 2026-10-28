@@ -20,8 +20,11 @@ import (
 )
 
 const (
-	bphsL0CompactionTrigger             = 4
-	bphsBaseCompactionL0Rounds          = 8
+	bphsL0CompactionTrigger = 4
+	// One completed L0 merge is enough to keep the read path at base + at most
+	// one run. Waiting for eight rounds leaves several overlapping L0 runs that
+	// every GET and SCAN must probe even after the write phase has ended.
+	bphsBaseCompactionL0Rounds          = 1
 	bphsDefaultPartitionSyncConcurrency = 8
 	bphsDefaultRecordSyncConcurrency    = 8
 )
@@ -657,9 +660,9 @@ func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
 	if part == nil {
 		return false
 	}
-	// Inline records are bounded by partition-local L0 compaction. Rewriting
-	// the whole Base for every L0 batch is pure write amplification, so inline
-	// partitions merge into a local Base only after several L0 merge rounds.
+	// Inline records are bounded by partition-local L0 compaction. Merge one
+	// completed L0 run into the local Base so quiescent reads see a single run,
+	// without rewriting the Base after every small memtable flush.
 	// VLog growth still triggers earlier because it is reclaimable Blob space.
 	if part.vlog.Size() == 0 {
 		return part.l0Merges >= bphsBaseCompactionL0Rounds
@@ -1185,13 +1188,8 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 	base := s.basePtr.Load()
 
 	result := make(map[string]string)
-	for i, basePart := range base.parts {
-		if basePart.OwnershipHi != "" && startKey >= basePart.OwnershipHi {
-			continue
-		}
-		if basePart.OwnershipLo != "" && endKey < basePart.OwnershipLo {
-			continue
-		}
+	first, last := base.ownedOverlapBounds(startKey, endKey)
+	for i := first; i < last; i++ {
 		part := s.parts[i]
 		part.mu.RLock()
 

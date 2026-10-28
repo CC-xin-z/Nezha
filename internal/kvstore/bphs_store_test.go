@@ -381,14 +381,23 @@ func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 	if err := store.SyncPartitions(dirty); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.parts[0].l0) == 0 {
-		t.Fatal("memtable 满后没有生成 L0")
+	if err := store.WaitForCompactions(); err != nil {
+		t.Fatal(err)
 	}
-	if len(store.parts[0].l0) >= bphsL0CompactionTrigger {
-		t.Fatalf("L0 compaction 未触发：仍有 %d 个 run", len(store.parts[0].l0))
+	part := store.parts[0]
+	part.mu.RLock()
+	l0Runs := len(part.l0)
+	hasLocalBase := part.baseLocal
+	recordsBytes := part.records.Size()
+	part.mu.RUnlock()
+	if l0Runs >= bphsL0CompactionTrigger {
+		t.Fatalf("L0 compaction 未触发：仍有 %d 个 run", l0Runs)
 	}
-	if got := store.parts[0].records.Size(); got != 0 {
-		t.Fatalf("L0 durable 后 records 仍保留 %d 字节", got)
+	if l0Runs == 0 && !hasLocalBase {
+		t.Fatal("memtable 满后的数据既不在 L0，也不在本地 base")
+	}
+	if recordsBytes != 0 {
+		t.Fatalf("L0 durable 后 records 仍保留 %d 字节", recordsBytes)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

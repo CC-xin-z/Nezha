@@ -139,6 +139,37 @@ func TestPartitionOverlapping(t *testing.T) {
 	}
 }
 
+func TestPartitionOwnedOverlapBounds(t *testing.T) {
+	ps := mkSet([2]string{"100", "199"}, [2]string{"300", "399"}, [2]string{"500", "599"})
+	ps.assignOwnershipRanges()
+
+	cases := []struct {
+		lo, hi   string
+		first    int
+		last     int
+		expected string
+	}{
+		{"000", "050", 0, 1, "首分区负责负无穷到第一个数据点"},
+		{"150", "160", 0, 1, "窄范围只命中首分区"},
+		{"210", "290", 0, 1, "数据空隙归首分区"},
+		{"299", "300", 0, 2, "OwnershipHi 是开区间，终点可进入下一分区"},
+		{"150", "350", 0, 2, "跨两个分区"},
+		{"000", "999", 0, 3, "全范围"},
+		{"600", "999", 2, 3, "末分区负责其余键空间"},
+	}
+	for _, c := range cases {
+		first, last := ps.ownedOverlapBounds(c.lo, c.hi)
+		if first != c.first || last != c.last {
+			t.Errorf("%s: ownedOverlapBounds(%q,%q) = [%d,%d), want [%d,%d)",
+				c.expected, c.lo, c.hi, first, last, c.first, c.last)
+		}
+	}
+
+	if first, last := ps.ownedOverlapBounds("500", "100"); first != 0 || last != 0 {
+		t.Errorf("reversed range = [%d,%d), want empty", first, last)
+	}
+}
+
 // newTestServer 造一个够用的 KVServer：分区写入器只用到几个尺寸配置，
 // 不碰 Raft、不碰 RocksDB 实例。
 func newTestServer(targetBytes int64) *KVServer {
