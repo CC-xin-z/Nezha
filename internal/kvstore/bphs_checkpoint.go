@@ -115,8 +115,9 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 }
 
 func (kvs *KVServer) drainBPHSDurable(maxLagEntries int) (int, error) {
-	kvs.stateMu.Lock()
-	defer kvs.stateMu.Unlock()
+	// applyUnderLock owns kvs.mu before applyBatch takes stateMu.RLock.
+	// Taking stateMu first here would invert that order and deadlock as soon as
+	// this maintenance pass races a live apply batch.
 	kvs.mu.Lock()
 	defer kvs.mu.Unlock()
 
@@ -138,12 +139,11 @@ func (kvs *KVServer) drainBPHSDurable(maxLagEntries int) (int, error) {
 }
 
 func (kvs *KVServer) checkpointBPHSLog(expected int) (bool, string, string, error) {
-	// Match captureState/installSnapshot lock order: readers are excluded first,
-	// then apply/snapshot state, then the GC state fields.
+	// Excluding readers prevents the old log file from being unlinked under an
+	// in-flight lookup. Do not take stateMu here: applyBatch owns kvs.mu and
+	// then takes stateMu.RLock, so stateMu -> kvs.mu would deadlock.
 	kvs.storeRetireMu.Lock()
 	defer kvs.storeRetireMu.Unlock()
-	kvs.stateMu.Lock()
-	defer kvs.stateMu.Unlock()
 	kvs.mu.Lock()
 	defer kvs.mu.Unlock()
 
