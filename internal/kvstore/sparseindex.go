@@ -148,11 +148,21 @@ func (sfi *SortedFileIndex) boundedScanRange(startKey, endKey string) (int64, in
 // scanBlock 在 [start, end) 内顺序查找 key。
 // 找到返回其 entry；块内 key 已超过目标说明不存在，返回 raft.ErrNoKey。
 func (kvs *KVServer) scanBlock(index *SortedFileIndex, key string, start, end int64) (*raft.Entry, error) {
-	file, err := os.Open(index.FilePath)
-	if err != nil {
-		return nil, err
+	var file *os.File
+	var err error
+	if index.pool != nil {
+		file, err = index.pool.Get()
+		if err != nil {
+			return nil, err
+		}
+		defer index.pool.Put(file)
+	} else {
+		file, err = os.Open(index.FilePath)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
 	}
-	defer file.Close()
 
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
 		return nil, err
@@ -203,10 +213,11 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 		return kvs.scanBlock(index, key, start, end)
 	}
 
-	block, err := readBlock(index.FilePath, start, blockLen)
+	block, release, err := readBlock(index, start, blockLen)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	hash, cached := index.cachedBlockHash(start)
 	if !cached {
@@ -220,22 +231,58 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 	return lookupBlockHash(block, hash, key)
 }
 
-func readBlock(path string, start, blockLen int64) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+var sortedFileBlockPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, defaultIndexBlockBytes)
+		return &buf
+	},
+}
 
-	block := make([]byte, int(blockLen))
+func readBlock(index *SortedFileIndex, start, blockLen int64) ([]byte, func(), error) {
+	var file *os.File
+	var err error
+	if index.pool != nil {
+		file, err = index.pool.Get()
+	} else {
+		file, err = os.Open(index.FilePath)
+	}
+	if err != nil {
+		return nil, func() {}, err
+	}
+	releaseFile := func() {
+		if index.pool != nil {
+			index.pool.Put(file)
+		} else {
+			file.Close()
+		}
+	}
+
+	bufp := sortedFileBlockPool.Get().(*[]byte)
+	block := *bufp
+	if cap(block) < int(blockLen) {
+		block = make([]byte, int(blockLen))
+	} else {
+		block = block[:int(blockLen)]
+	}
 	n, err := file.ReadAt(block, start)
 	if err != nil && err != io.EOF {
-		return nil, err
+		releaseFile()
+		*bufp = block[:0]
+		sortedFileBlockPool.Put(bufp)
+		return nil, func() {}, err
 	}
 	if n != len(block) {
-		return nil, io.ErrUnexpectedEOF
+		releaseFile()
+		*bufp = block[:0]
+		sortedFileBlockPool.Put(bufp)
+		return nil, func() {}, io.ErrUnexpectedEOF
 	}
-	return block, nil
+	release := func() {
+		releaseFile()
+		*bufp = block[:0]
+		sortedFileBlockPool.Put(bufp)
+	}
+	return block, release, nil
 }
 
 func (sfi *SortedFileIndex) cachedBlockHash(start int64) (*blockHashIndex, bool) {

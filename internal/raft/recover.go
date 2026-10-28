@@ -137,16 +137,41 @@ func (rf *Raft) RecoverLog(files []LogFile, lastApplied int) (lastIndex int, err
 		rf.lastApplied = rf.lastIncludedIndex
 		rf.commitIndex = rf.lastIncludedIndex
 		rf.shotOffset = rf.lastIncludedIndex
+		rf.lastWrittenIndex = rf.lastIncludedIndex
+		rf.lastWrittenTerm = rf.lastIncludedTerm
+		rf.pendingBaseIndex = rf.lastIncludedIndex
+		rf.pendingBaseTerm = rf.lastIncludedTerm
 		// 盘上的东西都是已落盘的，已落盘前沿就是 base（见 durableIndex）
 		rf.persistedIndex.Store(int64(rf.lastIncludedIndex))
 		util.DPrintf("RaftNode[%d] recovery complete: log empty, everything compacted at base %d, term=%d votedFor=%d",
 			rf.me, rf.lastIncludedIndex, rf.currentTerm, rf.votedFor)
 		return rf.lastIncludedIndex, nil
 	}
+	lastIndex = expected - 1
+	// A BPHS log checkpoint advances the persisted base to the end of the old
+	// file before kv_state.json is rewritten. If the process dies in that narrow
+	// window, the old file still exists and is fully covered by the checkpoint
+	// state; discard it instead of treating the older file base as corruption.
+	if rf.stateLoaded && rf.lastIncludedIndex != base &&
+		lastApplied == rf.lastIncludedIndex && lastIndex == rf.lastIncludedIndex {
+		rf.setLog(nil)
+		rf.Offsets = nil
+		rf.offsetVersions = nil
+		rf.lastApplied = rf.lastIncludedIndex
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.shotOffset = rf.lastIncludedIndex
+		rf.lastWrittenIndex = rf.lastIncludedIndex
+		rf.lastWrittenTerm = rf.lastIncludedTerm
+		rf.pendingBaseIndex = rf.lastIncludedIndex
+		rf.pendingBaseTerm = rf.lastIncludedTerm
+		rf.persistedIndex.Store(int64(rf.lastIncludedIndex))
+		util.DPrintf("RaftNode[%d] recovery: retired log ends at checkpoint base %d",
+			rf.me, rf.lastIncludedIndex)
+		return rf.lastIncludedIndex, nil
+	}
 	if rf.stateLoaded && rf.lastIncludedIndex != base {
 		return 0, fmt.Errorf("log base mismatch: state file says %d, first log record implies %d", rf.lastIncludedIndex, base)
 	}
-	lastIndex = expected - 1
 	if lastApplied < base || lastApplied > lastIndex {
 		return 0, fmt.Errorf("applied index %d outside recovered log range (%d, %d]", lastApplied, base, lastIndex)
 	}
@@ -158,6 +183,10 @@ func (rf *Raft) RecoverLog(files []LogFile, lastApplied int) (lastIndex int, err
 	rf.lastApplied = lastApplied
 	rf.commitIndex = lastApplied
 	rf.shotOffset = lastApplied // invariant: Offsets[0] belongs to index lastApplied+1
+	rf.lastWrittenIndex = lastIndex
+	rf.lastWrittenTerm = entries[len(entries)-1].GetTerm()
+	rf.pendingBaseIndex = rf.lastIncludedIndex
+	rf.pendingBaseTerm = rf.lastIncludedTerm
 	// 回放出来的每一条都在盘上，所以已落盘前沿就是日志末尾。不摆正的话它停在 0，
 	// commit 判据会把 leader 自己的一票算成 0，写入永远提交不了。
 	rf.persistedIndex.Store(int64(lastIndex))

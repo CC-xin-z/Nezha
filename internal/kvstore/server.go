@@ -199,6 +199,7 @@ type KVServer struct {
 	bphsSyncConcurrency           int
 	bphsRecordSyncConcurrency     int
 	bphsRaftLogWAL                bool
+	bphsLogCheckpointBytes        int64
 	bphsWALBytes                  int64
 	bphsPartitionGCThresholdBytes int64
 
@@ -206,10 +207,11 @@ type KVServer struct {
 	// layer before this restarted Raft-WAL node starts accepting clients.
 	// raft.lastApplied advances when entries are handed to applyCh, not when the
 	// KV state machine has installed them, so it cannot be used as the read gate.
-	recoveryTarget int
-	recoveryDone   chan struct{}
-	recoveryOnce   sync.Once
-	bphsDir        string
+	recoveryTarget     int
+	recoveryDone       chan struct{}
+	recoveryOnce       sync.Once
+	lastClientActivity atomic.Int64
+	bphsDir            string
 }
 
 func (kv *KVServer) Kill() {
@@ -347,6 +349,7 @@ func New(cfg Config) (*KVServer, error) {
 		bphsSyncConcurrency:           cfg.BPHSSyncConcurrency,
 		bphsRecordSyncConcurrency:     cfg.BPHSRecordSyncConcurrency,
 		bphsRaftLogWAL:                cfg.BPHSRaftLogWAL,
+		bphsLogCheckpointBytes:        int64(cfg.BPHSLogCheckpointMB) << 20,
 		bphsWALBytes:                  int64(cfg.BPHSWALMB) << 20,
 		bphsPartitionGCThresholdBytes: int64(cfg.BPHSPartitionGCThresholdMB) << 20,
 	}
@@ -390,12 +393,12 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
 		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.BPHS,
 		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsRecordSyncConcurrency,
-		kvs.bphsRaftLogWAL, kvs.bphsWALBytes>>20,
+		kvs.bphsRaftLogWAL, kvs.bphsLogCheckpointBytes>>20, kvs.bphsWALBytes>>20,
 		kvs.bphsPartitionGCThresholdBytes>>20,
 		kvs.partitionTargetBytes>>20)
 
@@ -511,6 +514,7 @@ func (kvs *KVServer) Run(ctx context.Context) {
 		fmt.Printf("[RECOVER] BPHS Raft-WAL: replay complete through index %d, durable=%d\n",
 			kvs.recoveryTarget, kvs.bphs.DurableIndex())
 	}
+	go kvs.bphsLogCheckpointLoop(ctx)
 	go kvs.gcLoop(ctx)
 	go kvs.RegisterKVServer(ctx, kvs.address)
 	if resumeGC {

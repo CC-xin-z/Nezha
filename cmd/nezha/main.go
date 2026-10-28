@@ -74,6 +74,7 @@ func main() {
 	flag.IntVar(&cfg.BPHSSyncConcurrency, "bphsSyncConcurrency", 8, "maximum number of dirty BPHS partitions fsynced in parallel after one apply batch")
 	flag.IntVar(&cfg.BPHSRecordSyncConcurrency, "bphsRecordSyncConcurrency", 8, "maximum number of BPHS partition record logs synced by the background worker")
 	flag.BoolVar(&cfg.BPHSRaftLogWAL, "bphsRaftLogWAL", false, "use the durable Raft log as BPHS's WAL and materialize partitions asynchronously")
+	flag.IntVar(&cfg.BPHSLogCheckpointMB, "bphsLogCheckpointMB", 512, "retire a fully durable Raft log file after it reaches this size in MB (0 disables BPHS Raft-WAL checkpoints)")
 	flag.IntVar(&cfg.BPHSWALMB, "bphsWALMB", 256, "size in MB at which the node-wide BPHS WAL is checkpointed and reset")
 	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
@@ -152,6 +153,9 @@ func main() {
 	}
 	if cfg.BPHS && cfg.BPHSWALMB <= 0 {
 		log.Fatalf("nezha: -bphsWALMB=%d 必须是正整数", cfg.BPHSWALMB)
+	}
+	if cfg.BPHSLogCheckpointMB < 0 {
+		log.Fatalf("nezha: -bphsLogCheckpointMB=%d 不能为负", cfg.BPHSLogCheckpointMB)
 	}
 
 	// 先把 fd 软上限抬到硬上限，再建节点。必须在 New 之前：New 会装载分区组，

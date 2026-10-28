@@ -101,6 +101,7 @@ func (kvs *KVServer) noteRecoveryApplied(applied int) {
 }
 
 func (kvs *KVServer) ScanRangeInRaft(ctx context.Context, in *kvrpc.ScanRangeRequest) (*kvrpc.ScanRangeResponse, error) {
+	kvs.noteClientActivity()
 	// 一次读要同时用到 persister、当前日志和分区组三样，而装快照会把三样一起换掉。
 	// **这里不再整段持 stateMu 的读锁**：那样会让装快照排在一次长扫描后面，而
 	// applyCommand 也按读锁持有 stateMu，于是 apply 跟着停一次扫描的时长
@@ -295,6 +296,7 @@ func (kvs *KVServer) StartGet(st stateSnapshot, args *kvrpc.GetInRaftRequest) *k
 }
 
 func (kvs *KVServer) GetInRaft(ctx context.Context, in *kvrpc.GetInRaftRequest) (*kvrpc.GetInRaftResponse, error) {
+	kvs.noteClientActivity()
 	// 同 ScanRangeInRaft：一致性靠 captureState 那一小段，生命周期靠 storeRetireMu。
 	// 点查很短，但"短"不等于"原子"——一次点查仍然可能在回收旧库时正在进行。
 	//
@@ -321,6 +323,7 @@ func (kvs *KVServer) GetInRaft(ctx context.Context, in *kvrpc.GetInRaftRequest) 
 }
 
 func (kvs *KVServer) PutInRaft(ctx context.Context, in *kvrpc.PutInRaftRequest) (*kvrpc.PutInRaftResponse, error) {
+	kvs.noteClientActivity()
 	// 校验放在进入 Raft 之前：一个存不下的 key 不该先被复制到多数派、再在 apply 时
 	// 出问题。存储层原样存 key，唯一的限制是 NUL 开头留给元数据（raft.ValidateKey）。
 	// 此前这里没有校验，而存储层会**静默改写**不合规的 key——超长的截断、带前导零的

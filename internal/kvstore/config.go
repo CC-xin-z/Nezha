@@ -143,6 +143,10 @@ type Config struct {
 	// BPHSRaftLogWAL uses the already-fsynced Raft log as BPHS's write-ahead log.
 	// Partition data is materialized asynchronously up to a durable frontier.
 	BPHSRaftLogWAL bool
+	// BPHSLogCheckpointMB bounds the active Raft log file in BPHS Raft-WAL mode.
+	// Once the log exceeds the threshold and the node is idle and fully durable,
+	// it is replaced by an empty checkpoint log whose base is the applied index.
+	BPHSLogCheckpointMB int
 	// BPHSWALMB bounds the node-wide BPHS WAL. Once it grows past this size,
 	// dirty partition records are synchronously made durable and the WAL resets.
 	BPHSWALMB int

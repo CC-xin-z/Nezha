@@ -83,6 +83,7 @@ type bphsStore struct {
 	mu                        sync.RWMutex
 	kvs                       *KVServer
 	base                      *PartitionSet
+	basePtr                   atomic.Pointer[PartitionSet]
 	parts                     []*bphsPartition
 	dir                       string
 	memtableBytes             int64
@@ -113,6 +114,7 @@ type bphsStore struct {
 	closeOnce   sync.Once
 	errMu       sync.Mutex
 	compactErr  error
+	compactFail atomic.Bool
 }
 
 func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes, inlineCacheBytes int64, maxVersion uint32) (*bphsStore, error) {
@@ -167,6 +169,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		compactCh:                 make(chan int, base.Len()),
 		compactStop:               make(chan struct{}),
 	}
+	s.basePtr.Store(base)
 	durableState, hasDurable, err := readBPHSDurableState(dir)
 	if err != nil {
 		wal.Close()
@@ -431,6 +434,7 @@ func (s *bphsStore) compactLoop() {
 				s.errMu.Lock()
 				if s.compactErr == nil {
 					s.compactErr = err
+					s.compactFail.Store(true)
 				}
 				s.errMu.Unlock()
 				fmt.Printf("BPHS background compaction partition %d failed: %v\n", idx, err)
@@ -461,6 +465,9 @@ func (s *bphsStore) scheduleCompactionLocked(part *bphsPartition) {
 
 func (s *bphsStore) compactionError() error {
 	if s == nil {
+		return nil
+	}
+	if !s.compactFail.Load() {
 		return nil
 	}
 	s.errMu.Lock()
@@ -501,6 +508,7 @@ func (s *bphsStore) SetBase(base *PartitionSet) error {
 		}
 	}
 	s.base = base
+	s.basePtr.Store(base)
 	for i, part := range s.parts {
 		part.base = base.parts[i]
 	}
@@ -511,9 +519,7 @@ func (s *bphsStore) route(paddedKey string) (*bphsPartition, error) {
 	if s == nil {
 		return nil, fmt.Errorf("BPHS store is nil")
 	}
-	s.mu.RLock()
-	base := s.base
-	s.mu.RUnlock()
+	base := s.basePtr.Load()
 	_, idx, ok := base.findOwned(paddedKey)
 	if !ok || idx < 0 || idx >= len(s.parts) {
 		return nil, fmt.Errorf("no BPHS partition owns key %q", paddedKey)
@@ -1176,9 +1182,7 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		return nil, fmt.Errorf("background partition compaction: %w", err)
 	}
 
-	s.mu.RLock()
-	base := s.base
-	s.mu.RUnlock()
+	base := s.basePtr.Load()
 
 	result := make(map[string]string)
 	for i, basePart := range base.parts {
