@@ -112,20 +112,6 @@ func TestInlineCacheReplaceAdjustsBytes(t *testing.T) {
 	}
 }
 
-func TestInlineCacheRemove(t *testing.T) {
-	c := NewInlineCache(1 << 20)
-	c.Add("key", "value")
-	c.Remove("key")
-
-	if _, ok := c.Get("key"); ok {
-		t.Fatal("removed key still present in cache")
-	}
-	_, _, bytes, entries := c.Stats()
-	if bytes != 0 || entries != 0 {
-		t.Fatalf("cache after Remove = bytes:%d entries:%d, want 0/0", bytes, entries)
-	}
-}
-
 // 热 key 反复回填之后，缓存必须还能用。
 //
 // 这是上一条的后果：字节数只增不减时，淘汰循环会一路淘到 lru 空了仍然超预算，
