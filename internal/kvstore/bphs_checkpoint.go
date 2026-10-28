@@ -36,6 +36,7 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 	ticker := time.NewTicker(bphsCheckpointPoll)
 	defer ticker.Stop()
 	var idleSince time.Time
+	var nextStatus time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -60,14 +61,24 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 				idleSince = time.Time{}
 				continue
 			}
-			lastActivity := time.Unix(0, kvs.lastClientActivity.Load())
-			if now.Sub(lastActivity) < bphsCheckpointIdle {
-				idleSince = time.Time{}
-				continue
+			if kvs.raft.IsLeader() {
+				lastActivity := time.Unix(0, kvs.lastClientActivity.Load())
+				if now.Sub(lastActivity) < bphsCheckpointIdle {
+					idleSince = time.Time{}
+					continue
+				}
 			}
 			index, _, ok := kvs.raft.CheckpointCandidate()
 			if !ok {
 				idleSince = time.Time{}
+				if now.After(nextStatus) {
+					st := kvs.raft.CheckpointStatus()
+					fmt.Printf("[BPHS-CHECKPOINT-WAIT] log=%dMB last=%d applied=%d commit=%d written=%d offsets=%d batch=%d snapshot=%v in_flight=%v\n",
+						logSize>>20, st.LastIndex, st.LastApplied, st.CommitIndex,
+						st.LastWrittenIndex, st.PendingOffsets, st.PendingBatch,
+						st.SnapshotInFlight, st.BatchInFlight)
+					nextStatus = now.Add(30 * time.Second)
+				}
 				continue
 			}
 			kvs.mu.Lock()

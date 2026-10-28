@@ -6,6 +6,19 @@ import (
 	"path/filepath"
 )
 
+// CheckpointStatus describes why a fully materialized log checkpoint is or is
+// not currently possible.
+type CheckpointStatus struct {
+	LastIndex        int
+	LastApplied      int
+	CommitIndex      int
+	LastWrittenIndex int
+	PendingOffsets   int
+	PendingBatch     int
+	SnapshotInFlight bool
+	BatchInFlight    bool
+}
+
 // CurrentLogDiskSize returns the size of the active on-disk Raft log.
 func (rf *Raft) CurrentLogDiskSize() int64 {
 	rf.logMu.Lock()
@@ -26,30 +39,48 @@ func (rf *Raft) CurrentLogDiskSize() int64 {
 // disk batch, apply offset, snapshot, or committed-but-undelivered entry makes
 // the candidate unavailable.
 func (rf *Raft) CheckpointCandidate() (index int, term int32, ok bool) {
+	st := rf.CheckpointStatus()
+	if !st.Ready() {
+		return 0, 0, false
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	if rf.killed() || rf.snapshotsInFlightLocked() {
-		return 0, 0, false
-	}
-	last := rf.lastIndex()
-	if last == 0 || rf.lastApplied != last || rf.commitIndex != last || rf.lastWrittenIndex != last {
-		return 0, 0, false
-	}
-	if len(rf.Offsets) != 0 || len(rf.offsetVersions) != 0 || len(rf.batchLog) != 0 {
-		return 0, 0, false
-	}
-	rf.batchMu.Lock()
-	batchPending := rf.curBatch != nil && len(rf.curBatch.entries) != 0
-	rf.batchMu.Unlock()
-	if batchPending {
-		return 0, 0, false
-	}
-	term = rf.termAt(last)
+	term = rf.termAt(st.LastIndex)
 	if term < 0 {
 		return 0, 0, false
 	}
-	return last, term, true
+	return st.LastIndex, term, true
+}
+
+// CheckpointStatus snapshots the conditions that guard empty-log rotation.
+func (rf *Raft) CheckpointStatus() CheckpointStatus {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	st := CheckpointStatus{
+		LastIndex:        rf.lastIndex(),
+		LastApplied:      rf.lastApplied,
+		CommitIndex:      rf.commitIndex,
+		LastWrittenIndex: rf.lastWrittenIndex,
+		PendingOffsets:   len(rf.Offsets),
+		PendingBatch:     len(rf.batchLog),
+		SnapshotInFlight: rf.snapshotsInFlightLocked(),
+	}
+	rf.batchMu.Lock()
+	st.BatchInFlight = rf.curBatch != nil && len(rf.curBatch.entries) != 0
+	rf.batchMu.Unlock()
+	return st
+}
+
+func (st CheckpointStatus) Ready() bool {
+	return st.LastIndex > 0 &&
+		st.LastApplied == st.LastIndex &&
+		st.CommitIndex == st.LastIndex &&
+		st.LastWrittenIndex == st.LastIndex &&
+		st.PendingOffsets == 0 &&
+		st.PendingBatch == 0 &&
+		!st.SnapshotInFlight &&
+		!st.BatchInFlight
 }
 
 // RotateEmptyLogIfIdle replaces a fully materialized Raft log with a new empty
