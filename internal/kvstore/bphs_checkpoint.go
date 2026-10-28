@@ -23,7 +23,9 @@ func (kvs *KVServer) noteClientActivity() {
 
 // bphsLogCheckpointLoop retires an obsolete Raft log file after BPHS has made
 // every applied entry durable. It waits for a quiet period so log rewriting and
-// Go heap scavenging do not overlap a latency-sensitive read phase.
+// Go heap scavenging do not overlap a latency-sensitive read phase. The Raft
+// log remains the WAL while writes are active; materialization happens only
+// after the Raft log is idle, immediately before the old file is retired.
 func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 	if kvs == nil || !kvs.bphsRaftLogWAL || kvs.bphsLogCheckpointBytes <= 0 {
 		return
@@ -44,20 +46,6 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 		case now := <-ticker.C:
 			logSize := kvs.raft.CurrentLogDiskSize()
 			if logSize < threshold {
-				idleSince = time.Time{}
-				continue
-			}
-			maxLagEntries := int(threshold / 512)
-			if maxLagEntries < 100_000 {
-				maxLagEntries = 100_000
-			}
-			if drained, err := kvs.drainBPHSDurable(maxLagEntries); err != nil {
-				fmt.Printf("[BPHS-DURABLE] failed to drain durable watermark: %v\n", err)
-				idleSince = time.Time{}
-				continue
-			} else if drained > 0 {
-				fmt.Printf("[BPHS-DURABLE] materialized through index %d; active Raft log=%dMB\n",
-					drained, logSize>>20)
 				idleSince = time.Time{}
 				continue
 			}
@@ -112,30 +100,6 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 			idleSince = time.Time{}
 		}
 	}
-}
-
-func (kvs *KVServer) drainBPHSDurable(maxLagEntries int) (int, error) {
-	// applyUnderLock owns kvs.mu before applyBatch takes stateMu.RLock.
-	// Taking stateMu first here would invert that order and deadlock as soon as
-	// this maintenance pass races a live apply batch.
-	kvs.mu.Lock()
-	defer kvs.mu.Unlock()
-
-	if kvs.bphs == nil || !kvs.bphsRaftLogWAL || kvs.installing || kvs.gcActive || kvs.gcInProgress {
-		return 0, nil
-	}
-	applied := kvs.lastAppliedIndex
-	durable := int(kvs.bphs.DurableIndex())
-	if applied <= durable || applied-durable < maxLagEntries {
-		return 0, nil
-	}
-	if err := kvs.bphs.MaterializeAll(); err != nil {
-		return 0, err
-	}
-	if err := kvs.bphs.MarkAllDurable(uint32(applied)); err != nil {
-		return 0, err
-	}
-	return applied, nil
 }
 
 func (kvs *KVServer) checkpointBPHSLog(expected int) (bool, string, string, error) {

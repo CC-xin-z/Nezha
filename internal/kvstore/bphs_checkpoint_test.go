@@ -8,13 +8,13 @@ import (
 // Regression test for the lock inversion that stalled live writes:
 // applyUnderLock acquires kvs.mu and then stateMu.RLock. Maintenance must not
 // hold stateMu first while waiting for kvs.mu.
-func TestBPHSDurableDrainDoesNotInvertApplyLockOrder(t *testing.T) {
+func TestBPHSCheckpointDoesNotInvertApplyLockOrder(t *testing.T) {
 	kvs := &KVServer{}
 	kvs.mu.Lock()
 
 	maintenanceDone := make(chan struct{})
 	go func() {
-		_, _ = kvs.drainBPHSDurable(1)
+		_, _, _, _ = kvs.checkpointBPHSLog(1)
 		close(maintenanceDone)
 	}()
 
