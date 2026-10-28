@@ -456,6 +456,10 @@ type SortedFileIndex struct {
 
 	// Entries 是本分区里的记录条数，纯观测量，随清单持久化。
 	Entries int
+
+	// bphsFilter accelerates BPHS L0 probes. It is advisory only: false means
+	// the key is definitely absent, true still requires a normal file lookup.
+	bphsFilter *bphsKeyFilter
 }
 
 func (sfi *SortedFileIndex) closePool() {

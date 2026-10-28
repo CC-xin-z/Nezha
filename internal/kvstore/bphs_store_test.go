@@ -728,6 +728,67 @@ func TestBPHSLegacyTailVersionFallback(t *testing.T) {
 	}
 }
 
+func TestBPHSKeyFilterHasNoFalseNegatives(t *testing.T) {
+	records := []bphsRecord{
+		{Key: "0000000001"},
+		{Key: "0000000002"},
+		{Key: "0000000100"},
+	}
+	filter := newBPHSKeyFilterFromRecords(records)
+	for _, rec := range records {
+		if !filter.MayContain(rec.Key) {
+			t.Fatalf("filter returned a false negative for %q", rec.Key)
+		}
+	}
+	if filter.MayContain("9999999999") {
+		// False positives are legal; this assertion is intentionally omitted.
+		t.Log("unexpected false positive, still correct")
+	}
+}
+
+func TestBPHSKeyFilterSurvivesL0Reload(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base")
+	defer base.Close()
+
+	dir := filepath.Join(t.TempDir(), "bphs")
+	store, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("0000000001", "inline", 2); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	part := store.parts[0]
+	part.mu.Lock()
+	if err := store.flushPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		store.Close()
+		t.Fatal(err)
+	}
+	part.mu.Unlock()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if len(reopened.parts[0].l0) != 1 || reopened.parts[0].l0[0].bphsFilter == nil {
+		t.Fatal("reloaded BPHS L0 is missing its key filter")
+	}
+	if !reopened.parts[0].l0[0].bphsFilter.MayContain("0000000001") {
+		t.Fatal("reloaded BPHS L0 filter has a false negative")
+	}
+}
+
 func TestBPHSVLogSizeTriggersCompactionBeforeMemtableFull(t *testing.T) {
 	kvs := &KVServer{
 		persister:                     &raft.Persister{},

@@ -304,5 +304,6 @@ func (kvs *KVServer) flushPartitionMemtable(mt *partitionMemtable, path string, 
 		Hi:           hi,
 		pool:         pool,
 		Entries:      len(records),
+		bphsFilter:   newBPHSKeyFilterFromRecords(records),
 	}, nil
 }

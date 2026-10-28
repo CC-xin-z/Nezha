@@ -36,6 +36,8 @@ var bphsWriteStats struct {
 	l0MergeNs           atomic.Uint64
 	baseCompactions     atomic.Uint64
 	baseCompactionNs    atomic.Uint64
+	bloomProbes         atomic.Uint64
+	bloomSkips          atomic.Uint64
 }
 
 func recordBPHSPut(valueBytes int, lockWait time.Duration) {
@@ -111,6 +113,13 @@ func recordBPHSBaseCompaction(elapsed time.Duration) {
 	bphsWriteStats.baseCompactionNs.Add(uint64(elapsed))
 }
 
+func recordBPHSBloomProbe(skipped bool) {
+	bphsWriteStats.bloomProbes.Add(1)
+	if skipped {
+		bphsWriteStats.bloomSkips.Add(1)
+	}
+}
+
 func bphsWriteStatsLine() string {
 	puts := bphsWriteStats.puts.Load()
 	if puts == 0 {
@@ -132,6 +141,12 @@ func bphsWriteStatsLine() string {
 		}
 		return float64(total) / float64(count)
 	}
+	bloomProbes := bphsWriteStats.bloomProbes.Load()
+	bloomSkips := bphsWriteStats.bloomSkips.Load()
+	bloomSkipRate := 0.0
+	if bloomProbes > 0 {
+		bloomSkipRate = float64(bloomSkips) / float64(bloomProbes) * 100
+	}
 	return fmt.Sprintf(
 		"[BPHS-WRITE] puts=%d puts_per_sync_batch=%.1f dirty_per_batch=%.2f sync_rounds_per_batch=%.2f "+
 			"put_lock_wait=%.4fms partition_lock_wait=%.4fms sync_total=%.4fms/batch "+
@@ -139,7 +154,8 @@ func bphsWriteStatsLine() string {
 			"record_sync_calls=%d record_sync=%.4fms/call vlog_sync_calls=%d vlog_sync=%.4fms/call "+
 			"wal_sync_calls=%d wal_sync=%.4fms/call wal_mib=%.2f wal_resets=%d "+
 			"mem_flushes=%d flush=%.4fms/call flush_mib=%.2f "+
-			"l0_merges=%d l0_merge=%.4fms/call base_compactions=%d base_compact=%.4fms/call avg_value=%.1fB",
+			"l0_merges=%d l0_merge=%.4fms/call base_compactions=%d base_compact=%.4fms/call "+
+			"bloom_probes=%d bloom_skips=%d bloom_skip_rate=%.2f%% avg_value=%.1fB",
 		puts,
 		avgValue(puts, batches),
 		avgValue(bphsWriteStats.dirtyPartitions.Load(), batches),
@@ -165,6 +181,9 @@ func bphsWriteStatsLine() string {
 		avgMs(bphsWriteStats.l0MergeNs.Load(), bphsWriteStats.l0Merges.Load()),
 		bphsWriteStats.baseCompactions.Load(),
 		avgMs(bphsWriteStats.baseCompactionNs.Load(), bphsWriteStats.baseCompactions.Load()),
+		bloomProbes,
+		bloomSkips,
+		bloomSkipRate,
 		avgValue(bphsWriteStats.putBytes.Load(), puts),
 	)
 }

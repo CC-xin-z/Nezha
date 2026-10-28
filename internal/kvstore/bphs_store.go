@@ -1013,6 +1013,7 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 		reader := bufio.NewReaderSize(file, 1<<20)
 		count := 0
 		var maxVersion uint32
+		keys := make([]string, 0, 4096)
 		for {
 			entry, _, err := ReadEntry(reader, 0)
 			if err == io.EOF {
@@ -1023,6 +1024,7 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 				return nil, err
 			}
 			count++
+			keys = append(keys, entry.Key)
 			if entry.Index > maxVersion {
 				maxVersion = entry.Index
 			}
@@ -1047,6 +1049,7 @@ func loadPartitionL0Files(kvs *KVServer, dir string, partition int, inlineCacheB
 				Hi:           hi,
 				pool:         pool,
 				Entries:      count,
+				bphsFilter:   newBPHSKeyFilter(keys),
 			},
 			maxVersion: maxVersion,
 		})
@@ -1127,6 +1130,11 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	// L0 按从新到旧查找；后台分区 Compaction 合入 base 前，这里必须继续
 	// 覆盖所有仍在文件中的版本。
 	for i := len(part.l0) - 1; i >= 0; i-- {
+		if part.l0[i].bphsFilter != nil && !part.l0[i].bphsFilter.MayContain(key) {
+			recordBPHSBloomProbe(true)
+			continue
+		}
+		recordBPHSBloomProbe(false)
 		entry, err := s.kvs.lookupInSortedFile(part.l0[i], key)
 		if err != nil {
 			if err == ErrKeyAbsent {
