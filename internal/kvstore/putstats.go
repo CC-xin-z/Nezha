@@ -180,8 +180,10 @@ func StartWriteStatsReporter(interval time.Duration) {
 				fmt.Println(raft.RaftWriteStatsLine())
 				fmt.Println(raft.GroupCommitStatsLine())
 			}
-			if line := bphsReadStatsLine(); line != "[BPHS-READ] 无数据" {
-				fmt.Println(line)
+			if bphsReadStatsEnabled {
+				if line := bphsReadStatsLine(); line != "[BPHS-READ] 无数据" {
+					fmt.Println(line)
+				}
 			}
 		}
 	}()

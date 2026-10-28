@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+// Read-path counters add visible contention at high GET concurrency. Keep the
+// instrumentation in the tree for diagnosis, but compile the hot-path calls out
+// of performance builds.
+const bphsReadStatsEnabled = false
+
 // bphsWriteStats separates BPHS's extra durability work from the common Raft
 // path. The key values are dirty partitions per apply batch and the resulting
 // number of partition fsync rounds.
@@ -137,6 +142,9 @@ const (
 )
 
 func recordBPHSRead(source bphsReadSource) {
+	if !bphsReadStatsEnabled {
+		return
+	}
 	switch source {
 	case bphsReadMem:
 		bphsWriteStats.memHits.Add(1)
@@ -150,6 +158,9 @@ func recordBPHSRead(source bphsReadSource) {
 }
 
 func recordBPHSScan(partitions, l0Runs int) {
+	if !bphsReadStatsEnabled {
+		return
+	}
 	bphsWriteStats.scanQueries.Add(1)
 	if partitions > 0 {
 		bphsWriteStats.scanPartitions.Add(uint64(partitions))
@@ -160,6 +171,9 @@ func recordBPHSScan(partitions, l0Runs int) {
 }
 
 func bphsReadStatsLine() string {
+	if !bphsReadStatsEnabled {
+		return "[BPHS-READ] 无数据"
+	}
 	memHits := bphsWriteStats.memHits.Load()
 	l0Hits := bphsWriteStats.l0Hits.Load()
 	baseHits := bphsWriteStats.baseHits.Load()
