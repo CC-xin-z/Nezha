@@ -14,7 +14,7 @@ const (
 	bphsCheckpointIdle   = 30 * time.Second
 	bphsCheckpointMinLog = 256 << 20
 	bphsIdleCompactPoll  = 5 * time.Second
-	bphsIdleCompactQuiet = 10 * time.Second
+	bphsIdleCompactQuiet = 60 * time.Second
 )
 
 func (kvs *KVServer) noteClientActivity() {

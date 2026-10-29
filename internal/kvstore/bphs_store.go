@@ -21,10 +21,10 @@ import (
 
 const (
 	bphsL0CompactionTrigger = 4
-	// One completed L0 merge is enough to keep the read path at base + at most
-	// one run. Waiting for eight rounds leaves several overlapping L0 runs that
-	// every GET and SCAN must probe even after the write phase has ended.
-	bphsBaseCompactionL0Rounds          = 1
+	// Avoid rewriting a growing base after every L0 merge. Keep several
+	// immutable runs during writes and collapse them in a dedicated read-ready
+	// pass once the workload becomes quiescent.
+	bphsBaseCompactionL0Rounds          = 8
 	bphsDefaultPartitionSyncConcurrency = 8
 	bphsDefaultRecordSyncConcurrency    = 8
 )
