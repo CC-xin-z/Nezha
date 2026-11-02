@@ -422,17 +422,14 @@ func (s *bphsStore) compactLoop() {
 			return
 		case idx := <-s.compactCh:
 			part := s.parts[idx]
-			part.mu.Lock()
-			var err error
 			t0 := time.Now()
-			if part.compacting {
-				err = s.compactPartitionLocked(part)
-				recordBPHSBaseCompaction(time.Since(t0))
-				fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
-					idx, time.Since(t0), part.gen, err)
-				part.compacting = false
-			}
-			part.mu.Unlock()
+			err := s.runPartitionCompaction(part)
+			part.mu.RLock()
+			generation := part.gen
+			part.mu.RUnlock()
+			recordBPHSBaseCompaction(time.Since(t0))
+			fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
+				idx, time.Since(t0), generation, err)
 			if err != nil {
 				s.errMu.Lock()
 				if s.compactErr == nil {
@@ -445,6 +442,34 @@ func (s *bphsStore) compactLoop() {
 			s.compactJobs.Done()
 		}
 	}
+}
+
+// runPartitionCompaction clears part.compacting on every exit path. Inline
+// partitions use a snapshot built outside part.mu; VLog partitions retain the
+// locked path because compaction currently resets the VLog generation.
+func (s *bphsStore) runPartitionCompaction(part *bphsPartition) error {
+	part.mu.Lock()
+	if !part.compacting {
+		part.mu.Unlock()
+		return nil
+	}
+	useLockedPath := part.vlog.Size() > 0
+	part.mu.Unlock()
+
+	if useLockedPath {
+		part.mu.Lock()
+		var err error
+		if part.compacting {
+			err = s.compactPartitionLocked(part)
+		}
+		part.compacting = false
+		if err == nil && s.shouldCompactPartitionLocked(part) {
+			s.scheduleCompactionLocked(part)
+		}
+		part.mu.Unlock()
+		return err
+	}
+	return s.compactPartitionSnapshot(part)
 }
 
 func (s *bphsStore) scheduleCompactionLocked(part *bphsPartition) {
@@ -489,8 +514,8 @@ func (s *bphsStore) WaitForCompactions() error {
 }
 
 // CompactForRead collapses the current local MemTable and L0 runs into the
-// partition base after writes have gone idle. It is called outside kvs.mu;
-// partition locks preserve the normal apply/read ordering.
+// partition base after writes have gone idle. Inline partitions build the new
+// base from a snapshot without holding part.mu for the file rewrite.
 func (s *bphsStore) CompactForRead() (int, error) {
 	if s == nil {
 		return 0, nil
@@ -512,6 +537,15 @@ func (s *bphsStore) CompactForRead() (int, error) {
 		// that worker finish instead of compacting the same partition twice.
 		if part.compacting || (len(part.l0) == 0 && part.mem.Len() == 0) {
 			part.mu.Unlock()
+			continue
+		}
+		if part.vlog.Size() == 0 {
+			part.compacting = true
+			part.mu.Unlock()
+			if err := s.compactPartitionSnapshot(part); err != nil {
+				return compacted, err
+			}
+			compacted++
 			continue
 		}
 		if err := s.compactPartitionLocked(part); err != nil {
@@ -681,7 +715,9 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 		return fmt.Errorf("reset partition %d record log after L0: %w", part.index, err)
 	}
 	part.recordsDirty = false
-	if len(part.l0) >= bphsL0CompactionTrigger {
+	// A snapshot compaction may still be reading the current L0 prefix.
+	// Appending a new run is safe; merging or deleting an old run is not.
+	if !part.compacting && len(part.l0) >= bphsL0CompactionTrigger {
 		mergeStart := time.Now()
 		if err := s.compactL0Locked(part); err != nil {
 			recordBPHSL0Merge(time.Since(mergeStart))
@@ -717,6 +753,212 @@ func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
 		}
 	}
 	return delta >= threshold
+}
+
+type bphsCompactionSnapshot struct {
+	base       *SortedFileIndex
+	l0         []*SortedFileIndex
+	mem        []bphsRecord
+	generation uint64
+}
+
+func (s *bphsStore) captureCompactionSnapshot(
+	part *bphsPartition,
+) (bphsCompactionSnapshot, bool) {
+	part.mu.Lock()
+	defer part.mu.Unlock()
+	if !part.compacting {
+		return bphsCompactionSnapshot{}, false
+	}
+	snapshot := bphsCompactionSnapshot{
+		base:       part.base,
+		l0:         append([]*SortedFileIndex(nil), part.l0...),
+		generation: part.gen,
+	}
+	if len(part.mem.records) > 0 {
+		snapshot.mem = append([]bphsRecord(nil), part.mem.Sorted()...)
+	}
+	return snapshot, true
+}
+
+func sameBHPSL0Prefix(current, prefix []*SortedFileIndex) bool {
+	if len(current) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if current[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func removeBPHSSortedFile(index *SortedFileIndex) {
+	if index == nil {
+		return
+	}
+	index.closePool()
+	os.Remove(index.FilePath)
+	os.Remove(sparseIndexPath(index.FilePath))
+}
+
+func (s *bphsStore) buildCompactionBase(
+	part *bphsPartition,
+	snapshot bphsCompactionSnapshot,
+) (*SortedFileIndex, bphsPartitionManifest, error) {
+	merged := make(map[string]bphsRecord)
+	putLatest := func(rec bphsRecord) {
+		old, ok := merged[rec.Key]
+		if !ok || rec.Version >= old.Version {
+			merged[rec.Key] = rec
+		}
+	}
+
+	if snapshot.base != nil {
+		records, err := readRawSortedFile(snapshot.base.FilePath)
+		if err != nil {
+			return nil, bphsPartitionManifest{}, err
+		}
+		for _, rec := range records {
+			putLatest(rec)
+		}
+	}
+	for _, run := range snapshot.l0 {
+		records, err := readBPHSSortedFile(run.FilePath)
+		if err != nil {
+			return nil, bphsPartitionManifest{}, err
+		}
+		for _, rec := range records {
+			if rec.Kind != bphsInlineRecord {
+				return nil, bphsPartitionManifest{}, fmt.Errorf(
+					"snapshot compaction partition %d contains non-inline L0 record",
+					part.index,
+				)
+			}
+			putLatest(rec)
+		}
+	}
+	for _, rec := range snapshot.mem {
+		if rec.Kind != bphsInlineRecord {
+			return nil, bphsPartitionManifest{}, fmt.Errorf(
+				"snapshot compaction partition %d contains non-inline MemTable record",
+				part.index,
+			)
+		}
+		putLatest(rec)
+	}
+
+	records := make([]bphsRecord, 0, len(merged))
+	var cutVersion uint32
+	for _, rec := range merged {
+		if rec.Version > cutVersion {
+			cutVersion = rec.Version
+		}
+		records = append(records, rec)
+	}
+	if len(records) == 0 {
+		return nil, bphsPartitionManifest{}, nil
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+
+	name := fmt.Sprintf("p%06d_base_%020d.sst", part.index, time.Now().UnixNano())
+	path := filepath.Join(s.dir, name)
+	newBase, err := s.kvs.flushBPHSBaseFile(records, path, 0)
+	if err != nil {
+		return nil, bphsPartitionManifest{}, err
+	}
+	if newBase == nil {
+		return nil, bphsPartitionManifest{}, nil
+	}
+	newBase.InlineValues = s.inline
+	meta := bphsPartitionManifest{
+		Generation: snapshot.generation,
+		BaseFile:   filepath.Base(path),
+		BaseSize:   newBase.FileSize,
+		MaxVersion: cutVersion,
+		Lo:         newBase.Lo,
+		Hi:         newBase.Hi,
+		Entries:    newBase.Entries,
+	}
+	return newBase, meta, nil
+}
+
+func (s *bphsStore) installCompactionSnapshot(
+	part *bphsPartition,
+	snapshot bphsCompactionSnapshot,
+	newBase *SortedFileIndex,
+	meta bphsPartitionManifest,
+) error {
+	part.mu.Lock()
+	defer part.mu.Unlock()
+
+	cleanupNewBase := func() {
+		removeBPHSSortedFile(newBase)
+	}
+	if !part.compacting ||
+		part.base != snapshot.base ||
+		part.gen != snapshot.generation ||
+		!sameBHPSL0Prefix(part.l0, snapshot.l0) {
+		cleanupNewBase()
+		return fmt.Errorf("BPHS partition %d compaction snapshot changed before install", part.index)
+	}
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		cleanupNewBase()
+		return err
+	}
+	if err := raft.WriteFileAtomic(bphsPartitionManifestPath(s.dir, part.index), data); err != nil {
+		cleanupNewBase()
+		return err
+	}
+
+	oldBase, oldLocal := part.base, part.baseLocal
+	oldL0 := append([]*SortedFileIndex(nil), snapshot.l0...)
+	part.base = newBase
+	part.baseLocal = true
+	part.l0 = append([]*SortedFileIndex(nil), part.l0[len(snapshot.l0):]...)
+	part.l0Merges = 0
+	part.mem.PruneThroughVersion(meta.MaxVersion)
+
+	if err := s.advancePartitionDurable(part, meta.MaxVersion); err != nil {
+		return err
+	}
+	for _, run := range oldL0 {
+		removeBPHSSortedFile(run)
+	}
+	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
+		removeBPHSSortedFile(oldBase)
+	}
+	return nil
+}
+
+// compactPartitionSnapshot materializes an immutable Base/L0/MemTable view
+// without holding part.mu during the expensive merge. New writes continue in
+// the MemTable or produce newer L0 runs; only the frozen prefix is installed
+// into the new Base at commit time.
+func (s *bphsStore) compactPartitionSnapshot(part *bphsPartition) (err error) {
+	defer func() {
+		part.mu.Lock()
+		part.compacting = false
+		if err == nil && s.shouldCompactPartitionLocked(part) {
+			s.scheduleCompactionLocked(part)
+		}
+		part.mu.Unlock()
+	}()
+
+	snapshot, ok := s.captureCompactionSnapshot(part)
+	if !ok {
+		return nil
+	}
+	if len(snapshot.l0) == 0 && len(snapshot.mem) == 0 {
+		return nil
+	}
+	newBase, meta, err := s.buildCompactionBase(part, snapshot)
+	if err != nil || newBase == nil {
+		return err
+	}
+	return s.installCompactionSnapshot(part, snapshot, newBase, meta)
 }
 
 func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {

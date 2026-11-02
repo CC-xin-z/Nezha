@@ -628,6 +628,129 @@ func TestBPHSCompactForReadCollapsesResidualDelta(t *testing.T) {
 	}
 }
 
+func TestBPHSCompactionSnapshotPreservesConcurrentWrites(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000001", "base-old")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs, base, filepath.Join(t.TempDir(), "bphs"), 1<<20, 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for _, tc := range []struct {
+		key, value string
+		version    uint32
+	}{
+		{"0000000001", "old-l0", 2},
+		{"0000000002", "stable-l0", 3},
+	} {
+		if _, err := store.Put(tc.key, tc.value, tc.version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	part := store.parts[0]
+	part.mu.Lock()
+	if err := store.flushPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		t.Fatal(err)
+	}
+	part.mu.Unlock()
+
+	if _, err := store.Put("0000000003", "snapshot-mem", 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	part.mu.Lock()
+	part.compacting = true
+	part.mu.Unlock()
+	snapshot, ok := store.captureCompactionSnapshot(part)
+	if !ok {
+		t.Fatal("failed to capture compaction snapshot")
+	}
+
+	if _, err := store.Put("0000000001", "concurrent-l0", 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+	part.mu.Lock()
+	if err := store.flushPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		t.Fatal(err)
+	}
+	part.mu.Unlock()
+
+	if _, err := store.Put("0000000004", "concurrent-mem", 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPartitions(map[int]struct{}{0: struct{}{}}); err != nil {
+		t.Fatal(err)
+	}
+
+	newBase, meta, err := store.buildCompactionBase(part, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newBase == nil {
+		t.Fatal("snapshot compaction produced no base")
+	}
+	if meta.MaxVersion != 4 {
+		t.Fatalf("snapshot compaction max version = %d, want 4", meta.MaxVersion)
+	}
+	if err := store.installCompactionSnapshot(part, snapshot, newBase, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	part.mu.Lock()
+	part.compacting = false
+	localBase := part.baseLocal
+	generation := part.gen
+	l0Runs := len(part.l0)
+	memRecords := part.mem.Len()
+	part.mu.Unlock()
+	if !localBase || generation != snapshot.generation {
+		t.Fatalf("installed base = local:%v generation:%d, want true/%d",
+			localBase, generation, snapshot.generation)
+	}
+	if l0Runs != 1 {
+		t.Fatalf("new L0 runs after snapshot install = %d, want 1", l0Runs)
+	}
+	if memRecords != 1 {
+		t.Fatalf("MemTable records after snapshot install = %d, want 1", memRecords)
+	}
+
+	for key, want := range map[string]string{
+		"0000000001": "concurrent-l0",
+		"0000000002": "stable-l0",
+		"0000000003": "snapshot-mem",
+		"0000000004": "concurrent-mem",
+	} {
+		got, found, err := store.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found || got != want {
+			t.Fatalf("get(%s) = %q,%v; want %q,true", key, got, found, want)
+		}
+	}
+}
+
 func TestBPHSSortedFileReadsPreserveVersions(t *testing.T) {
 	kvs := &KVServer{indexBlockBytes: 128}
 

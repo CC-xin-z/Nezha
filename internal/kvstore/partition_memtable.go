@@ -217,6 +217,29 @@ func (mt *partitionMemtable) SortedRange(startKey, endKey string) []bphsRecord {
 	return records[lo:hi]
 }
 
+// PruneThroughVersion removes records already covered by a compacted base.
+// Newer versions of the same keys remain in the MemTable and continue to
+// override the base after compaction.
+func (mt *partitionMemtable) PruneThroughVersion(version uint32) int {
+	if mt == nil || version == 0 || len(mt.records) == 0 {
+		return 0
+	}
+	removed := 0
+	for key, rec := range mt.records {
+		if rec.Version > version {
+			continue
+		}
+		mt.bytes -= bphsRecordBytes(rec)
+		delete(mt.records, key)
+		removed++
+	}
+	if removed > 0 {
+		mt.sortedCache = nil
+		mt.sortedValid = false
+	}
+	return removed
+}
+
 func (mt *partitionMemtable) Reset() {
 	if mt == nil {
 		return

@@ -73,6 +73,28 @@ func TestPartitionMemtableSortedRange(t *testing.T) {
 	}
 }
 
+func TestPartitionMemtablePruneThroughVersion(t *testing.T) {
+	mt := newPartitionMemtable(1 << 20)
+	mt.Put(bphsRecord{Key: "0000000001", Version: 2, Kind: bphsInlineRecord, Value: "a"})
+	mt.Put(bphsRecord{Key: "0000000002", Version: 3, Kind: bphsInlineRecord, Value: "b"})
+	mt.Put(bphsRecord{Key: "0000000003", Version: 5, Kind: bphsInlineRecord, Value: "c"})
+
+	removed := mt.PruneThroughVersion(3)
+	if removed != 2 {
+		t.Fatalf("pruned records = %d, want 2", removed)
+	}
+	if mt.Len() != 1 {
+		t.Fatalf("memtable len after prune = %d, want 1", mt.Len())
+	}
+	rec, ok := mt.Get("0000000003")
+	if !ok || rec.Version != 5 || rec.Value != "c" {
+		t.Fatalf("newer record after prune = %+v,%v; want version=5 value=c", rec, ok)
+	}
+	if mt.Bytes() != bphsRecordBytes(rec) {
+		t.Fatalf("memtable bytes after prune = %d, want %d", mt.Bytes(), bphsRecordBytes(rec))
+	}
+}
+
 func TestFlushPartitionMemtableRoundTrip(t *testing.T) {
 	mt := newPartitionMemtable(1 << 20)
 	const count = 257
