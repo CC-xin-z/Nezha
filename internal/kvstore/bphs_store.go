@@ -806,64 +806,9 @@ func (s *bphsStore) buildCompactionBase(
 	part *bphsPartition,
 	snapshot bphsCompactionSnapshot,
 ) (*SortedFileIndex, bphsPartitionManifest, error) {
-	merged := make(map[string]bphsRecord)
-	putLatest := func(rec bphsRecord) {
-		old, ok := merged[rec.Key]
-		if !ok || rec.Version >= old.Version {
-			merged[rec.Key] = rec
-		}
-	}
-
-	if snapshot.base != nil {
-		records, err := readRawSortedFile(snapshot.base.FilePath)
-		if err != nil {
-			return nil, bphsPartitionManifest{}, err
-		}
-		for _, rec := range records {
-			putLatest(rec)
-		}
-	}
-	for _, run := range snapshot.l0 {
-		records, err := readBPHSSortedFile(run.FilePath)
-		if err != nil {
-			return nil, bphsPartitionManifest{}, err
-		}
-		for _, rec := range records {
-			if rec.Kind != bphsInlineRecord {
-				return nil, bphsPartitionManifest{}, fmt.Errorf(
-					"snapshot compaction partition %d contains non-inline L0 record",
-					part.index,
-				)
-			}
-			putLatest(rec)
-		}
-	}
-	for _, rec := range snapshot.mem {
-		if rec.Kind != bphsInlineRecord {
-			return nil, bphsPartitionManifest{}, fmt.Errorf(
-				"snapshot compaction partition %d contains non-inline MemTable record",
-				part.index,
-			)
-		}
-		putLatest(rec)
-	}
-
-	records := make([]bphsRecord, 0, len(merged))
-	var cutVersion uint32
-	for _, rec := range merged {
-		if rec.Version > cutVersion {
-			cutVersion = rec.Version
-		}
-		records = append(records, rec)
-	}
-	if len(records) == 0 {
-		return nil, bphsPartitionManifest{}, nil
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
-
 	name := fmt.Sprintf("p%06d_base_%020d.sst", part.index, time.Now().UnixNano())
 	path := filepath.Join(s.dir, name)
-	newBase, err := s.kvs.flushBPHSBaseFile(records, path, 0)
+	newBase, cutVersion, err := s.writeStreamingCompactionBase(part, snapshot, path)
 	if err != nil {
 		return nil, bphsPartitionManifest{}, err
 	}
