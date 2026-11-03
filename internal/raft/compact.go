@@ -93,6 +93,10 @@ func (rf *Raft) compactLog() {
 				"预算 %dMB，压缩点取到 %d（固定窗口本会保留 %d 条）\n",
 				len(rf.log), rf.logBytes>>20, d.budget>>20, d.point, catchUpEntries)
 		}
+		if d.budgetBypassedFloor {
+			fmt.Printf("[LOG-BUDGET] 内存日志超过 %dMB 预算，压缩点越过 durable floor %d 到 %d；落后副本将由 snapshot 补齐\n",
+				d.budget>>20, rf.compactFloor.Load(), d.point)
+		}
 		if d.pinnedBy >= 0 && d.cappedBy < 0 && d.pinnedAt-safeIndex >= logPinWarnEntries {
 			fmt.Printf("[LOG-PINNED] peer[%d] 只复制到 %d，压缩点被从 %d 按到 %d："+
 				"内存日志驻留 %d 条 / %dMB（预算 %dMB，未超）\n",
@@ -297,6 +301,10 @@ type compactDecision struct {
 	// 预算比 catchUpEntries 那个固定窗口更紧，于是压缩点由预算决定。
 	// 大 value 档才会发生：16KB value 时 5000 条就是 83MB。
 	budgetCapsWindow bool
+	// budgetBypassedFloor records that the hard byte budget overrode the
+	// state-machine durable floor. A peer that falls behind the new point must
+	// be repaired by a snapshot once the state machine reaches that cut.
+	budgetBypassedFloor bool
 }
 
 // compactDecisionLocked 按三档规则算出压缩点。调用方须持有 rf.mu。
@@ -353,8 +361,17 @@ func (rf *Raft) compactDecisionLocked(catchUpEntries int) compactDecision {
 		d.budgetCapsWindow = true
 	}
 	if materialized := int(rf.compactFloor.Load()); materialized > 0 && d.point > materialized {
-		d.point = materialized
-		d.pinnedAt = d.point
+		// The state-machine durable floor normally protects restart and snapshot
+		// correctness. It must not, however, turn the in-memory Raft log into an
+		// unbounded buffer when the byte budget is exceeded. In that case, keep
+		// the budget-derived point and let a lagging replica catch up via
+		// snapshot once the state machine reaches the required cut.
+		if !d.overBudget {
+			d.point = materialized
+			d.pinnedAt = d.point
+		} else {
+			d.budgetBypassedFloor = true
+		}
 	}
 
 	// matchIndex 仅在成为 leader 时分配；follower 上为 nil，此时无需 peer 约束。

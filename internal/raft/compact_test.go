@@ -320,6 +320,27 @@ func TestMaterializedCompactFloorBoundsTruncation(t *testing.T) {
 	}
 }
 
+func TestLogBudgetOverridesMaterializedCompactFloor(t *testing.T) {
+	per := logEntryBytes(entryWith(0, 1, "k", strings.Repeat("v", 84)))
+	rf := leaderForTruncTest(per * 20)
+	rf.matchIndex[1] = 1100
+	rf.matchIndex[2] = 1100
+	rf.notePeerActive(1)
+	rf.notePeerActive(2)
+	rf.SetCompactFloor(1010)
+
+	d := rf.compactDecisionLocked(5)
+	if d.point != 1095 {
+		t.Fatalf("compact point = %d, want over-budget point 1095 rather than durable floor 1010", d.point)
+	}
+	if d.floor != 1080 {
+		t.Fatalf("decision = %+v, want budget floor 1080", d)
+	}
+	if !d.budgetBypassedFloor {
+		t.Fatalf("decision = %+v, want durable floor bypass recorded", d)
+	}
+}
+
 // follower 上没有 matchIndex，压缩只受 lastApplied 约束；单节点同理（循环为空）。
 // 预算比 catchUpEntries 那个固定窗口更紧时，压缩点必须由预算决定。
 //
