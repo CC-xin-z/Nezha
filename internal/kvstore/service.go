@@ -101,7 +101,8 @@ func (kvs *KVServer) noteRecoveryApplied(applied int) {
 }
 
 func (kvs *KVServer) ScanRangeInRaft(ctx context.Context, in *kvrpc.ScanRangeRequest) (*kvrpc.ScanRangeResponse, error) {
-	kvs.noteClientActivity()
+	// A range scan is itself enough read pressure to request maintenance.
+	kvs.noteReadActivity(bphsReadCompactMinLoad)
 	// 一次读要同时用到 persister、当前日志和分区组三样，而装快照会把三样一起换掉。
 	// **这里不再整段持 stateMu 的读锁**：那样会让装快照排在一次长扫描后面，而
 	// applyCommand 也按读锁持有 stateMu，于是 apply 跟着停一次扫描的时长
@@ -309,7 +310,7 @@ func (kvs *KVServer) StartGet(st stateSnapshot, args *kvrpc.GetInRaftRequest) *k
 }
 
 func (kvs *KVServer) GetInRaft(ctx context.Context, in *kvrpc.GetInRaftRequest) (*kvrpc.GetInRaftResponse, error) {
-	kvs.noteClientActivity()
+	kvs.noteReadActivity(1)
 	// 同 ScanRangeInRaft：一致性靠 captureState 那一小段，生命周期靠 storeRetireMu。
 	// 点查很短，但"短"不等于"原子"——一次点查仍然可能在回收旧库时正在进行。
 	//

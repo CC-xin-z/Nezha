@@ -14,11 +14,30 @@ const (
 	bphsCheckpointMaxTail = 64 << 20
 	bphsIdleCompactPoll   = 5 * time.Second
 	bphsIdleCompactQuiet  = 60 * time.Second
+	// A read workload commonly starts shortly after the write phase. Waiting for
+	// both reads and writes to go idle keeps every residual L0 visible to the
+	// entire read phase. Once writes have been quiet briefly, maintain the local
+	// bases in the background while reads continue.
+	bphsReadCompactWriteQuiet = 10 * time.Second
+	bphsReadCompactActiveFor  = 2 * time.Second
+	bphsReadCompactMinLoad    = 64
 )
 
 func (kvs *KVServer) noteClientActivity() {
 	if kvs != nil {
 		kvs.lastClientActivity.Store(time.Now().UnixNano())
+	}
+}
+
+func (kvs *KVServer) noteReadActivity(weight uint64) {
+	if kvs != nil {
+		if weight == 0 {
+			weight = 1
+		}
+		now := time.Now()
+		kvs.lastClientActivity.Store(now.UnixNano())
+		kvs.lastReadActivity.Store(now.UnixNano())
+		kvs.postWriteReadRequests.Add(weight)
 	}
 }
 
@@ -81,9 +100,9 @@ func (kvs *KVServer) bphsLogCheckpointLoop(ctx context.Context) {
 }
 
 // bphsIdleCompactionLoop collapses residual per-partition MemTables and L0
-// runs after a write burst has gone quiet. This is intentionally separate from
-// the checkpoint loop: checkpointing bounds the Raft log, while this loop
-// bounds the number of local runs observed by subsequent GET and SCAN calls.
+// runs. A fully idle store gets a complete pass; when writes stop but reads are
+// active, it performs one read-priority pass per write generation. This is
+// intentionally separate from checkpointing, which bounds the Raft log.
 func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
 	if kvs == nil || !kvs.bphsEnabled {
 		return
@@ -101,12 +120,9 @@ func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
 			kvs.storeRetireMu.RLock()
 			kvs.mu.Lock()
 			store := kvs.bphs
-			active := store != nil &&
-				!kvs.installing && !kvs.gcActive && !kvs.gcInProgress &&
-				now.Sub(kvs.lastPutTime) >= bphsIdleCompactQuiet &&
-				now.Sub(time.Unix(0, kvs.lastClientActivity.Load())) >= bphsIdleCompactQuiet
+			mode, putAt := kvs.bphsMaintenanceModeLocked(now)
 			kvs.mu.Unlock()
-			if !active {
+			if mode == bphsMaintenanceNone || store == nil {
 				kvs.storeRetireMu.RUnlock()
 				continue
 			}
@@ -115,18 +131,63 @@ func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
 			compacted, err := store.CompactForRead()
 			kvs.storeRetireMu.RUnlock()
 			if err != nil {
-				fmt.Printf("[BPHS-IDLE-COMPACT] failed: %v\n", err)
+				fmt.Printf("[BPHS-%s-COMPACT] failed: %v\n", mode.logName(), err)
 				continue
 			}
 			if compacted > 0 {
-				fmt.Printf("[BPHS-IDLE-COMPACT] partitions=%d elapsed=%v\n",
-					compacted, time.Since(start))
+				fmt.Printf("[BPHS-%s-COMPACT] partitions=%d elapsed=%v\n",
+					mode.logName(), compacted, time.Since(start))
+			}
+			if mode == bphsMaintenanceRead {
+				kvs.mu.Lock()
+				if kvs.lastPutTime.Equal(putAt) {
+					kvs.lastReadMaintainedPut = putAt
+				}
+				kvs.mu.Unlock()
 			}
 			if _, err := kvs.maybeReclaimLegacyPartitions(); err != nil {
 				fmt.Printf("[BPHS-LEGACY] reclaim failed: %v\n", err)
 			}
 		}
 	}
+}
+
+type bphsMaintenanceMode uint8
+
+const (
+	bphsMaintenanceNone bphsMaintenanceMode = iota
+	bphsMaintenanceRead
+	bphsMaintenanceIdle
+)
+
+func (m bphsMaintenanceMode) logName() string {
+	if m == bphsMaintenanceRead {
+		return "READ"
+	}
+	return "IDLE"
+}
+
+// bphsMaintenanceModeLocked selects the maintenance priority. The caller holds
+// kvs.mu and storeRetireMu; lastReadActivity is atomic because read handlers do
+// not take kvs.mu merely to publish activity.
+func (kvs *KVServer) bphsMaintenanceModeLocked(now time.Time) (bphsMaintenanceMode, time.Time) {
+	if kvs == nil || kvs.bphs == nil || kvs.installing || kvs.gcActive || kvs.gcInProgress {
+		return bphsMaintenanceNone, time.Time{}
+	}
+	putAt := kvs.lastPutTime
+	clientAt := time.Unix(0, kvs.lastClientActivity.Load())
+	if now.Sub(putAt) >= bphsIdleCompactQuiet && now.Sub(clientAt) >= bphsIdleCompactQuiet {
+		return bphsMaintenanceIdle, putAt
+	}
+	readAt := time.Unix(0, kvs.lastReadActivity.Load())
+	if readAt.UnixNano() == 0 ||
+		now.Sub(putAt) < bphsReadCompactWriteQuiet ||
+		now.Sub(readAt) > bphsReadCompactActiveFor ||
+		kvs.postWriteReadRequests.Load() < bphsReadCompactMinLoad ||
+		!kvs.lastReadMaintainedPut.Before(putAt) {
+		return bphsMaintenanceNone, time.Time{}
+	}
+	return bphsMaintenanceRead, putAt
 }
 
 func (kvs *KVServer) checkpointBPHSLog(expected int) (bool, string, string, error) {
