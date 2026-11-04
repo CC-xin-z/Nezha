@@ -195,7 +195,9 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		return nil, fmt.Errorf("cut log: %w", err)
 	}
 
+	var lastApplied int
 	kvs.mu.Lock()
+	lastApplied = kvs.lastAppliedIndex
 	changed := kvs.gcInProgress || kvs.numGC != numGC || kvs.currentLog != currentLog
 	kvs.mu.Unlock()
 	if changed {
@@ -208,11 +210,25 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		release()
 		return nil, errSnapshotBusy
 	}
-	if applied > cut.LastIndex {
+	snapshotApplied := applied
+	if kvs.bphsRaftLogWAL && bphs != nil {
+		// In Raft-WAL mode the global store's applied marker can lag the
+		// partition-local durable frontier even when legacy rows remain.
+		// Legacy rows may still exist from before BPHS activation; they are
+		// copied for compatibility, while the BPHS cut remains authoritative.
+		snapshotApplied = lastApplied
+		if applied > snapshotApplied {
+			snapshotApplied = applied
+		}
+	}
+	if snapshotApplied > cut.LastIndex {
 		// 导出在切点之前完成，所以这不该发生。真发生了说明先后顺序被改坏了，
 		// 宁可不发也不要发一份接收端起不来的快照。
 		release()
-		return nil, fmt.Errorf("snapshot: store applied=%d is ahead of the log cut at %d", applied, cut.LastIndex)
+		return nil, fmt.Errorf(
+			"snapshot: applied=%d is ahead of the log cut at %d",
+			snapshotApplied, cut.LastIndex,
+		)
 	}
 	if legacyPartitionsRetired && bphs == nil {
 		release()
@@ -220,7 +236,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 	var bphsCut []bphsSnapshotPartition
 	if bphs != nil {
-		bphsCut, err = bphs.SnapshotCut(dir, applied)
+		bphsCut, err = bphs.SnapshotCut(dir, snapshotApplied)
 		if err != nil {
 			release()
 			return nil, fmt.Errorf("cut BPHS state: %w", err)
@@ -255,7 +271,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	sm := snapshotManifest{
 		LastIncludedIndex:       cut.BaseIndex,
 		LastIncludedTerm:        cut.BaseTerm,
-		AppliedIndex:            applied,
+		AppliedIndex:            snapshotApplied,
 		LastIndex:               cut.LastIndex,
 		LastTerm:                cut.LastTerm,
 		NumGC:                   numGC,
@@ -597,6 +613,12 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		// 否则重启时 applied=0 与日志基址矛盾，恢复直接放弃。
 		store.SetApplied(sm.AppliedIndex)
 	}
+	if kvs.bphsRaftLogWAL && len(sm.BPHS) > 0 {
+		// The exported legacy store may carry an older applied marker. BPHS is
+		// authoritative in this mode and the snapshot cut has already captured
+		// its records/L0/base, so align the new store before installation.
+		store.SetApplied(sm.AppliedIndex)
+	}
 	if got, ok, err := store.GetApplied(); err != nil || !ok || got != sm.AppliedIndex {
 		store.Close()
 		return fail("ingest 之后库里的 applied=%d（ok=%v err=%v），清单说的是 %d",
@@ -723,6 +745,12 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		}
 	}
 	kvs.storeRetireMu.Unlock()
+	// Run may still be waiting for the pre-snapshot Raft-WAL recovery target.
+	// No apply batch is delivered for the snapshot prefix, so release that gate
+	// only after the replacement state, log and on-disk cleanup are complete.
+	kvs.mu.Lock()
+	kvs.noteRecoveryApplied(sm.AppliedIndex)
+	kvs.mu.Unlock()
 	fmt.Printf("[SNAPSHOT] 装好一份：位点=(%d,%d) applied=%d 日志到=%d 分区=%d(%dB) "+
 		"库行数=%d 耗时=%v（原状态：分区=%d 日志=%s）\n",
 		sm.LastIncludedIndex, sm.LastIncludedTerm, sm.AppliedIndex, last,
