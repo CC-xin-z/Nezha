@@ -225,6 +225,12 @@ func (c *Client) redirect(from int, hint int32) int {
 	return c.Leader()
 }
 
+func (c *Client) failoverTarget(from int) int {
+	next := (from + 1) % len(c.servers)
+	c.leader.Store(int32(next))
+	return next
+}
+
 func (c *Client) call(server int, timeout time.Duration, fn func(ctx context.Context, kv kvrpc.KVClient) error) error {
 	conn, err := c.pools[server].Get()
 	if err != nil {
@@ -246,14 +252,17 @@ func (c *Client) Put(key, value string) (*kvrpc.PutInRaftResponse, error) {
 	}
 	req := &kvrpc.PutInRaftRequest{Key: key, Value: value, Op: "Put", ClientId: c.clientID, SeqId: c.NextSeq()}
 	target := c.Leader()
-	for {
+	var lastErr error
+	for attempt := 0; attempt < len(c.servers)*4; attempt++ {
 		var reply *kvrpc.PutInRaftResponse
 		err := c.call(target, c.opts.PutTimeout, func(ctx context.Context, kv kvrpc.KVClient) (e error) {
 			reply, e = kv.PutInRaft(ctx, req)
 			return
 		})
 		if err != nil {
-			return nil, err
+			lastErr = err
+			target = c.failoverTarget(target)
+			continue
 		}
 		if reply.Err == kvrpc.ErrWrongLeader {
 			target = c.redirect(target, reply.LeaderId)
@@ -261,15 +270,22 @@ func (c *Client) Put(key, value string) (*kvrpc.PutInRaftResponse, error) {
 		}
 		return reply, nil
 	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("client: no reachable leader")
 }
 
 // Get reads key through the leader, following redirects. found is false for ErrNoKey.
 func (c *Client) Get(key string) (value string, found bool, err error) {
 	target := c.Leader()
-	for {
+	var lastErr error
+	for attempt := 0; attempt < len(c.servers)*4; attempt++ {
 		reply, err := c.GetFrom(target, key)
 		if err != nil {
-			return "", false, err
+			lastErr = err
+			target = c.failoverTarget(target)
+			continue
 		}
 		switch reply.Err {
 		case kvrpc.OK:
@@ -282,6 +298,10 @@ func (c *Client) Get(key string) (value string, found bool, err error) {
 			return reply.Value, false, fmt.Errorf("client: get %q: %s", key, reply.Err)
 		}
 	}
+	if lastErr != nil {
+		return "", false, lastErr
+	}
+	return "", false, errors.New("client: no reachable leader")
 }
 
 // GetFrom reads key from one specific server without following redirects. Verification
@@ -303,10 +323,13 @@ func (c *Client) GetFrom(server int, key string) (*kvrpc.GetInRaftResponse, erro
 // Scan returns the rows in [start, end] through the leader, following redirects.
 func (c *Client) Scan(start, end string) (*kvrpc.ScanRangeResponse, error) {
 	target := c.Leader()
-	for {
+	var lastErr error
+	for attempt := 0; attempt < len(c.servers)*4; attempt++ {
 		reply, err := c.ScanFrom(target, start, end)
 		if err != nil {
-			return nil, err
+			lastErr = err
+			target = c.failoverTarget(target)
+			continue
 		}
 		if reply.Err == kvrpc.ErrWrongLeader {
 			target = c.redirect(target, reply.LeaderId)
@@ -314,6 +337,10 @@ func (c *Client) Scan(start, end string) (*kvrpc.ScanRangeResponse, error) {
 		}
 		return reply, nil
 	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("client: no reachable leader")
 }
 
 // ScanFrom scans one specific server without following redirects.

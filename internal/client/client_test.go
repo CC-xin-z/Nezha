@@ -109,6 +109,29 @@ func TestFollowsRedirectOnce(t *testing.T) {
 	}
 }
 
+func TestFallsBackFromUnreachableCachedLeader(t *testing.T) {
+	live, _ := cluster(t, 1, 0)
+	servers := []string{"127.0.0.1:1", live[0]}
+	c := MustNew(servers, Options{
+		Leader:      0,
+		PoolMaxIdle: 2, PoolMaxActive: 4, PoolMaxConcurrentStreams: 8,
+	})
+	defer c.Close()
+
+	if reply, err := c.Put("k", "v"); err != nil || reply.Err != kvrpc.OK {
+		t.Fatalf("Put after cached leader failure: reply=%v err=%v", reply, err)
+	}
+	if c.Leader() != 1 {
+		t.Fatalf("client leader=%d, want fallback server 1", c.Leader())
+	}
+	if value, found, err := c.Get("k"); err != nil || !found || value != "v" {
+		t.Fatalf("Get after fallback = %q,%v,%v", value, found, err)
+	}
+	if reply, err := c.Scan("k", "k"); err != nil || reply.Err != kvrpc.OK || len(reply.KeyValuePairs) != 1 {
+		t.Fatalf("Scan after fallback: reply=%v err=%v", reply, err)
+	}
+}
+
 func TestGetFromDoesNotRedirect(t *testing.T) {
 	addrs, _ := cluster(t, 2, 1)
 	c := MustNew(addrs, Options{PoolMaxIdle: 2, PoolMaxActive: 4, PoolMaxConcurrentStreams: 8})
