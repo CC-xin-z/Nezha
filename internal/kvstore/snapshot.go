@@ -771,19 +771,25 @@ func checkSnapshotFiles(sm snapshotManifest, byName map[string]string) error {
 	if sm.StoreSST != "" && byName[sm.StoreSST] == "" {
 		return fmt.Errorf("快照缺存储引擎导出 %s", sm.StoreSST)
 	}
-	for _, m := range sm.Partitions {
-		p := byName[m.Path]
-		if p == "" {
-			return fmt.Errorf("快照缺分区 %s", m.Path)
+	if sm.LegacyPartitionsRetired {
+		if len(sm.BPHS) == 0 {
+			return fmt.Errorf("快照 retired legacy partitions but contains no BPHS partitions")
 		}
-		st, err := os.Stat(p)
-		if err != nil {
-			return fmt.Errorf("快照的分区 %s: %v", m.Path, err)
-		}
-		// 长度对不上意味着没收全或者收错了。让它在这里失败，而不是等 loadPartitionSet
-		// 去撞一个说不出哪里不对的 "unexpected EOF"。
-		if st.Size() != m.Size {
-			return fmt.Errorf("快照的分区 %s 清单说 %d 字节，收到 %d 字节", m.Path, m.Size, st.Size())
+	} else {
+		for _, m := range sm.Partitions {
+			p := byName[m.Path]
+			if p == "" {
+				return fmt.Errorf("快照缺分区 %s", m.Path)
+			}
+			st, err := os.Stat(p)
+			if err != nil {
+				return fmt.Errorf("快照的分区 %s: %v", m.Path, err)
+			}
+			// 长度对不上意味着没收全或者收错了。让它在这里失败，而不是等 loadPartitionSet
+			// 去撞一个说不出哪里不对的 "unexpected EOF"。
+			if st.Size() != m.Size {
+				return fmt.Errorf("快照的分区 %s 清单说 %d 字节，收到 %d 字节", m.Path, m.Size, st.Size())
+			}
 		}
 	}
 	for _, m := range sm.BPHS {

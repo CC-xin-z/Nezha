@@ -62,3 +62,47 @@ func TestClearSnapshotWorkRemovesStaleTrees(t *testing.T) {
 		t.Fatalf("启动清理后 Snapshot 根目录仍存在: %v", err)
 	}
 }
+
+func TestCheckSnapshotFilesSkipsRetiredLegacyPartitions(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "p000000_base.sst")
+	manifestPath := filepath.Join(dir, "p000000.manifest.json")
+	logPath := filepath.Join(dir, "RaftState.log")
+	if err := os.WriteFile(basePath, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sm := snapshotManifest{
+		LegacyPartitionsRetired: true,
+		CurrentLog:              filepath.Base(logPath),
+		Partitions: []partitionMeta{{
+			Path: "RaftState_sorted_1.p0",
+			Size: 123,
+		}},
+		BPHS: []bphsSnapshotPartition{{
+			Index:         0,
+			BaseFile:      filepath.Base(basePath),
+			BaseBytes:     4,
+			ManifestFile:  filepath.Base(manifestPath),
+			ManifestBytes: 2,
+		}},
+	}
+	byName := map[string]string{
+		filepath.Base(basePath):     basePath,
+		filepath.Base(manifestPath): manifestPath,
+		filepath.Base(logPath):      logPath,
+	}
+	if err := checkSnapshotFiles(sm, byName); err != nil {
+		t.Fatalf("metadata-only snapshot rejected missing legacy partition: %v", err)
+	}
+
+	sm.LegacyPartitionsRetired = false
+	if err := checkSnapshotFiles(sm, byName); err == nil {
+		t.Fatal("non-retired snapshot accepted a missing legacy partition")
+	}
+}
