@@ -84,6 +84,76 @@ func TestBPHSScanSkipsDisjointL0Range(t *testing.T) {
 	}
 }
 
+func TestBPHSScanMergesBaseL0AndMemByNewestKey(t *testing.T) {
+	kvs := &KVServer{inlineThreshold: 512, indexBlockBytes: 512}
+	dir := t.TempDir()
+
+	base, err := kvs.flushBPHSBaseFile([]bphsRecord{
+		{Key: "a", Version: 1, Kind: bphsInlineRecord, Value: "base-a"},
+		{Key: "b", Version: 2, Kind: bphsInlineRecord, Value: "base-b"},
+		{Key: "d", Version: 3, Kind: bphsInlineRecord, Value: "base-d"},
+	}, filepath.Join(dir, "base.sst"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSet := &PartitionSet{parts: []*SortedFileIndex{base}}
+	baseSet.assignOwnershipRanges()
+
+	makeL0 := func(name string, records ...bphsRecord) *SortedFileIndex {
+		t.Helper()
+		mt := newPartitionMemtable(0)
+		for _, rec := range records {
+			mt.Put(rec)
+		}
+		index, err := kvs.flushPartitionMemtable(mt, filepath.Join(dir, name), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	oldL0 := makeL0("p000000_l0_1.sst",
+		bphsRecord{Key: "b", Version: 4, Kind: bphsInlineRecord, Value: "older-l0-b"})
+	newL0 := makeL0("p000000_l0_2.sst",
+		bphsRecord{Key: "b", Version: 5, Kind: bphsInlineRecord, Value: "newer-l0-b"},
+		bphsRecord{Key: "c", Version: 6, Kind: bphsInlineRecord, Value: "l0-c"})
+
+	part := &bphsPartition{
+		index:     0,
+		base:      base,
+		baseLocal: true,
+		mem:       newPartitionMemtable(0),
+		l0:        []*SortedFileIndex{oldL0, newL0},
+	}
+	part.mem.Put(bphsRecord{Key: "c", Version: 7, Kind: bphsInlineRecord, Value: "mem-c"})
+	store := &bphsStore{
+		kvs:    kvs,
+		base:   baseSet,
+		parts:  []*bphsPartition{part},
+		dir:    dir,
+		inline: NewInlineCache(0),
+	}
+	store.basePtr.Store(baseSet)
+
+	got, err := store.Scan("a", "z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"a": "base-a",
+		"b": "newer-l0-b",
+		"c": "mem-c",
+		"d": "base-d",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scan result=%v, want %v", got, want)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("scan[%q]=%q, want %q; all=%v", key, got[key], value, got)
+		}
+	}
+}
+
 func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},

@@ -249,7 +249,6 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 				fmt.Println("底层执行了Put请求，以及重置put操作时间")
 			}
 			kvs.lastPutTime = time.Now() // 更新put操作时间
-			kvs.postWriteReadRequests.Store(0)
 			// Tail membership must become visible before the write becomes
 			// readable. applyBatch runs under kvs.mu, which is the publication
 			// boundary for the store update below.

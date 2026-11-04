@@ -1496,19 +1496,20 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		part := s.parts[i]
 		part.mu.RLock()
 
-		if part.base != nil {
-			if err := s.kvs.scanFromSortedFileInto(result, startKey, endKey, part.base); err != nil {
-				part.mu.RUnlock()
-				return nil, err
+		if len(part.l0) == 0 {
+			// The ready/local steady state has one run. Keep the original
+			// direct streaming path and avoid merge bookkeeping.
+			if part.base != nil {
+				if err := s.kvs.scanFromSortedFileInto(result, startKey, endKey, part.base); err != nil {
+					part.mu.RUnlock()
+					return nil, err
+				}
 			}
+		} else if err := s.scanBPHSPartitionMergedInto(result, startKey, endKey, part); err != nil {
+			part.mu.RUnlock()
+			return nil, err
 		}
-		for _, l0 := range part.l0 {
-			l0Runs++
-			if err := s.scanBPHSSortedFileInto(result, startKey, endKey, part, l0); err != nil {
-				part.mu.RUnlock()
-				return nil, err
-			}
-		}
+		l0Runs += len(part.l0)
 		for _, rec := range part.mem.SortedRange(startKey, endKey) {
 			value, err := s.recordValue(part, rec)
 			if err != nil {
@@ -1522,6 +1523,162 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 	return result, nil
 }
 
+type bphsScanRun struct {
+	part         *bphsPartition
+	file         *os.File
+	reader       *bufio.Reader
+	pool         *FileDescriptorPool
+	decodeRecord bool
+	priority     int
+	endKey       string
+	key          string
+	value        string
+	valid        bool
+}
+
+func (s *bphsStore) openBPHSScanRun(
+	part *bphsPartition, index *SortedFileIndex, startKey, endKey string,
+	decodeRecord bool, priority int,
+) (*bphsScanRun, error) {
+	if index == nil {
+		return nil, nil
+	}
+	startOffset, endOffset, ok := index.boundedScanRange(startKey, endKey)
+	if !ok {
+		return nil, nil
+	}
+	if index.pool == nil {
+		return nil, fmt.Errorf("BPHS scan file %s has no descriptor pool", index.FilePath)
+	}
+	file, err := index.pool.Get()
+	if err != nil {
+		return nil, err
+	}
+	length := endOffset - startOffset
+	run := &bphsScanRun{
+		part:         part,
+		file:         file,
+		reader:       bufio.NewReaderSize(io.NewSectionReader(file, startOffset, length), boundedScanBufferBytes(length)),
+		pool:         index.pool,
+		decodeRecord: decodeRecord,
+		priority:     priority,
+		endKey:       endKey,
+	}
+	if err := s.advanceBPHSScanRun(run, startKey); err != nil {
+		run.close()
+		return nil, err
+	}
+	return run, nil
+}
+
+func (s *bphsStore) advanceBPHSScanRun(run *bphsScanRun, startKey string) error {
+	for {
+		entry, _, err := ReadEntry(run.reader, 0)
+		if err == io.EOF {
+			run.valid = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if entry.Key > run.endKey {
+			run.valid = false
+			return nil
+		}
+		if entry.Key < startKey {
+			continue
+		}
+		if run.decodeRecord {
+			rec, err := entryToBPHSRecord(entry)
+			if err != nil {
+				return err
+			}
+			run.value, err = s.recordValue(run.part, rec)
+			if err != nil {
+				return err
+			}
+			run.key = rec.Key
+		} else {
+			run.key, run.value = entry.Key, entry.Value
+		}
+		run.valid = true
+		return nil
+	}
+}
+
+func (run *bphsScanRun) close() {
+	if run == nil || run.file == nil {
+		return
+	}
+	run.pool.Put(run.file)
+	run.file = nil
+}
+
+// scanBPHSPartitionMergedInto merges immutable Base and L0 runs in key order.
+// Every key is emitted once with the newest L0 version taking precedence over
+// the Base, avoiding the old base-first/L0-overwrite double map insertion.
+func (s *bphsStore) scanBPHSPartitionMergedInto(
+	result map[string]string, startKey, endKey string, part *bphsPartition,
+) error {
+	runs := make([]*bphsScanRun, 0, len(part.l0)+1)
+	closeRuns := func() {
+		for _, run := range runs {
+			run.close()
+		}
+	}
+	defer closeRuns()
+
+	if part.base != nil {
+		run, err := s.openBPHSScanRun(part, part.base, startKey, endKey, false, 0)
+		if err != nil {
+			return err
+		}
+		if run != nil {
+			runs = append(runs, run)
+		}
+	}
+	for i, l0 := range part.l0 {
+		run, err := s.openBPHSScanRun(part, l0, startKey, endKey, true, i+1)
+		if err != nil {
+			return err
+		}
+		if run != nil {
+			runs = append(runs, run)
+		}
+	}
+
+	for {
+		minKey := ""
+		var newest *bphsScanRun
+		for _, run := range runs {
+			if !run.valid {
+				continue
+			}
+			if newest == nil || run.key < minKey {
+				minKey = run.key
+				newest = run
+				continue
+			}
+			if run.key == minKey && run.priority > newest.priority {
+				newest = run
+			}
+		}
+		if newest == nil {
+			return nil
+		}
+		result[minKey] = newest.value
+		for _, run := range runs {
+			if run.valid && run.key == minKey {
+				if err := s.advanceBPHSScanRun(run, startKey); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+// scanBPHSSortedFileInto remains the single-run helper for callers that already
+// know there is no L0 overlay, including narrow debugging paths and tests.
 func (s *bphsStore) scanBPHSSortedFileInto(result map[string]string, startKey, endKey string, part *bphsPartition, index *SortedFileIndex) error {
 	if index == nil {
 		return fmt.Errorf("BPHS L0 index is nil")

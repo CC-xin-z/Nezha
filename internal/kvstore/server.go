@@ -213,15 +213,7 @@ type KVServer struct {
 	recoveryDone       chan struct{}
 	recoveryOnce       sync.Once
 	lastClientActivity atomic.Int64
-	lastReadActivity   atomic.Int64
-	// postWriteReadRequests distinguishes a real read phase from one incidental
-	// GET after writes. PUT application resets it; GET/SCAN add read pressure.
-	postWriteReadRequests atomic.Uint64
-	bphsDir               string
-	// lastReadMaintainedPut remembers which write generation was already
-	// maintained for a read-priority pass. A new PUT updates lastPutTime and
-	// makes another pass eligible after the write quiet window.
-	lastReadMaintainedPut time.Time
+	bphsDir            string
 	// legacyPartitionsRetired records that every BPHS partition has a local
 	// base and the activation-time global partition files may be omitted from
 	// recovery and snapshots. It is persisted in kv_state before deletion.
