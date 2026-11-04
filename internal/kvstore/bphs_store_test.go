@@ -176,6 +176,9 @@ func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 	if err := store.durableSyncError(); err != nil {
 		t.Fatalf("background sync: %v", err)
 	}
+	if got := store.DurableIndex(); got < 2 {
+		t.Fatalf("durable index after background record sync = %d, want >= 2", got)
+	}
 	store.walMaxBytes = 1
 	if err := store.checkpointSharedWAL(); err != nil {
 		t.Fatal(err)
@@ -186,9 +189,16 @@ func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 }
 
 func TestBPHSRecordSyncQueueCoalescesPartitions(t *testing.T) {
+	p0 := &bphsPartition{}
+	p1 := &bphsPartition{}
+	p2 := &bphsPartition{}
+	p0.pendingDurableVersion.Store(1)
+	p1.pendingDurableVersion.Store(2)
+	p2.pendingDurableVersion.Store(3)
 	store := &bphsStore{
-		recordSyncPending: make(map[int]struct{}),
+		recordSyncPending: make(map[int]uint32),
 		recordSyncSignal:  make(chan struct{}, 1),
+		parts:             []*bphsPartition{p0, p1, p2},
 	}
 	store.queueRecordSync(map[int]struct{}{0: {}, 1: {}})
 	store.queueRecordSync(map[int]struct{}{1: {}, 2: {}})
@@ -201,6 +211,15 @@ func TestBPHSRecordSyncQueueCoalescesPartitions(t *testing.T) {
 		if _, ok := store.recordSyncPending[idx]; !ok {
 			t.Fatalf("partition %d missing from pending record sync set", idx)
 		}
+	}
+	if got := store.recordSyncPending[0]; got != 1 {
+		t.Fatalf("partition 0 pending version = %d, want 1", got)
+	}
+	if got := store.recordSyncPending[1]; got != 2 {
+		t.Fatalf("partition 1 pending version = %d, want 2", got)
+	}
+	if got := store.recordSyncPending[2]; got != 3 {
+		t.Fatalf("partition 2 pending version = %d, want 3", got)
 	}
 }
 
@@ -297,12 +316,12 @@ func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 { // partition records + vlog + shared WAL
+	if len(entries) != 4 { // partition records + vlog + shared WAL + durable index
 		names := make([]string, 0, len(entries))
 		for _, entry := range entries {
 			names = append(names, fmt.Sprint(entry.Name()))
 		}
-		t.Fatalf("BPHS files = %v, want records+vlog+shared WAL", names)
+		t.Fatalf("BPHS files = %v, want records+vlog+shared WAL+durable index", names)
 	}
 }
 

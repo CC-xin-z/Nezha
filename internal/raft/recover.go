@@ -169,6 +169,24 @@ func (rf *Raft) RecoverLog(files []LogFile, lastApplied int) (lastIndex int, err
 			rf.me, rf.lastIncludedIndex)
 		return rf.lastIncludedIndex, nil
 	}
+	// A tail-preserving checkpoint commits the new HardState base before
+	// kv_state.json switches current_log. If we crash in that window, recovery
+	// still opens the old, longer log file. Its early records are already
+	// covered by the hard-state base, so discard that prefix and reconstruct
+	// the log from the state-file cut.
+	if rf.stateLoaded && rf.lastIncludedIndex > base {
+		if lastApplied < rf.lastIncludedIndex || lastIndex < rf.lastIncludedIndex {
+			return 0, fmt.Errorf("state base %d is outside recovered log range (%d, %d]",
+				rf.lastIncludedIndex, base, lastIndex)
+		}
+		skip := rf.lastIncludedIndex - base
+		if skip > len(entries) {
+			return 0, fmt.Errorf("state base %d requires %d records but only %d were recovered",
+				rf.lastIncludedIndex, skip, len(entries))
+		}
+		entries = append([]*raftrpc.LogEntry(nil), entries[skip:]...)
+		base = rf.lastIncludedIndex
+	}
 	if rf.stateLoaded && rf.lastIncludedIndex != base {
 		return 0, fmt.Errorf("log base mismatch: state file says %d, first log record implies %d", rf.lastIncludedIndex, base)
 	}

@@ -148,6 +148,23 @@ func (rf *Raft) OverwriteLogFileFrom(e []*Entry, startPos int64) {
 	rf.writeEntries(e, startPos, true)
 }
 
+func encodeRaftLogEntry(entry *Entry) []byte {
+	value := []byte(entry.Value)
+	key := []byte(nil)
+	if !entry.NoOp {
+		key = []byte(entry.Key)
+	}
+	data := make([]byte, 20+len(key)+len(value))
+	binary.LittleEndian.PutUint32(data[0:4], entry.Index)
+	binary.LittleEndian.PutUint32(data[4:8], entry.CurrentTerm)
+	binary.LittleEndian.PutUint32(data[8:12], entry.VotedFor)
+	binary.LittleEndian.PutUint32(data[12:16], uint32(len(key)))
+	binary.LittleEndian.PutUint32(data[16:20], uint32(len(value)))
+	copy(data[20:20+len(key)], key)
+	copy(data[20+len(key):], value)
+	return data
+}
+
 // writeEntries 是两者共同的实现。
 //
 // 不接受文件名参数：目标文件由 rf.currentLog 决定，而它归 logMu 管。让调用方
@@ -198,25 +215,7 @@ func (rf *Raft) writeEntries(e []*Entry, startPos int64, overwrite bool) {
 	}
 
 	for i, entry := range e {
-
-		valueSize := uint32(len(entry.Value))
-
-		paddedKey := ""
-		if !entry.NoOp {
-			paddedKey = entry.Key // 存储层原样存 key，见 persister.go 的契约说明
-		}
-		keySize := uint32(len(paddedKey))          // NoOp records have keySize==0; recovery relies on it
-		data := make([]byte, 20+keySize+valueSize) // 48 bytes for 6 uint64 + key + value
-
-		// 将数据编码到byte slice中
-		binary.LittleEndian.PutUint32(data[0:4], entry.Index)
-		binary.LittleEndian.PutUint32(data[4:8], entry.CurrentTerm)
-		binary.LittleEndian.PutUint32(data[8:12], entry.VotedFor)
-		binary.LittleEndian.PutUint32(data[12:16], keySize)
-		binary.LittleEndian.PutUint32(data[16:20], valueSize)
-
-		copy(data[20:20+keySize], paddedKey)
-		copy(data[20+keySize:], entry.Value)
+		data := encodeRaftLogEntry(entry)
 
 		// 写入文件
 		u, err := writer.Write(data)

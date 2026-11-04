@@ -104,3 +104,78 @@ func TestRecoverLogAcceptsRetiredFileAtCheckpointBase(t *testing.T) {
 			last, len(rf.log), rf.lastApplied)
 	}
 }
+
+func TestRotateLogAtCutPreservesRaftTail(t *testing.T) {
+	dir := t.TempDir()
+	oldLog := filepath.Join(dir, "RaftState.log")
+	newLog := filepath.Join(dir, "RaftState.checkpoint-tail.log")
+
+	w := newLogWriter(t, oldLog, 0)
+	writeSampleLog(t, w)
+	w.CloseLogFile()
+
+	rf := &Raft{persister: &Persister{}, stateFile: filepath.Join(dir, "raft_state.json")}
+	if _, err := rf.RecoverLog([]LogFile{{Path: oldLog, Version: 0}}, 4); err != nil {
+		t.Fatal(err)
+	}
+	rf.SetCurrentLogVersioned(oldLog, 0)
+
+	gotOld, rotated, err := rf.RotateLogAtCut(4, newLog, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rotated || gotOld != oldLog {
+		t.Fatalf("rotated=%v old=%q, want true/%q", rotated, gotOld, oldLog)
+	}
+	if rf.lastIncludedIndex != 4 || rf.lastIncludedTerm != 1 {
+		t.Fatalf("base=(%d,%d), want (4,1)", rf.lastIncludedIndex, rf.lastIncludedTerm)
+	}
+	if rf.lastIndex() != 9 || len(rf.log) != 5 {
+		t.Fatalf("tail last=%d entries=%d, want 9/5", rf.lastIndex(), len(rf.log))
+	}
+	if len(rf.Offsets) != 5 {
+		t.Fatalf("pending offsets=%d, want entries 5..9", len(rf.Offsets))
+	}
+
+	fresh := &Raft{
+		persister:         &Persister{},
+		stateLoaded:       true,
+		lastIncludedIndex: 4,
+		lastIncludedTerm:  1,
+	}
+	last, err := fresh.RecoverLog([]LogFile{{Path: newLog, Version: 0}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 9 || fresh.lastIndex() != 9 || len(fresh.Offsets) != 5 {
+		t.Fatalf("recovered tail last=%d entries=%d offsets=%d, want 9/5/5",
+			last, len(fresh.log), len(fresh.Offsets))
+	}
+}
+
+func TestRecoverLogAcceptsStateBaseAheadOfOldLog(t *testing.T) {
+	dir := t.TempDir()
+	oldLog := filepath.Join(dir, "RaftState.log")
+	w := newLogWriter(t, oldLog, 0)
+	writeSampleLog(t, w)
+	w.CloseLogFile()
+
+	fresh := &Raft{
+		persister:         &Persister{},
+		stateLoaded:       true,
+		lastIncludedIndex: 4,
+		lastIncludedTerm:  1,
+	}
+	last, err := fresh.RecoverLog([]LogFile{{Path: oldLog, Version: 0}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 9 || fresh.lastIncludedIndex != 4 || fresh.firstIndex() != 5 {
+		t.Fatalf("recovered last/base/first = %d/%d/%d, want 9/4/5",
+			last, fresh.lastIncludedIndex, fresh.firstIndex())
+	}
+	if len(fresh.log) != 5 || len(fresh.Offsets) != 5 {
+		t.Fatalf("recovered tail entries/offsets = %d/%d, want 5/5",
+			len(fresh.log), len(fresh.Offsets))
+	}
+}

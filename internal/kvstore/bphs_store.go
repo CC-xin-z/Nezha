@@ -78,6 +78,10 @@ type bphsPartition struct {
 	compacting   bool
 	l0Merges     int
 	durableIndex atomic.Uint32
+	// pendingDurableVersion is advanced after a record (and, when needed, its
+	// VLog value) is fsynced. A background sync therefore advances the BPHS
+	// durable frontier without waiting for a MemTable flush.
+	pendingDurableVersion atomic.Uint32
 }
 
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
@@ -100,7 +104,7 @@ type bphsStore struct {
 	raftLogWAL                bool
 	recordSyncConcurrency     int
 	recordSyncMu              sync.Mutex
-	recordSyncPending         map[int]struct{}
+	recordSyncPending         map[int]uint32
 	recordSyncSignal          chan struct{}
 	recordSyncStop            chan struct{}
 	recordSyncWG              sync.WaitGroup
@@ -164,7 +168,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		durablePath:               filepath.Join(dir, "durable_index.json"),
 		raftLogWAL:                kvs.bphsRaftLogWAL,
 		recordSyncConcurrency:     recordSyncConcurrency,
-		recordSyncPending:         make(map[int]struct{}),
+		recordSyncPending:         make(map[int]uint32),
 		recordSyncSignal:          make(chan struct{}, 1),
 		recordSyncStop:            make(chan struct{}),
 		inline:                    inline,
@@ -663,6 +667,12 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	offset, err := part.records.Append(rec)
 	if err != nil {
 		return -1, fmt.Errorf("append partition %d record: %w", part.index, err)
+	}
+	for {
+		old := part.pendingDurableVersion.Load()
+		if version <= old || part.pendingDurableVersion.CompareAndSwap(old, version) {
+			break
+		}
 	}
 	part.recordsDirty = true
 	rec.LogOffset = offset
@@ -1558,7 +1568,7 @@ func (s *bphsStore) appendPendingSharedWAL() error {
 	return nil
 }
 
-func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}, concurrency int) error {
+func (s *bphsStore) syncRecordPartitions(indices map[int]uint32, concurrency int) error {
 	if len(indices) == 0 {
 		return nil
 	}
@@ -1584,17 +1594,32 @@ func (s *bphsStore) syncRecordPartitions(indices map[int]struct{}, concurrency i
 			part.mu.Lock()
 			defer part.mu.Unlock()
 			recordBPHSPartitionLockWait(time.Since(lockStart))
-			if !part.recordsDirty {
-				return
+			if part.vlogDirty {
+				syncStart := time.Now()
+				err := part.vlog.Sync()
+				recordBPHSVLogSync(time.Since(syncStart))
+				if err != nil {
+					results <- fmt.Errorf("sync partition %d vlog: %w", idx, err)
+					return
+				}
+				part.vlogDirty = false
 			}
-			syncStart := time.Now()
-			err := part.records.Sync()
-			recordBPHSRecordSync(time.Since(syncStart))
-			if err != nil {
-				results <- fmt.Errorf("sync partition %d records: %w", idx, err)
-				return
+			if part.recordsDirty {
+				syncStart := time.Now()
+				err := part.records.Sync()
+				recordBPHSRecordSync(time.Since(syncStart))
+				if err != nil {
+					results <- fmt.Errorf("sync partition %d records: %w", idx, err)
+					return
+				}
+				part.recordsDirty = false
 			}
-			part.recordsDirty = false
+			if version := indices[idx]; version > 0 {
+				if err := s.advancePartitionDurable(part, version); err != nil {
+					results <- fmt.Errorf("advance partition %d durable index: %w", idx, err)
+					return
+				}
+			}
 		}(idx)
 	}
 	wg.Wait()
@@ -1628,14 +1653,14 @@ func (s *bphsStore) recordSyncLoop() {
 	}
 }
 
-func (s *bphsStore) takePendingRecordSync() map[int]struct{} {
+func (s *bphsStore) takePendingRecordSync() map[int]uint32 {
 	s.recordSyncMu.Lock()
 	defer s.recordSyncMu.Unlock()
 	if len(s.recordSyncPending) == 0 {
 		return nil
 	}
 	out := s.recordSyncPending
-	s.recordSyncPending = make(map[int]struct{})
+	s.recordSyncPending = make(map[int]uint32)
 	return out
 }
 
@@ -1646,11 +1671,16 @@ func (s *bphsStore) queueRecordSync(indices map[int]struct{}) {
 	s.recordSyncMu.Lock()
 	deduped := 0
 	for idx := range indices {
-		if _, exists := s.recordSyncPending[idx]; exists {
+		version := s.parts[idx].pendingDurableVersion.Load()
+		if version == 0 {
 			deduped++
 			continue
 		}
-		s.recordSyncPending[idx] = struct{}{}
+		if old, exists := s.recordSyncPending[idx]; exists && old >= version {
+			deduped++
+			continue
+		}
+		s.recordSyncPending[idx] = version
 	}
 	s.recordSyncMu.Unlock()
 	recordBPHSRecordSyncQueued(len(indices), deduped)
@@ -1664,11 +1694,11 @@ func (s *bphsStore) checkpointSharedWAL() error {
 	if s.walMaxBytes <= 0 || s.wal.Size() < s.walMaxBytes {
 		return nil
 	}
-	all := make(map[int]struct{}, len(s.parts))
+	allVersions := make(map[int]uint32, len(s.parts))
 	for i := range s.parts {
-		all[i] = struct{}{}
+		allVersions[i] = s.parts[i].pendingDurableVersion.Load()
 	}
-	if err := s.syncRecordPartitions(all, s.syncConcurrency); err != nil {
+	if err := s.syncRecordPartitions(allVersions, s.syncConcurrency); err != nil {
 		return err
 	}
 	if err := s.wal.Reset(); err != nil {
@@ -1816,6 +1846,12 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 				}
 				recordBPHSRecordSync(time.Since(syncStart))
 				part.recordsDirty = false
+			}
+			if version := part.pendingDurableVersion.Load(); version > 0 {
+				if err := s.advancePartitionDurable(part, version); err != nil {
+					results <- syncResult{idx: idx, err: fmt.Errorf("advance partition %d durable index: %w", idx, err)}
+					return
+				}
 			}
 			results <- syncResult{idx: idx}
 		}(idx)
