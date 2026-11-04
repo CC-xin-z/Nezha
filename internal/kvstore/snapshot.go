@@ -85,6 +85,9 @@ type snapshotManifest struct {
 	NumGC      int             `json:"num_gc"`
 	SortedFile string          `json:"sorted_file"` // 分区组基名，文件名
 	Partitions []partitionMeta `json:"partitions"`
+	// LegacyPartitionsRetired means Partitions is metadata-only routing for
+	// BPHS local bases; no global partition files are included or installed.
+	LegacyPartitionsRetired bool `json:"legacy_partitions_retired,omitempty"`
 
 	CurrentLog      string                  `json:"current_log"`       // 当前日志的文件名
 	CurrentLogBytes int64                   `json:"current_log_bytes"` // 只取前这么多字节
@@ -163,6 +166,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		return nil, errSnapshotBusy
 	}
 	numGC, currentLog, sortedFile := kvs.numGC, kvs.currentLog, kvs.sortedFilePath
+	legacyPartitionsRetired := kvs.legacyPartitionsRetired
 	ps, releasePins := kvs.pinPartitionsLocked()
 	bphs := kvs.bphs
 	manifest := kvs.lastPartitions.manifest()
@@ -210,12 +214,34 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 		release()
 		return nil, fmt.Errorf("snapshot: store applied=%d is ahead of the log cut at %d", applied, cut.LastIndex)
 	}
+	if legacyPartitionsRetired && bphs == nil {
+		release()
+		return nil, fmt.Errorf("snapshot: legacy partitions are retired but BPHS is unavailable")
+	}
 	var bphsCut []bphsSnapshotPartition
 	if bphs != nil {
 		bphsCut, err = bphs.SnapshotCut(dir, applied)
 		if err != nil {
 			release()
 			return nil, fmt.Errorf("cut BPHS state: %w", err)
+		}
+		if legacyPartitionsRetired {
+			if len(bphsCut) != len(manifest) {
+				release()
+				return nil, fmt.Errorf(
+					"snapshot: metadata-only routing has %d partitions but BPHS cut has %d",
+					len(manifest), len(bphsCut),
+				)
+			}
+			for _, part := range bphsCut {
+				if part.BaseFile == "" {
+					release()
+					return nil, fmt.Errorf(
+						"snapshot: partition %d has no local BPHS base after legacy retirement",
+						part.Index,
+					)
+				}
+			}
 		}
 		kvs.mu.Lock()
 		changedAfterBPHS := kvs.gcInProgress || kvs.numGC != numGC || kvs.currentLog != currentLog
@@ -227,18 +253,19 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 
 	sm := snapshotManifest{
-		LastIncludedIndex: cut.BaseIndex,
-		LastIncludedTerm:  cut.BaseTerm,
-		AppliedIndex:      applied,
-		LastIndex:         cut.LastIndex,
-		LastTerm:          cut.LastTerm,
-		NumGC:             numGC,
-		SortedFile:        baseNameOrEmpty(sortedFile),
-		Partitions:        manifest,
-		CurrentLog:        filepath.Base(cut.Path),
-		CurrentLogBytes:   cut.Bytes,
-		BPHS:              bphsCut,
-		StoreRows:         rows,
+		LastIncludedIndex:       cut.BaseIndex,
+		LastIncludedTerm:        cut.BaseTerm,
+		AppliedIndex:            applied,
+		LastIndex:               cut.LastIndex,
+		LastTerm:                cut.LastTerm,
+		NumGC:                   numGC,
+		SortedFile:              baseNameOrEmpty(sortedFile),
+		Partitions:              manifest,
+		LegacyPartitionsRetired: legacyPartitionsRetired,
+		CurrentLog:              filepath.Base(cut.Path),
+		CurrentLogBytes:         cut.Bytes,
+		BPHS:                    bphsCut,
+		StoreRows:               rows,
 	}
 	if rows > 0 {
 		sm.StoreSST = snapshotStoreSSTName
@@ -261,13 +288,15 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 	// 当前日志只发前 cut.Bytes 字节——它正在被追加，超出切点的字节不属于这份快照。
 	files = append(files, raft.SSTableFile{Path: cut.Path, Limit: cut.Bytes})
-	for _, p := range ps.Paths() {
-		files = append(files, raft.SSTableFile{Path: p})
-		if idx := sparseIndexPath(p); fileExists(idx) {
-			// 旁挂索引可有可无（接收端读不到就扫描重建），但带上它能把安装时间从
-			// O(数据量) 变成 O(索引量)——实测 34 个分区 / 278MB，读索引 3.5ms，
-			// 扫描重建 266ms。
-			files = append(files, raft.SSTableFile{Path: idx})
+	if !legacyPartitionsRetired {
+		for _, p := range ps.Paths() {
+			files = append(files, raft.SSTableFile{Path: p})
+			if idx := sparseIndexPath(p); fileExists(idx) {
+				// 旁挂索引可有可无（接收端读不到就扫描重建），但带上它能把安装时间从
+				// O(数据量) 变成 O(索引量)——实测 34 个分区 / 278MB，读索引 3.5ms，
+				// 扫描重建 266ms。
+				files = append(files, raft.SSTableFile{Path: idx})
+			}
 		}
 	}
 	if bphs != nil {
@@ -449,6 +478,9 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	if err := os.MkdirAll(names.indexDir, 0o755); err != nil {
 		return fail("建索引目录: %v", err)
 	}
+	if sm.LegacyPartitionsRetired && (!kvs.bphsEnabled || len(sm.BPHS) == 0) {
+		return fail("快照 retired legacy partitions but BPHS data/config is unavailable")
+	}
 	if len(sm.BPHS) > 0 {
 		if err := os.RemoveAll(names.bphsDir); err != nil {
 			return fail("清理 BPHS 安装目录: %v", err)
@@ -520,17 +552,19 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	//    用 rename：收件目录就在 dataDir 下，同一个文件系统，原子且不拷字节。
 	metas := make([]partitionMeta, 0, len(sm.Partitions))
 	for i, m := range sm.Partitions {
-		dst := partitionPath(names.sortedBase, i)
-		if err := os.Rename(byName[m.Path], dst); err != nil {
-			return fail("分区 %s 落位: %v", m.Path, err)
-		}
-		if src, ok := byName[filepath.Base(sparseIndexPath(m.Path))]; ok {
-			if err := os.Rename(src, sparseIndexPath(dst)); err != nil {
-				// 索引可有可无：装载时读不到就扫描重建，只是慢。
-				util.EPrintf("[SNAPSHOT] 分区 %s 的旁挂索引落位失败（启动时会扫描重建）: %v", dst, err)
+		if !sm.LegacyPartitionsRetired {
+			dst := partitionPath(names.sortedBase, i)
+			if err := os.Rename(byName[m.Path], dst); err != nil {
+				return fail("分区 %s 落位: %v", m.Path, err)
 			}
+			if src, ok := byName[filepath.Base(sparseIndexPath(m.Path))]; ok {
+				if err := os.Rename(src, sparseIndexPath(dst)); err != nil {
+					// 索引可有可无：装载时读不到就扫描重建，只是慢。
+					util.EPrintf("[SNAPSHOT] 分区 %s 的旁挂索引落位失败（启动时会扫描重建）: %v", dst, err)
+				}
+			}
+			m.Path = filepath.Base(dst)
 		}
-		m.Path = filepath.Base(dst)
 		metas = append(metas, m)
 	}
 
@@ -570,7 +604,12 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	}
 
 	// 4) 重建分区组。放在写状态文件之前：装不起来就整份作废，本节点仍是原来的状态。
-	newParts, err := kvs.loadPartitionSet(names.sortedBase, metas)
+	var newParts *PartitionSet
+	if sm.LegacyPartitionsRetired {
+		newParts, err = partitionSetFromMetadata(metas)
+	} else {
+		newParts, err = kvs.loadPartitionSet(names.sortedBase, metas)
+	}
 	if err != nil {
 		store.Close()
 		return fail("装载快照的分区组: %v", err)
@@ -594,6 +633,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 	kvs.currentLog = names.logPath
 	kvs.numGC = sm.NumGC
 	kvs.lastAppliedIndex = sm.AppliedIndex
+	kvs.legacyPartitionsRetired = sm.LegacyPartitionsRetired
 	if len(metas) > 0 {
 		kvs.sortedFilePath = names.sortedBase
 		kvs.retirePartitions(newParts)

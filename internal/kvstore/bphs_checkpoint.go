@@ -122,6 +122,9 @@ func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
 				fmt.Printf("[BPHS-IDLE-COMPACT] partitions=%d elapsed=%v\n",
 					compacted, time.Since(start))
 			}
+			if _, err := kvs.maybeReclaimLegacyPartitions(); err != nil {
+				fmt.Printf("[BPHS-LEGACY] reclaim failed: %v\n", err)
+			}
 		}
 	}
 }

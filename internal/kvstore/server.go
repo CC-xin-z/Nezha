@@ -214,6 +214,10 @@ type KVServer struct {
 	recoveryOnce       sync.Once
 	lastClientActivity atomic.Int64
 	bphsDir            string
+	// legacyPartitionsRetired records that every BPHS partition has a local
+	// base and the activation-time global partition files may be omitted from
+	// recovery and snapshots. It is persisted in kv_state before deletion.
+	legacyPartitionsRetired bool
 }
 
 func (kv *KVServer) Kill() {

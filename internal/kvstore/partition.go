@@ -51,6 +51,11 @@ const partitionPoolSize = 8
 // 读路径靠它把一次查找路由到唯一（GET）或若干连续（SCAN）分区上。
 type PartitionSet struct {
 	parts []*SortedFileIndex
+	// metadataOnly marks a routing skeleton left after BPHS has materialized
+	// every partition locally and the activation-time global files were
+	// retired. Bounds and ownership ranges are still needed, but Paths must not
+	// expose files that no longer exist to snapshots or the partition reaper.
+	metadataOnly bool
 	// inline 是全集共享的一份内联缓存。不按分区切分是刻意的：分区数要写到最后才确定，没法预先
 	// 分摊预算；共享一份则总内存与改造前完全一致，读性能对照不会被"缓存容量变了"污染——而这正是
 	// P1 验收门槛所测的东西。每个分区的 InlineValues 都指向这同一个实例，getFromSortedFile
@@ -114,6 +119,9 @@ func (ps *PartitionSet) TotalSize() int64 {
 // Paths 按 key 序返回全部分区文件路径。
 func (ps *PartitionSet) Paths() []string {
 	if ps == nil {
+		return nil
+	}
+	if ps.metadataOnly {
 		return nil
 	}
 	out := make([]string, 0, len(ps.parts))
@@ -238,6 +246,49 @@ func (ps *PartitionSet) manifest() []partitionMeta {
 		})
 	}
 	return out
+}
+
+// partitionSetFromMetadata reconstructs routing and ownership bounds without
+// opening the old global partition files. Recovery and snapshots still need
+// these bounds after every BPHS partition has its own local base.
+func partitionSetFromMetadata(metas []partitionMeta) (*PartitionSet, error) {
+	if len(metas) == 0 {
+		return nil, fmt.Errorf("metadata-only partition set is empty")
+	}
+	ps := &PartitionSet{
+		parts:        make([]*SortedFileIndex, 0, len(metas)),
+		metadataOnly: true,
+	}
+	for i, m := range metas {
+		if m.Path == "" {
+			return nil, fmt.Errorf("metadata-only partition %d has no path name", i)
+		}
+		if n := len(ps.parts); n > 0 {
+			prev := ps.parts[n-1]
+			if m.Lo <= prev.Hi {
+				return nil, fmt.Errorf(
+					"metadata-only partition %s range [%q,%q] overlaps the previous [%q,%q]",
+					m.Path, m.Lo, m.Hi, prev.Lo, prev.Hi,
+				)
+			}
+		}
+		ps.parts = append(ps.parts, &SortedFileIndex{
+			FilePath: m.Path,
+			FileSize: m.Size,
+			Lo:       m.Lo,
+			Hi:       m.Hi,
+			Entries:  m.Entries,
+		})
+	}
+	ps.assignOwnershipRanges()
+	return ps, nil
+}
+
+func (ps *PartitionSet) metadataOnlyClone() (*PartitionSet, error) {
+	if ps == nil {
+		return nil, fmt.Errorf("cannot clone a nil partition set")
+	}
+	return partitionSetFromMetadata(ps.manifest())
 }
 
 // loadPartitionSet 按清单重建一组分区：边界取自清单，稀疏索引优先读旁挂文件。
@@ -689,6 +740,55 @@ func (kvs *KVServer) reapPartitions() int {
 		fmt.Printf("[GC] %d 个退役分区组仍被引用（快照传输中），它们的文件暂不删除\n", len(stillHeld))
 	}
 	return removed
+}
+
+// maybeReclaimLegacyPartitions switches state to metadata-only routing and
+// removes the activation-time global partition files once every BPHS partition
+// has a durable local base. State is persisted before any unlink, so a crash can
+// leave stale files but can never leave state pointing at deleted recovery data.
+func (kvs *KVServer) maybeReclaimLegacyPartitions() (int, error) {
+	kvs.mu.Lock()
+	if kvs.legacyPartitionsRetired || kvs.installing || kvs.gcActive || kvs.gcInProgress ||
+		kvs.bphs == nil || kvs.lastPartitions == nil {
+		kvs.mu.Unlock()
+		return 0, nil
+	}
+	store, current := kvs.bphs, kvs.lastPartitions
+	kvs.mu.Unlock()
+
+	if !store.CoversLegacy() || !store.AllPartitionsMaterialized() {
+		return 0, nil
+	}
+	metadata, err := current.metadataOnlyClone()
+	if err != nil {
+		return 0, err
+	}
+
+	kvs.mu.Lock()
+	if kvs.legacyPartitionsRetired || kvs.installing || kvs.gcActive || kvs.gcInProgress ||
+		kvs.bphs != store || kvs.lastPartitions != current {
+		kvs.mu.Unlock()
+		return 0, nil
+	}
+	kvs.legacyPartitionsRetired = true
+	kvs.retirePartitions(metadata)
+	if kvs.firstPartitions == current {
+		kvs.firstPartitions = metadata
+	}
+	if kvs.anotherPartitions == current {
+		kvs.anotherPartitions = metadata
+	}
+	kvs.saveKVState()
+	kvs.mu.Unlock()
+
+	// Routing only needs ownership bounds now. The local per-partition bases
+	// remain the authoritative read source.
+	store.UseOwnershipMetadata(metadata)
+	removed := kvs.reapPartitions()
+	if removed > 0 {
+		fmt.Printf("[BPHS-LEGACY] state switched to metadata-only routing; removed %d global partition files\n", removed)
+	}
+	return removed, nil
 }
 
 // lastKeyFrom 从 from 扫到 size，返回最后一条记录的 key。

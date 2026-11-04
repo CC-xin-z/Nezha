@@ -213,6 +213,13 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 				localBaseLoaded = true
 			}
 		}
+		if base.metadataOnly && !localBaseLoaded {
+			s.Close()
+			return nil, fmt.Errorf(
+				"partition %d uses metadata-only recovery but has no local BPHS base",
+				i,
+			)
+		}
 		records, err := openPartitionRecordLog(filepath.Join(dir, fmt.Sprintf("p%06d.records", i)))
 		if err != nil {
 			if localBaseLoaded {
@@ -593,6 +600,56 @@ func (s *bphsStore) SetBase(base *PartitionSet) error {
 		part.base = base.parts[i]
 	}
 	return nil
+}
+
+// UseOwnershipMetadata replaces the activation-time partition object with a
+// metadata-only routing skeleton after every local BPHS base is durable.
+func (s *bphsStore) UseOwnershipMetadata(base *PartitionSet) {
+	if s == nil || base == nil {
+		return
+	}
+	s.mu.Lock()
+	s.base = base
+	s.basePtr.Store(base)
+	s.mu.Unlock()
+}
+
+// AllPartitionsMaterialized reports whether every BPHS partition has a local
+// base and no compaction is in flight. Only then can the global partition files
+// from activation be retired without making recovery depend on them.
+func (s *bphsStore) AllPartitionsMaterialized() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	parts := append([]*bphsPartition(nil), s.parts...)
+	s.mu.RUnlock()
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		part.mu.RLock()
+		ok := part.baseLocal && part.base != nil && !part.compacting
+		path, size := "", int64(0)
+		if part.base != nil {
+			path = part.base.FilePath
+			size = part.base.FileSize
+		}
+		index := part.index
+		part.mu.RUnlock()
+		if !ok {
+			return false
+		}
+		if st, err := os.Stat(path); err != nil || st.IsDir() || st.Size() != size {
+			return false
+		}
+		meta, hasMeta, err := loadBPHSPartitionManifest(s.dir, index)
+		if err != nil || !hasMeta || meta.BaseFile == "" ||
+			meta.BaseSize != size || filepath.Base(path) != meta.BaseFile {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *bphsStore) route(paddedKey string) (*bphsPartition, error) {

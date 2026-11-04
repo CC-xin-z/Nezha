@@ -29,6 +29,10 @@ type kvState struct {
 	OldLog       string          `json:"old_log"` // the next two are meaningful only while GCInProgress
 	OldDB        string          `json:"old_db"`
 	BPHSDir      string          `json:"bphs_dir,omitempty"`
+	// LegacyPartitionsRetired means the activation-time global partition files
+	// are no longer required. The Partitions list is retained as metadata-only
+	// routing information; every BPHS partition must recover from its local base.
+	LegacyPartitionsRetired bool `json:"legacy_partitions_retired,omitempty"`
 }
 
 func (kvs *KVServer) stateFilePath() string {
@@ -55,6 +59,7 @@ func (kvs *KVServer) saveKVState() {
 			st.BPHSDir = rel
 		}
 	}
+	st.LegacyPartitionsRetired = kvs.legacyPartitionsRetired
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		panic(fmt.Sprintf("marshal kv state: %v", err))
@@ -287,6 +292,10 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 			log.Fatalf("[RECOVER] BPHS directory named by state is unavailable: %v", err)
 		}
 	}
+	if st.LegacyPartitionsRetired &&
+		(st.BPHSDir == "" || st.SortedFile == "" || len(st.Partitions) == 0) {
+		log.Fatalf("[RECOVER] legacy partitions are retired but BPHS/routing metadata is incomplete")
+	}
 	if _, err := kvs.persister.Init(st.CurrentDB, true); err != nil {
 		log.Fatalf("[RECOVER] open current RocksDB %s: %v", st.CurrentDB, err)
 	}
@@ -298,11 +307,18 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 	// Completed GC rounds: rebuild the partition set and set the read-path flags to the
 	// "GC completed" position. 边界取自清单，稀疏索引仍要扫每个分区重建。
 	if st.SortedFile != "" {
-		parts, err := kvs.loadPartitionSet(st.SortedFile, st.Partitions)
+		var parts *PartitionSet
+		var err error
+		if st.LegacyPartitionsRetired {
+			parts, err = partitionSetFromMetadata(st.Partitions)
+		} else {
+			parts, err = kvs.loadPartitionSet(st.SortedFile, st.Partitions)
+		}
 		if err != nil {
 			log.Fatalf("[RECOVER] rebuild partition set for %s: %v", st.SortedFile, err)
 		}
 		kvs.lastPartitions = parts
+		kvs.legacyPartitionsRetired = st.LegacyPartitionsRetired
 		switch {
 		case st.NumGC >= 2 && !(st.GCInProgress && st.NumGC == 2):
 			// round two completed
@@ -319,6 +335,12 @@ func (kvs *KVServer) recoverOrInit(initialDB string) (files []raft.LogFile, appl
 		kvs.lastGCFinish = true
 		if err := kvs.enableOrUpdateBPHS(kvs.lastPartitions); err != nil {
 			log.Fatalf("[RECOVER] enable BPHS: %v", err)
+		}
+		if st.LegacyPartitionsRetired {
+			if err := removePartitionFiles(st.SortedFile); err != nil {
+				log.Fatalf("[RECOVER] remove retired legacy partition files: %v", err)
+			}
+			log.Printf("[RECOVER] legacy partition files already retired for %s", st.SortedFile)
 		}
 		fmt.Printf("[RECOVER] partition set rebuilt: %s (%d partitions, %d bytes)\n",
 			st.SortedFile, parts.Len(), parts.TotalSize())
