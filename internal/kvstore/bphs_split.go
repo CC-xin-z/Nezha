@@ -276,6 +276,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	if part.mem.Len() != 0 || len(part.l0) != 0 || part.records.Size() != 0 || part.vlog.Size() != 0 {
 		return fmt.Errorf("partition %d is not idle enough to split", parentID)
 	}
+	parentOwnershipHi := part.ownershipHi
 	bounds, err := scanBPHSSplitBounds(part.base.FilePath, part, splitKey)
 	if err != nil {
 		return err
@@ -323,7 +324,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		return err
 	}
 	childBase.Lo, childBase.Hi = bounds.rightLo, bounds.rightHi
-	childBase.OwnershipLo, childBase.OwnershipHi = splitKey, part.ownershipHi
+	childBase.OwnershipLo, childBase.OwnershipHi = splitKey, parentOwnershipHi
 	childBase.InlineValues = s.inline
 	s.retainBase(childBase.FilePath)
 
@@ -337,7 +338,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		gen:          parentMeta.Generation,
 		logicalBytes: bounds.rightBytes,
 		ownershipLo:  splitKey,
-		ownershipHi:  part.ownershipHi,
+		ownershipHi:  parentOwnershipHi,
 	}
 	child.durableIndex.Store(commandIndex)
 	child.pendingDurableVersion.Store(commandIndex)
@@ -378,10 +379,13 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	parentRoute.Size = part.base.FileSize
 	parentRoute.Entries = bounds.leftEntries
 	parentRoute.BPHSID = parentID
+	parentRoute.OwnershipHi = splitKey
 	childRoute := parentRoute
 	childRoute.Lo, childRoute.Hi = bounds.rightLo, bounds.rightHi
 	childRoute.Entries = bounds.rightEntries
 	childRoute.BPHSID = newID
+	childRoute.OwnershipLo = splitKey
+	childRoute.OwnershipHi = parentOwnershipHi
 	metas = append(metas, partitionMeta{})
 	copy(metas[pos+2:], metas[pos+1:])
 	metas[pos] = parentRoute

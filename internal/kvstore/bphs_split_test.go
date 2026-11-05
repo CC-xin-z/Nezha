@@ -29,6 +29,9 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	basePath := filepath.Join(valuelogDir, "RaftState_sorted_1.p0")
 	records := make([]bphsRecord, 0, 10)
 	for i := 1; i <= 10; i++ {
+		if i == 6 {
+			continue
+		}
 		records = append(records, bphsRecord{
 			Key:     fmt.Sprintf("%010d", i),
 			Version: uint32(i),
@@ -91,17 +94,37 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	if value, found, err := store.Get("0000000005"); err != nil || !found || value != "value-updated" {
 		t.Fatalf("GET after split = %q,%v,%v", value, found, err)
 	}
+	if childID, err := store.Put("0000000006", "gap-value", 13); err != nil || childID != 1 {
+		t.Fatalf("PUT in split gap routed to %d, err=%v", childID, err)
+	}
 	if got, err := store.Scan("0000000001", "0000000010"); err != nil || len(got) != 10 {
 		t.Fatalf("SCAN after split returned %d rows, err=%v", len(got), err)
+	}
+	meta := kvs.lastPartitions.manifest()
+	if meta[0].OwnershipHi != "0000000006" || meta[1].OwnershipLo != "0000000006" {
+		t.Fatalf("split boundaries not persisted: left.hi=%q right.lo=%q",
+			meta[0].OwnershipHi, meta[1].OwnershipLo)
 	}
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	globalBase.closePool()
-	reopenSet, err := partitionSetFromMetadata(kvs.lastPartitions.manifest())
+	persisted, ok, err := loadKVState(kvs.stateFilePath())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !ok || len(persisted.Partitions) != 2 {
+		t.Fatalf("persisted split state: ok=%v partitions=%d", ok, len(persisted.Partitions))
+	}
+	reopenSet, err := partitionSetFromMetadata(persisted.Partitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopenSet.parts[0].OwnershipHi != "0000000006" ||
+		reopenSet.parts[1].OwnershipLo != "0000000006" {
+		t.Fatalf("split boundaries not restored: left.hi=%q right.lo=%q",
+			reopenSet.parts[0].OwnershipHi, reopenSet.parts[1].OwnershipLo)
 	}
 	reopened, err := openBPHSStore(kvs, reopenSet, filepath.Join(dataDir, "data", "bphs"), 1<<20, 0, 0)
 	if err != nil {
@@ -110,5 +133,8 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	defer reopened.Close()
 	if value, found, err := reopened.Get("0000000010"); err != nil || !found || value != "value-10" {
 		t.Fatalf("GET after split recovery = %q,%v,%v", value, found, err)
+	}
+	if value, found, err := reopened.Get("0000000006"); err != nil || !found || value != "gap-value" {
+		t.Fatalf("GET split-gap key after recovery = %q,%v,%v", value, found, err)
 	}
 }

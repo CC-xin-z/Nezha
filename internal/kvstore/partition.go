@@ -245,6 +245,11 @@ type partitionMeta struct {
 	// BPHSID is the stable storage identity. Old state files omit it and fall
 	// back to the sorted ordinal.
 	BPHSID int `json:"bphs_id,omitempty"`
+	// Ownership bounds are the write-routing range [Lo, Hi). Empty strings
+	// mean negative/positive infinity. They cannot be rebuilt from Lo/Hi after
+	// a dynamic split because the split boundary may sit in a key gap.
+	OwnershipLo string `json:"ownership_lo,omitempty"`
+	OwnershipHi string `json:"ownership_hi,omitempty"`
 }
 
 func (ps *PartitionSet) manifest() []partitionMeta {
@@ -256,9 +261,61 @@ func (ps *PartitionSet) manifest() []partitionMeta {
 		out = append(out, partitionMeta{
 			Path: filepath.Base(p.FilePath), Lo: p.Lo, Hi: p.Hi, Size: p.FileSize,
 			Entries: p.Entries, BPHSID: ps.partitionID(i),
+			OwnershipLo: p.OwnershipLo, OwnershipHi: p.OwnershipHi,
 		})
 	}
 	return out
+}
+
+// applyOwnershipMetadata restores persisted write-routing bounds. Older
+// manifests have neither field and fall back to the static prefix layout.
+// Explicit bounds must remain contiguous and cover every partition's actual
+// data range, otherwise writes and reads could route to different partitions.
+func applyOwnershipMetadata(ps *PartitionSet, metas []partitionMeta) error {
+	if ps == nil || len(ps.parts) != len(metas) {
+		return fmt.Errorf("partition ownership metadata length mismatch")
+	}
+	explicit := false
+	for _, m := range metas {
+		if m.OwnershipLo != "" || m.OwnershipHi != "" {
+			explicit = true
+			break
+		}
+	}
+	if !explicit {
+		ps.assignOwnershipRanges()
+		return nil
+	}
+	for i, p := range ps.parts {
+		p.OwnershipLo = metas[i].OwnershipLo
+		p.OwnershipHi = metas[i].OwnershipHi
+	}
+	for i, p := range ps.parts {
+		if i == 0 && p.OwnershipLo != "" {
+			return fmt.Errorf("partition %d has bounded ownership below the first range: %q",
+				i, p.OwnershipLo)
+		}
+		if i+1 < len(ps.parts) {
+			if p.OwnershipHi == "" {
+				return fmt.Errorf("partition %d has no ownership upper bound", i)
+			}
+			if p.OwnershipHi != ps.parts[i+1].OwnershipLo {
+				return fmt.Errorf("partition %d ownership ends at %q, partition %d starts at %q",
+					i, p.OwnershipHi, i+1, ps.parts[i+1].OwnershipLo)
+			}
+		} else if p.OwnershipHi != "" {
+			return fmt.Errorf("last partition has bounded ownership: %q", p.OwnershipHi)
+		}
+		if p.OwnershipLo != "" && p.Lo < p.OwnershipLo {
+			return fmt.Errorf("partition %d data starts at %q below ownership %q",
+				i, p.Lo, p.OwnershipLo)
+		}
+		if p.OwnershipHi != "" && p.Hi >= p.OwnershipHi {
+			return fmt.Errorf("partition %d data ends at %q outside ownership upper bound %q",
+				i, p.Hi, p.OwnershipHi)
+		}
+	}
+	return nil
 }
 
 func partitionIDsFromMetadata(metas []partitionMeta) ([]int, error) {
@@ -326,7 +383,10 @@ func partitionSetFromMetadata(metas []partitionMeta) (*PartitionSet, error) {
 			Entries:  m.Entries,
 		})
 	}
-	ps.assignOwnershipRanges()
+	if err := applyOwnershipMetadata(ps, metas); err != nil {
+		ps.Close()
+		return nil, err
+	}
 	return ps, nil
 }
 
@@ -446,7 +506,10 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			Entries:      m.Entries,
 		})
 	}
-	ps.assignOwnershipRanges()
+	if err := applyOwnershipMetadata(ps, metas); err != nil {
+		ps.Close()
+		return nil, err
+	}
 	return ps, nil
 }
 
