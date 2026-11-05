@@ -200,6 +200,43 @@ func TestBPHSStoreSyncConcurrencyDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestBPHSStoreRoutesThroughStablePartitionIDs(t *testing.T) {
+	dir := t.TempDir()
+	kvs := newTestServer(4096)
+	basePath := filepath.Join(dir, "RaftState_sorted_1")
+	base := writeEntries(t, kvs, basePath, 200, 100)
+	if base.Len() < 2 {
+		t.Fatalf("test requires multiple partitions, got %d", base.Len())
+	}
+	for i := range base.ids {
+		base.ids[i] = (i + 1) % base.Len()
+	}
+
+	store, err := openBPHSStore(kvs, base, filepath.Join(dir, "bphs"), 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	defer store.Close()
+
+	key := fmt.Sprintf("%010d", 7)
+	_, sortedPos, ok := base.findOwned(key)
+	if !ok {
+		t.Fatalf("base does not own key %q", key)
+	}
+	wantID := base.partitionID(sortedPos)
+	part, err := store.route(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if part.index != wantID {
+		t.Fatalf("route returned partition %d, want stable ID %d", part.index, wantID)
+	}
+	if store.parts[wantID] != part {
+		t.Fatal("storage slot does not match routed stable partition ID")
+	}
+}
+
 func TestBPHSSyncPartitionsFastUsesSharedWALAndBackgroundRecords(t *testing.T) {
 	kvs := &KVServer{
 		persister:           &raft.Persister{},

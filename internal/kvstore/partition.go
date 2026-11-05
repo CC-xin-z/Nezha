@@ -51,6 +51,9 @@ const partitionPoolSize = 8
 // 读路径靠它把一次查找路由到唯一（GET）或若干连续（SCAN）分区上。
 type PartitionSet struct {
 	parts []*SortedFileIndex
+	// ids maps sorted ownership ranges to stable BPHS storage identities.
+	// Dynamic split can insert a range without renaming existing partitions.
+	ids []int
 	// metadataOnly marks a routing skeleton left after BPHS has materialized
 	// every partition locally and the activation-time global files were
 	// retired. Bounds and ownership ranges are still needed, but Paths must not
@@ -65,6 +68,13 @@ type PartitionSet struct {
 	// refs 是长期读者（今天只有快照传输）持有的引用数。见本文件末尾"生命周期"一节：
 	// 引用未归零的分区组，它的文件一个都不能删。
 	refs atomic.Int32
+}
+
+func (ps *PartitionSet) partitionID(index int) int {
+	if ps != nil && index >= 0 && index < len(ps.ids) {
+		return ps.ids[index]
+	}
+	return index
 }
 
 // assignOwnershipRanges 为静态分区建立写入所有权区间。
@@ -232,6 +242,9 @@ type partitionMeta struct {
 	Size int64  `json:"size"`
 	// Entries 是记录条数，纯观测：清单是回看一组分区长什么样的唯一入口。
 	Entries int `json:"entries"`
+	// BPHSID is the stable storage identity. Old state files omit it and fall
+	// back to the sorted ordinal.
+	BPHSID int `json:"bphs_id,omitempty"`
 }
 
 func (ps *PartitionSet) manifest() []partitionMeta {
@@ -239,13 +252,41 @@ func (ps *PartitionSet) manifest() []partitionMeta {
 		return nil
 	}
 	out := make([]partitionMeta, 0, len(ps.parts))
-	for _, p := range ps.parts {
+	for i, p := range ps.parts {
 		out = append(out, partitionMeta{
 			Path: filepath.Base(p.FilePath), Lo: p.Lo, Hi: p.Hi, Size: p.FileSize,
-			Entries: p.Entries,
+			Entries: p.Entries, BPHSID: ps.partitionID(i),
 		})
 	}
 	return out
+}
+
+func partitionIDsFromMetadata(metas []partitionMeta) ([]int, error) {
+	ids := make([]int, len(metas))
+	allZero := true
+	for i, meta := range metas {
+		ids[i] = meta.BPHSID
+		if meta.BPHSID != 0 {
+			allZero = false
+		}
+	}
+	if allZero {
+		for i := range ids {
+			ids[i] = i
+		}
+		return ids, nil
+	}
+	seen := make(map[int]struct{}, len(ids))
+	for i, id := range ids {
+		if id < 0 || id >= len(ids) {
+			return nil, fmt.Errorf("partition %d has invalid BPHSID %d", i, id)
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("duplicate BPHSID %d in partition metadata", id)
+		}
+		seen[id] = struct{}{}
+	}
+	return ids, nil
 }
 
 // partitionSetFromMetadata reconstructs routing and ownership bounds without
@@ -259,6 +300,11 @@ func partitionSetFromMetadata(metas []partitionMeta) (*PartitionSet, error) {
 		parts:        make([]*SortedFileIndex, 0, len(metas)),
 		metadataOnly: true,
 	}
+	ids, err := partitionIDsFromMetadata(metas)
+	if err != nil {
+		return nil, err
+	}
+	ps.ids = ids
 	for i, m := range metas {
 		if m.Path == "" {
 			return nil, fmt.Errorf("metadata-only partition %d has no path name", i)
@@ -308,6 +354,11 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			len(metas), bytesTotal, time.Since(t0), loaded, scanned)
 	}()
 	ps := &PartitionSet{base: base, inline: NewInlineCache(kvs.inlineCacheBytes)}
+	ids, err := partitionIDsFromMetadata(metas)
+	if err != nil {
+		return nil, err
+	}
+	ps.ids = ids
 	// 清单里只有文件名，按当前数据目录解析——旧清单存的是绝对路径，取 Base 一样能用，
 	// 而且正好把"指向别处"这件事一并修掉。
 	dir := filepath.Dir(base)
@@ -628,6 +679,10 @@ func (pw *partitionWriter) Finish() (*PartitionSet, error) {
 		return nil, err
 	}
 	ps := &PartitionSet{parts: pw.done, inline: pw.inline, base: pw.base}
+	ps.ids = make([]int, len(ps.parts))
+	for i := range ps.ids {
+		ps.ids[i] = i
+	}
 	ps.assignOwnershipRanges()
 	return ps, nil
 }

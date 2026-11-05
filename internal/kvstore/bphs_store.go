@@ -177,6 +177,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		compactStop:               make(chan struct{}),
 	}
 	s.basePtr.Store(base)
+	s.parts = make([]*bphsPartition, base.Len())
 	durableState, hasDurable, err := readBPHSDurableState(dir)
 	if err != nil {
 		wal.Close()
@@ -190,11 +191,16 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	s.compactWG.Add(1)
 	go s.compactLoop()
 	coveredVersions := make([]uint32, len(base.parts))
-	for i, basePart := range base.parts {
-		meta, hasMeta, err := loadBPHSPartitionManifest(dir, i)
+	for pos, basePart := range base.parts {
+		partitionID := base.partitionID(pos)
+		if partitionID < 0 || partitionID >= len(s.parts) || s.parts[partitionID] != nil {
+			s.Close()
+			return nil, fmt.Errorf("invalid or duplicate BPHS partition id %d at sorted position %d", partitionID, pos)
+		}
+		meta, hasMeta, err := loadBPHSPartitionManifest(dir, partitionID)
 		if err != nil {
 			s.Close()
-			return nil, fmt.Errorf("load partition %d BPHS manifest: %w", i, err)
+			return nil, fmt.Errorf("load partition %d BPHS manifest: %w", partitionID, err)
 		}
 		localBase := basePart
 		localBaseLoaded := false
@@ -207,7 +213,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 				localBase, err = loadBPHSBaseFile(kvs, dir, meta, inlineCacheBytes)
 				if err != nil {
 					s.Close()
-					return nil, fmt.Errorf("load partition %d BPHS base: %w", i, err)
+					return nil, fmt.Errorf("load partition %d BPHS base: %w", partitionID, err)
 				}
 				localBase.InlineValues = inline
 				localBaseLoaded = true
@@ -217,28 +223,28 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			s.Close()
 			return nil, fmt.Errorf(
 				"partition %d uses metadata-only recovery but has no local BPHS base",
-				i,
+				partitionID,
 			)
 		}
-		records, err := openPartitionRecordLog(filepath.Join(dir, fmt.Sprintf("p%06d.records", i)))
+		records, err := openPartitionRecordLog(filepath.Join(dir, fmt.Sprintf("p%06d.records", partitionID)))
 		if err != nil {
 			if localBaseLoaded {
 				localBase.closePool()
 			}
 			s.Close()
-			return nil, fmt.Errorf("open partition %d record log: %w", i, err)
+			return nil, fmt.Errorf("open partition %d record log: %w", partitionID, err)
 		}
-		vlog, err := openPartitionVLog(filepath.Join(dir, fmt.Sprintf("p%06d.vlog", i)))
+		vlog, err := openPartitionVLog(filepath.Join(dir, fmt.Sprintf("p%06d.vlog", partitionID)))
 		if err != nil {
 			records.Close()
 			if localBaseLoaded {
 				localBase.closePool()
 			}
 			s.Close()
-			return nil, fmt.Errorf("open partition %d vlog: %w", i, err)
+			return nil, fmt.Errorf("open partition %d vlog: %w", partitionID, err)
 		}
 		part := &bphsPartition{
-			index:     i,
+			index:     partitionID,
 			base:      localBase,
 			baseLocal: localBaseLoaded,
 			mem:       newPartitionMemtable(memtableBytes),
@@ -246,7 +252,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			vlog:      vlog,
 			gen:       gen,
 		}
-		l0, err := loadPartitionL0Files(kvs, dir, i, inlineCacheBytes)
+		l0, err := loadPartitionL0Files(kvs, dir, partitionID, inlineCacheBytes)
 		if err != nil {
 			records.Close()
 			vlog.Close()
@@ -254,7 +260,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 				localBase.closePool()
 			}
 			s.Close()
-			return nil, fmt.Errorf("load partition %d L0: %w", i, err)
+			return nil, fmt.Errorf("load partition %d L0: %w", partitionID, err)
 		}
 		for _, loaded := range l0 {
 			if localBaseLoaded && loaded.maxVersion <= maxCoveredVersion {
@@ -281,13 +287,13 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 					localBase.closePool()
 				}
 				s.Close()
-				return nil, fmt.Errorf("replay partition %d records: %w", i, err)
+				return nil, fmt.Errorf("replay partition %d records: %w", partitionID, err)
 			}
 			// records are synced asynchronously in the fast path. A crash can
 			// leave a torn tail there while the shared WAL holds the complete
 			// durable batch; replay every complete prefix record and let the WAL
 			// cover the rest.
-			fmt.Printf("[RECOVER] partition %d record tail ignored; shared WAL will replay it: %v\n", i, err)
+			fmt.Printf("[RECOVER] partition %d record tail ignored; shared WAL will replay it: %v\n", partitionID, err)
 		}
 		for _, rec := range replayed {
 			if rec.Version <= maxCoveredVersion {
@@ -300,11 +306,17 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		}
 		durableVersion := maxCoveredVersion
 		if hasDurable {
-			durableVersion = durableState.Partitions[i]
+			durableVersion = durableState.Partitions[partitionID]
 		}
 		part.durableIndex.Store(durableVersion)
-		coveredVersions[i] = maxCoveredVersion
-		s.parts = append(s.parts, part)
+		coveredVersions[partitionID] = maxCoveredVersion
+		s.parts[partitionID] = part
+	}
+	for i, part := range s.parts {
+		if part == nil {
+			s.Close()
+			return nil, fmt.Errorf("missing BPHS partition %d after recovery", i)
+		}
 	}
 	if hasDurable {
 		s.durableIndex = durableState.DurableIndex
@@ -596,8 +608,8 @@ func (s *bphsStore) SetBase(base *PartitionSet) error {
 	}
 	s.base = base
 	s.basePtr.Store(base)
-	for i, part := range s.parts {
-		part.base = base.parts[i]
+	for pos := range base.parts {
+		s.parts[base.partitionID(pos)].base = base.parts[pos]
 	}
 	return nil
 }
@@ -661,7 +673,7 @@ func (s *bphsStore) route(paddedKey string) (*bphsPartition, error) {
 	if !ok || idx < 0 || idx >= len(s.parts) {
 		return nil, fmt.Errorf("no BPHS partition owns key %q", paddedKey)
 	}
-	return s.parts[idx], nil
+	return s.parts[base.partitionID(idx)], nil
 }
 
 func (s *bphsStore) Dir() string {
@@ -1493,7 +1505,7 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		recordBPHSScan(max(last-first, 0), l0Runs)
 	}()
 	for i := first; i < last; i++ {
-		part := s.parts[i]
+		part := s.parts[base.partitionID(i)]
 		part.mu.RLock()
 
 		if len(part.l0) == 0 {
@@ -2150,6 +2162,9 @@ func (s *bphsStore) Close() error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, part := range s.parts {
+			if part == nil {
+				continue
+			}
 			part.mu.Lock()
 			if err := part.records.Close(); err != nil && first == nil {
 				first = err

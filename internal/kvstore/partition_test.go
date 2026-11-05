@@ -348,6 +348,40 @@ func TestPartitionManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPartitionManifestPreservesStableBPHSIDs(t *testing.T) {
+	dir := t.TempDir()
+	kvs := newTestServer(4096)
+	base := filepath.Join(dir, "sorted_1")
+
+	ps := writeEntries(t, kvs, base, 200, 100)
+	metas := ps.manifest()
+	ps.Close()
+	if len(metas) < 2 {
+		t.Fatalf("前置条件不成立：应有多个分区，实际 %d", len(metas))
+	}
+
+	// Shift IDs so sorted position and storage identity are deliberately not
+	// equal. Dynamic split relies on this mapping remaining stable.
+	for i := range metas {
+		metas[i].BPHSID = (i + 1) % len(metas)
+	}
+	reloaded, err := kvs.loadPartitionSet(base, metas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	for i, meta := range metas {
+		if got := reloaded.partitionID(i); got != meta.BPHSID {
+			t.Fatalf("partition id at sorted position %d = %d, want %d", i, got, meta.BPHSID)
+		}
+	}
+	for i, meta := range reloaded.manifest() {
+		if meta.BPHSID != metas[i].BPHSID {
+			t.Fatalf("manifest position %d lost BPHSID: got %d want %d", i, meta.BPHSID, metas[i].BPHSID)
+		}
+	}
+}
+
 // 数据目录整体搬到别处之后，必须读新位置的文件。
 //
 // 清单曾存绝对路径：把数据目录复制到 B 再以 -data B 启动，节点打开的是原目录 A 里的
