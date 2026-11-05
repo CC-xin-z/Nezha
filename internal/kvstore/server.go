@@ -204,6 +204,7 @@ type KVServer struct {
 	bphsLogCheckpointBytes        int64
 	bphsWALBytes                  int64
 	bphsPartitionGCThresholdBytes int64
+	bphsDynamicSplit              bool
 
 	// recoveryTarget is the last Raft index that must be materialized by the KV
 	// layer before this restarted Raft-WAL node starts accepting clients.
@@ -214,6 +215,10 @@ type KVServer struct {
 	recoveryOnce       sync.Once
 	lastClientActivity atomic.Int64
 	bphsDir            string
+	// bphsLayoutVersion changes when a dynamic split is installed. Snapshot
+	// creation rechecks it after cutting BPHS files.
+	bphsLayoutVersion uint64
+	lastSplitProposal time.Time
 	// legacyPartitionsRetired records that every BPHS partition has a local
 	// base and the activation-time global partition files may be omitted from
 	// recovery and snapshots. It is persisted in kv_state before deletion.
@@ -362,6 +367,7 @@ func New(cfg Config) (*KVServer, error) {
 		bphsLogCheckpointBytes:        int64(cfg.BPHSLogCheckpointMB) << 20,
 		bphsWALBytes:                  int64(cfg.BPHSWALMB) << 20,
 		bphsPartitionGCThresholdBytes: int64(cfg.BPHSPartitionGCThresholdMB) << 20,
+		bphsDynamicSplit:              cfg.BPHSDynamicSplit,
 	}
 	// PASV switches off the storage engine's WAL. RocksDB reads that option once, when
 	// the store is opened, so it must be set before recoverOrInit.
@@ -408,14 +414,15 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d tailRoute=%v bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d tailRoute=%v bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d bphsDynamicSplit=%v\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
 		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.TailRoute, cfg.BPHS,
 		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsRecordSyncConcurrency,
 		kvs.bphsRaftLogWAL, kvs.bphsLogCheckpointBytes>>20, kvs.bphsWALBytes>>20,
 		kvs.bphsPartitionGCThresholdBytes>>20,
-		kvs.partitionTargetBytes>>20)
+		kvs.partitionTargetBytes>>20,
+		kvs.bphsDynamicSplit)
 
 	// A fresh node opens the initial store; a restarted node restores GC state, the
 	// sorted-file index and the applied index, and returns the log files Raft must replay.
@@ -540,6 +547,9 @@ func (kvs *KVServer) Run(ctx context.Context) {
 	}
 	go kvs.bphsIdleCompactionLoop(ctx)
 	go kvs.bphsLogCheckpointLoop(ctx)
+	if kvs.bphsDynamicSplit {
+		go kvs.bphsSplitLoop(ctx)
+	}
 	go kvs.gcLoop(ctx)
 	go kvs.RegisterKVServer(ctx, kvs.address)
 	if resumeGC {

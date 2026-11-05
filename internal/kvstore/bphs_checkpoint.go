@@ -125,6 +125,9 @@ func (kvs *KVServer) bphsIdleCompactionLoop(ctx context.Context) {
 			if _, err := kvs.maybeReclaimLegacyPartitions(); err != nil {
 				fmt.Printf("[BPHS-LEGACY] reclaim failed: %v\n", err)
 			}
+			if removed := kvs.reapPartitions(); removed > 0 {
+				fmt.Printf("[BPHS-LEGACY] removed %d retired partition files\n", removed)
+			}
 		}
 	}
 }

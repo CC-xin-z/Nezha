@@ -158,6 +158,9 @@ type Config struct {
 	// combined VLog + L0 + MemTable delta. Large BlobRecords barely increase L0
 	// size, so using L0 alone would never reclaim a growing partition VLog.
 	BPHSPartitionGCThresholdMB int
+	// BPHSDynamicSplit enables Raft-replicated logical split when an idle local
+	// partition exceeds twice the configured partition target.
+	BPHSDynamicSplit bool
 
 	// LSM-Raft baseline (lsmraft.go): span size and idle cut.
 	SSTSpanMB int

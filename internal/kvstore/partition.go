@@ -846,6 +846,36 @@ func (kvs *KVServer) maybeReclaimLegacyPartitions() (int, error) {
 	return removed, nil
 }
 
+// reclaimLegacyPartitionsLocked is the split preparation path: the caller holds
+// kvs.mu for the whole Raft apply entry. It persists the metadata-only routing
+// but leaves physical unlink to the normal reaper, which cannot run under
+// kvs.mu.
+func (kvs *KVServer) reclaimLegacyPartitionsLocked() (bool, error) {
+	if kvs.legacyPartitionsRetired || kvs.installing || kvs.gcActive || kvs.gcInProgress ||
+		kvs.bphs == nil || kvs.lastPartitions == nil {
+		return false, nil
+	}
+	store, current := kvs.bphs, kvs.lastPartitions
+	if !store.CoversLegacy() || !store.AllPartitionsMaterialized() {
+		return false, fmt.Errorf("BPHS local bases are not fully materialized")
+	}
+	metadata, err := current.metadataOnlyClone()
+	if err != nil {
+		return false, err
+	}
+	kvs.legacyPartitionsRetired = true
+	kvs.retirePartitions(metadata)
+	if kvs.firstPartitions == current {
+		kvs.firstPartitions = metadata
+	}
+	if kvs.anotherPartitions == current {
+		kvs.anotherPartitions = metadata
+	}
+	kvs.saveKVState()
+	store.UseOwnershipMetadata(metadata)
+	return true, nil
+}
+
 // lastKeyFrom 从 from 扫到 size，返回最后一条记录的 key。
 // 只用于装载时核对清单的 Hi：from 取最后一个稀疏索引点，所以读的是最后一个块，代价有界。
 func lastKeyFrom(path string, from, size int64) (string, error) {

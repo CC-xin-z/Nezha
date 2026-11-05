@@ -231,6 +231,14 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 			}
 			continue
 		}
+		if op.OpType == bphsSplitOp {
+			if err := kvs.applyBPHSSplit(op, index); err != nil {
+				log.Fatalf("apply BPHS split at index=%d: %v", index, err)
+			}
+			applied = index
+			pending = true
+			continue
+		}
 
 		opCtx, existOp := kvs.reqMap[index] // 检查当前index对应的等待put的请求是否超时，即是否还在等待被apply
 		kvs.seqMap[op.ClientId] = op.SeqId  // 更新服务器端，客户端请求的序列号

@@ -230,13 +230,16 @@ func (s *bphsStore) writeStreamingCompactionBase(
 				part.index,
 			)
 		}
+		if winner.Version > maxVersion {
+			maxVersion = winner.Version
+		}
+		if !part.ownsKey(winner.Key) {
+			continue
+		}
 		if entries == 0 {
 			lo = winner.Key
 		}
 		hi = winner.Key
-		if winner.Version > maxVersion {
-			maxVersion = winner.Version
-		}
 		if err := s.kvs.WriteEntryToSortedFile(writer, &raft.Entry{
 			Index: winner.Version,
 			Key:   winner.Key,

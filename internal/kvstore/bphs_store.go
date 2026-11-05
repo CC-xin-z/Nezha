@@ -30,13 +30,14 @@ const (
 )
 
 type bphsPartitionManifest struct {
-	Generation uint64 `json:"generation"`
-	BaseFile   string `json:"base_file,omitempty"`
-	BaseSize   int64  `json:"base_size,omitempty"`
-	MaxVersion uint32 `json:"max_version"`
-	Lo         string `json:"lo,omitempty"`
-	Hi         string `json:"hi,omitempty"`
-	Entries    int    `json:"entries"`
+	Generation   uint64 `json:"generation"`
+	BaseFile     string `json:"base_file,omitempty"`
+	BaseSize     int64  `json:"base_size,omitempty"`
+	LogicalBytes int64  `json:"logical_bytes,omitempty"`
+	MaxVersion   uint32 `json:"max_version"`
+	Lo           string `json:"lo,omitempty"`
+	Hi           string `json:"hi,omitempty"`
+	Entries      int    `json:"entries"`
 }
 
 func bphsPartitionManifestPath(dir string, partition int) string {
@@ -73,6 +74,9 @@ type bphsPartition struct {
 	vlog         *partitionVLog
 	l0           []*SortedFileIndex // 从旧到新
 	gen          uint64
+	logicalBytes int64
+	ownershipLo  string
+	ownershipHi  string
 	recordsDirty bool
 	vlogDirty    bool
 	compacting   bool
@@ -82,6 +86,14 @@ type bphsPartition struct {
 	// VLog value) is fsynced. A background sync therefore advances the BPHS
 	// durable frontier without waiting for a MemTable flush.
 	pendingDurableVersion atomic.Uint32
+}
+
+func (p *bphsPartition) ownsKey(key string) bool {
+	if p == nil {
+		return false
+	}
+	return (p.ownershipLo == "" || key >= p.ownershipLo) &&
+		(p.ownershipHi == "" || key < p.ownershipHi)
 }
 
 // bphsStore 是 BPHS 的节点本地状态。base 可以在全局 GC 完成后整体切换，但静态原型
@@ -113,6 +125,8 @@ type bphsStore struct {
 	inline                    *InlineCache
 	partitionGCThresholdBytes int64
 	legacyCovered             bool
+	baseRefMu                 sync.Mutex
+	baseRefs                  map[string]int
 
 	compactCh   chan int
 	compactStop chan struct{}
@@ -206,9 +220,13 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		localBaseLoaded := false
 		maxCoveredVersion := uint32(0)
 		gen := uint64(1)
+		logicalBytes := basePart.FileSize
 		if hasMeta {
 			gen = meta.Generation
 			maxCoveredVersion = meta.MaxVersion
+			if meta.LogicalBytes > 0 {
+				logicalBytes = meta.LogicalBytes
+			}
 			if meta.BaseFile != "" {
 				localBase, err = loadBPHSBaseFile(kvs, dir, meta, inlineCacheBytes)
 				if err != nil {
@@ -244,13 +262,16 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			return nil, fmt.Errorf("open partition %d vlog: %w", partitionID, err)
 		}
 		part := &bphsPartition{
-			index:     partitionID,
-			base:      localBase,
-			baseLocal: localBaseLoaded,
-			mem:       newPartitionMemtable(memtableBytes),
-			records:   records,
-			vlog:      vlog,
-			gen:       gen,
+			index:        partitionID,
+			base:         localBase,
+			baseLocal:    localBaseLoaded,
+			mem:          newPartitionMemtable(memtableBytes),
+			records:      records,
+			vlog:         vlog,
+			gen:          gen,
+			logicalBytes: logicalBytes,
+			ownershipLo:  basePart.OwnershipLo,
+			ownershipHi:  basePart.OwnershipHi,
 		}
 		l0, err := loadPartitionL0Files(kvs, dir, partitionID, inlineCacheBytes)
 		if err != nil {
@@ -318,6 +339,14 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			return nil, fmt.Errorf("missing BPHS partition %d after recovery", i)
 		}
 	}
+	s.baseRefMu.Lock()
+	s.baseRefs = make(map[string]int)
+	for _, part := range s.parts {
+		if part.baseLocal && part.base != nil {
+			s.baseRefs[part.base.FilePath]++
+		}
+	}
+	s.baseRefMu.Unlock()
 	if hasDurable {
 		s.durableIndex = durableState.DurableIndex
 	}
@@ -558,7 +587,8 @@ func (s *bphsStore) CompactForRead() (int, error) {
 		}
 		// A flush may have scheduled the normal background compaction. Let
 		// that worker finish instead of compacting the same partition twice.
-		if part.compacting || (len(part.l0) == 0 && part.mem.Len() == 0) {
+		if part.compacting ||
+			(part.baseLocal && len(part.l0) == 0 && part.mem.Len() == 0) {
 			part.mu.Unlock()
 			continue
 		}
@@ -624,6 +654,35 @@ func (s *bphsStore) UseOwnershipMetadata(base *PartitionSet) {
 	s.base = base
 	s.basePtr.Store(base)
 	s.mu.Unlock()
+}
+
+func (s *bphsStore) retainBase(path string) {
+	if s == nil || path == "" {
+		return
+	}
+	s.baseRefMu.Lock()
+	if s.baseRefs == nil {
+		s.baseRefs = make(map[string]int)
+	}
+	s.baseRefs[path]++
+	s.baseRefMu.Unlock()
+}
+
+func (s *bphsStore) releaseBase(path string) bool {
+	if s == nil || path == "" {
+		return false
+	}
+	s.baseRefMu.Lock()
+	defer s.baseRefMu.Unlock()
+	if s.baseRefs == nil {
+		return true
+	}
+	if s.baseRefs[path] > 1 {
+		s.baseRefs[path]--
+		return false
+	}
+	delete(s.baseRefs, path)
+	return true
 }
 
 // AllPartitionsMaterialized reports whether every BPHS partition has a local
@@ -752,6 +811,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 		})
 	}
 	part.mem.Put(rec)
+	part.logicalBytes += bphsRecordBytes(rec)
 	if part.mem.Full() {
 		if err := s.flushPartitionLocked(part); err != nil {
 			return -1, err
@@ -896,13 +956,14 @@ func (s *bphsStore) buildCompactionBase(
 	}
 	newBase.InlineValues = s.inline
 	meta := bphsPartitionManifest{
-		Generation: snapshot.generation,
-		BaseFile:   filepath.Base(path),
-		BaseSize:   newBase.FileSize,
-		MaxVersion: cutVersion,
-		Lo:         newBase.Lo,
-		Hi:         newBase.Hi,
-		Entries:    newBase.Entries,
+		Generation:   snapshot.generation,
+		BaseFile:     filepath.Base(path),
+		BaseSize:     newBase.FileSize,
+		LogicalBytes: newBase.FileSize,
+		MaxVersion:   cutVersion,
+		Lo:           newBase.Lo,
+		Hi:           newBase.Hi,
+		Entries:      newBase.Entries,
 	}
 	return newBase, meta, nil
 }
@@ -915,9 +976,12 @@ func (s *bphsStore) installCompactionSnapshot(
 ) error {
 	part.mu.Lock()
 	defer part.mu.Unlock()
+	s.retainBase(newBase.FilePath)
 
 	cleanupNewBase := func() {
-		removeBPHSSortedFile(newBase)
+		if s.releaseBase(newBase.FilePath) {
+			removeBPHSSortedFile(newBase)
+		}
 	}
 	if !part.compacting ||
 		part.base != snapshot.base ||
@@ -941,6 +1005,7 @@ func (s *bphsStore) installCompactionSnapshot(
 	oldL0 := append([]*SortedFileIndex(nil), snapshot.l0...)
 	part.base = newBase
 	part.baseLocal = true
+	part.logicalBytes = newBase.FileSize
 	part.l0 = append([]*SortedFileIndex(nil), part.l0[len(snapshot.l0):]...)
 	part.l0Merges = 0
 	part.mem.PruneThroughVersion(meta.MaxVersion)
@@ -952,7 +1017,9 @@ func (s *bphsStore) installCompactionSnapshot(
 		removeBPHSSortedFile(run)
 	}
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
-		removeBPHSSortedFile(oldBase)
+		if s.releaseBase(oldBase.FilePath) {
+			removeBPHSSortedFile(oldBase)
+		}
 	}
 	return nil
 }
@@ -975,7 +1042,7 @@ func (s *bphsStore) compactPartitionSnapshot(part *bphsPartition) (err error) {
 	if !ok {
 		return nil
 	}
-	if len(snapshot.l0) == 0 && len(snapshot.mem) == 0 {
+	if part.baseLocal && len(snapshot.l0) == 0 && len(snapshot.mem) == 0 {
 		return nil
 	}
 	newBase, meta, err := s.buildCompactionBase(part, snapshot)
@@ -1016,7 +1083,9 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 			return err
 		}
 		for _, rec := range records {
-			putLatest(rec)
+			if part.ownsKey(rec.Key) {
+				putLatest(rec)
+			}
 		}
 	}
 	for _, run := range part.l0 {
@@ -1064,28 +1133,30 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 		return nil
 	}
 	newBase.InlineValues = s.inline
+	s.retainBase(newBase.FilePath)
 
 	nextGen := part.gen + 1
 	meta := bphsPartitionManifest{
-		Generation: nextGen,
-		BaseFile:   filepath.Base(path),
-		BaseSize:   newBase.FileSize,
-		MaxVersion: cutVersion,
-		Lo:         newBase.Lo,
-		Hi:         newBase.Hi,
-		Entries:    newBase.Entries,
+		Generation:   nextGen,
+		BaseFile:     filepath.Base(path),
+		BaseSize:     newBase.FileSize,
+		LogicalBytes: newBase.FileSize,
+		MaxVersion:   cutVersion,
+		Lo:           newBase.Lo,
+		Hi:           newBase.Hi,
+		Entries:      newBase.Entries,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		newBase.closePool()
-		os.Remove(path)
-		os.Remove(sparseIndexPath(path))
+		if s.releaseBase(newBase.FilePath) {
+			removeBPHSSortedFile(newBase)
+		}
 		return err
 	}
 	if err := raft.WriteFileAtomic(bphsPartitionManifestPath(s.dir, part.index), data); err != nil {
-		newBase.closePool()
-		os.Remove(path)
-		os.Remove(sparseIndexPath(path))
+		if s.releaseBase(newBase.FilePath) {
+			removeBPHSSortedFile(newBase)
+		}
 		return err
 	}
 
@@ -1094,6 +1165,7 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	part.base = newBase
 	part.baseLocal = true
 	part.gen = nextGen
+	part.logicalBytes = newBase.FileSize
 	part.l0 = nil
 	part.l0Merges = 0
 	part.mem.Reset()
@@ -1134,9 +1206,9 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	part.vlogDirty = false
 
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
-		oldBase.closePool()
-		os.Remove(oldBase.FilePath)
-		os.Remove(sparseIndexPath(oldBase.FilePath))
+		if s.releaseBase(oldBase.FilePath) {
+			removeBPHSSortedFile(oldBase)
+		}
 	}
 	return nil
 }
@@ -2309,9 +2381,12 @@ func (s *bphsStore) SnapshotCut(workDir string, appliedLimit int) ([]bphsSnapsho
 			}
 		}
 		if meta.BaseFile != "" {
-			if err := copyFilePrefix(part.base.FilePath, filepath.Join(workDir, meta.BaseFile), meta.BaseBytes); err != nil {
-				part.mu.Unlock()
-				return nil, err
+			baseCopy := filepath.Join(workDir, meta.BaseFile)
+			if !fileExists(baseCopy) {
+				if err := copyFilePrefix(part.base.FilePath, baseCopy, meta.BaseBytes); err != nil {
+					part.mu.Unlock()
+					return nil, err
+				}
 			}
 			if idx := sparseIndexPath(part.base.FilePath); fileExists(idx) {
 				st, err := os.Stat(idx)
@@ -2321,9 +2396,12 @@ func (s *bphsStore) SnapshotCut(workDir string, appliedLimit int) ([]bphsSnapsho
 				}
 				meta.BaseIndexFile = filepath.Base(idx)
 				meta.BaseIndexBytes = st.Size()
-				if err := copyFilePrefix(idx, filepath.Join(workDir, meta.BaseIndexFile), meta.BaseIndexBytes); err != nil {
-					part.mu.Unlock()
-					return nil, err
+				indexCopy := filepath.Join(workDir, meta.BaseIndexFile)
+				if !fileExists(indexCopy) {
+					if err := copyFilePrefix(idx, indexCopy, meta.BaseIndexBytes); err != nil {
+						part.mu.Unlock()
+						return nil, err
+					}
 				}
 			}
 		}

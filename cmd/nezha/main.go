@@ -78,6 +78,7 @@ func main() {
 	flag.IntVar(&cfg.BPHSLogCheckpointMB, "bphsLogCheckpointMB", 512, "retire a fully durable Raft log file after it reaches this size in MB (0 disables BPHS Raft-WAL checkpoints)")
 	flag.IntVar(&cfg.BPHSWALMB, "bphsWALMB", 256, "size in MB at which the node-wide BPHS WAL is checkpointed and reset")
 	flag.IntVar(&cfg.BPHSPartitionGCThresholdMB, "bphsPartitionGCThresholdMB", 16, "partition-local GC trigger threshold in MB, counting VLog, L0 and MemTable delta")
+	flag.BoolVar(&cfg.BPHSDynamicSplit, "bphsDynamicSplit", false, "enable Raft-replicated dynamic split of oversized idle BPHS partitions")
 	// A request that hits this timeout stalls its client goroutine for the whole period,
 	// and throughput is decided by the slowest goroutine, so the value shapes the
 	// stability of throughput numbers more than the speed of the system does.

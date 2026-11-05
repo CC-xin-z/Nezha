@@ -167,6 +167,7 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 	}
 	numGC, currentLog, sortedFile := kvs.numGC, kvs.currentLog, kvs.sortedFilePath
 	legacyPartitionsRetired := kvs.legacyPartitionsRetired
+	bphsLayoutVersion := kvs.bphsLayoutVersion
 	ps, releasePins := kvs.pinPartitionsLocked()
 	bphs := kvs.bphs
 	manifest := kvs.lastPartitions.manifest()
@@ -260,7 +261,8 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 			}
 		}
 		kvs.mu.Lock()
-		changedAfterBPHS := kvs.gcInProgress || kvs.numGC != numGC || kvs.currentLog != currentLog
+		changedAfterBPHS := kvs.gcInProgress || kvs.numGC != numGC ||
+			kvs.currentLog != currentLog || kvs.bphsLayoutVersion != bphsLayoutVersion
 		kvs.mu.Unlock()
 		if changedAfterBPHS {
 			release()
@@ -339,6 +341,20 @@ func (kvs *KVServer) createSnapshot() (*snapshot, error) {
 			}
 		}
 	}
+	// Logical split lets multiple child partitions share one immutable Base.
+	// Send each physical file once; every BPHS manifest still records the shared
+	// basename and the receiver reconstructs both routing ranges.
+	uniqueFiles := files[:0]
+	seenFiles := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		key := fmt.Sprintf("%s:%d", file.Path, file.Limit)
+		if _, ok := seenFiles[key]; ok {
+			continue
+		}
+		seenFiles[key] = struct{}{}
+		uniqueFiles = append(uniqueFiles, file)
+	}
+	files = uniqueFiles
 
 	snap := &snapshot{manifest: sm, files: files, release: release}
 	fmt.Printf("[SNAPSHOT] 做好一份：位点=(%d,%d) applied=%d 日志到=%d 分区=%d 库行数=%d "+
@@ -507,6 +523,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 		if err := os.MkdirAll(filepath.Join(names.bphsDir, sparseIndexDir), 0o755); err != nil {
 			return fail("建 BPHS 索引目录: %v", err)
 		}
+		placedBPHSFiles := make(map[string]struct{})
 		for _, part := range sm.BPHS {
 			for _, f := range []struct {
 				label string
@@ -516,6 +533,9 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 				{"records", part.RecordsFile, part.RecordsBytes},
 				{"vlog", part.VLogFile, part.VLogBytes},
 			} {
+				if _, placed := placedBPHSFiles[f.name]; placed {
+					continue
+				}
 				dst := filepath.Join(names.bphsDir, filepath.Base(f.name))
 				if src := byName[f.name]; src != "" {
 					if err := os.Rename(src, dst); err != nil {
@@ -528,6 +548,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 				} else {
 					return fail("BPHS %s 文件 %s 缺失", f.label, f.name)
 				}
+				placedBPHSFiles[f.name] = struct{}{}
 			}
 			for _, f := range []struct {
 				label string
@@ -542,6 +563,9 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 				if f.name == "" {
 					continue
 				}
+				if _, placed := placedBPHSFiles[f.name]; placed {
+					continue
+				}
 				src := byName[f.name]
 				if src == "" {
 					return fail("BPHS %s 文件 %s 缺失", f.label, f.name)
@@ -549,8 +573,12 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 				if err := os.Rename(src, f.dst); err != nil {
 					return fail("BPHS %s 文件 %s 落位: %v", f.label, f.name, err)
 				}
+				placedBPHSFiles[f.name] = struct{}{}
 			}
 			if part.BaseIndexFile != "" {
+				if _, placed := placedBPHSFiles[part.BaseIndexFile]; placed {
+					continue
+				}
 				src := byName[part.BaseIndexFile]
 				if src == "" {
 					// 旁挂索引可以重建，缺了不影响正确性。
@@ -560,6 +588,7 @@ func (kvs *KVServer) installSnapshot(span raft.SSTableSpan) (int, raftrpc.Instal
 				if err := os.Rename(src, dst); err != nil {
 					return fail("BPHS base index 文件 %s 落位: %v", part.BaseIndexFile, err)
 				}
+				placedBPHSFiles[part.BaseIndexFile] = struct{}{}
 			}
 		}
 	}
