@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/api/raftrpc"
@@ -285,8 +286,8 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	if !part.baseLocal || part.base == nil {
 		return fmt.Errorf("partition %d has no local base", parentID)
 	}
-	if len(part.l0) != 0 || part.vlog.Size() != 0 {
-		return fmt.Errorf("partition %d has an active L0/VLog delta unsupported by hot-memory split", parentID)
+	if part.vlog.Size() != 0 {
+		return fmt.Errorf("partition %d has an active VLog delta unsupported by hot split", parentID)
 	}
 	parentOwnershipHi := part.ownershipHi
 	bounds, err := scanBPHSSplitBounds(part.base.FilePath, part, splitKey)
@@ -310,12 +311,17 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		childRecords.Close()
 		return err
 	}
+	var childL0Paths []string
 	cleanupChild := func() {
 		childRecords.Close()
 		childVLog.Close()
 		os.Remove(childRecords.Path())
 		os.Remove(childVLog.Path())
 		os.Remove(bphsPartitionManifestPath(s.dir, newID))
+		for _, path := range childL0Paths {
+			os.Remove(path)
+			os.Remove(sparseIndexPath(path))
+		}
 	}
 
 	var splitMem []bphsRecord
@@ -340,6 +346,41 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	childMem := newPartitionMemtable(s.memtableBytes)
 	for _, rec := range splitMem {
 		childMem.Put(rec)
+	}
+
+	parentL0Prefix := fmt.Sprintf("p%06d_l0_", parentID)
+	for _, run := range part.l0 {
+		sourceName := filepath.Base(run.FilePath)
+		if !strings.HasPrefix(sourceName, parentL0Prefix) {
+			cleanupChild()
+			return fmt.Errorf("partition %d L0 %s has unexpected name", parentID, sourceName)
+		}
+		childName := fmt.Sprintf("p%06d_l0_%s", newID, strings.TrimPrefix(sourceName, parentL0Prefix))
+		childPath := filepath.Join(s.dir, childName)
+		if err := os.Link(run.FilePath, childPath); err != nil {
+			cleanupChild()
+			return fmt.Errorf("link partition %d L0 %s for child %d: %w", parentID, sourceName, newID, err)
+		}
+		childL0Paths = append(childL0Paths, childPath)
+		if sourceIndex, childIndex := sparseIndexPath(run.FilePath), sparseIndexPath(childPath); fileExists(sourceIndex) {
+			if err := os.Link(sourceIndex, childIndex); err != nil {
+				cleanupChild()
+				return fmt.Errorf("link partition %d L0 index %s for child %d: %w", parentID, sourceIndex, newID, err)
+			}
+		}
+	}
+	loadedChildL0, err := loadPartitionL0Files(s.kvs, s.dir, newID, 0)
+	if err != nil {
+		cleanupChild()
+		return err
+	}
+	if len(loadedChildL0) != len(part.l0) {
+		cleanupChild()
+		return fmt.Errorf("partition %d child L0 count=%d, want %d", parentID, len(loadedChildL0), len(part.l0))
+	}
+	childL0 := make([]*SortedFileIndex, 0, len(loadedChildL0))
+	for _, loaded := range loadedChildL0 {
+		childL0 = append(childL0, loaded.file)
 	}
 
 	parentMeta.LogicalBytes = bounds.leftBytes
@@ -371,6 +412,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		mem:          childMem,
 		records:      childRecords,
 		vlog:         childVLog,
+		l0:           childL0,
 		gen:          parentMeta.Generation,
 		logicalBytes: bounds.rightBytes,
 		ownershipLo:  splitKey,

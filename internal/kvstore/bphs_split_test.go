@@ -220,6 +220,125 @@ func TestBPHSSplitWithActiveMemTable(t *testing.T) {
 	}
 }
 
+func TestBPHSSplitWithActiveL0(t *testing.T) {
+	dataDir := t.TempDir()
+	valuelogDir := filepath.Join(dataDir, "data", "valuelog")
+	if err := os.MkdirAll(valuelogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kvs := &KVServer{
+		dataDir:         dataDir,
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 512,
+		numGC:           1,
+		currentLog:      filepath.Join(valuelogDir, "RaftState.log"),
+		currentDBPath:   filepath.Join(dataDir, "data", "dbfile"),
+	}
+	records := make([]bphsRecord, 0, 10)
+	for i := 1; i <= 10; i++ {
+		records = append(records, bphsRecord{
+			Key:     fmt.Sprintf("%010d", i),
+			Version: uint32(i),
+			Kind:    bphsInlineRecord,
+			Value:   fmt.Sprintf("value-%02d", i),
+		})
+	}
+	base, err := kvs.flushBPHSBaseFile(
+		records,
+		filepath.Join(valuelogDir, "RaftState_sorted_1.p0"),
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSet := &PartitionSet{parts: []*SortedFileIndex{base}, ids: []int{0}}
+	baseSet.assignOwnershipRanges()
+	kvs.lastPartitions = baseSet
+	kvs.sortedFilePath = filepath.Join(valuelogDir, "RaftState_sorted_1")
+
+	store, err := openBPHSStore(kvs, baseSet, filepath.Join(dataDir, "data", "bphs"), 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompactForRead(); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.markLegacyCovered()
+	kvs.bphs = store
+
+	if _, err := store.Put("0000000009", "l0-value", 11); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	parent := store.parts[0]
+	parent.mu.Lock()
+	if err := store.flushPartitionLocked(parent); err != nil {
+		parent.mu.Unlock()
+		store.Close()
+		t.Fatal(err)
+	}
+	parent.mu.Unlock()
+	if len(parent.l0) == 0 {
+		store.Close()
+		t.Fatal("test setup did not create an active L0")
+	}
+	if _, err := store.Put("0000000010", "mem-value", 12); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	kvs.legacyPartitionsRetired = true
+
+	payload, err := json.Marshal(bphsSplitCommand{ParentID: 0, SplitKey: "0000000006"})
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	kvs.mu.Lock()
+	splitErr := kvs.applyBPHSSplit(&raftrpc.DetailCod{OpType: bphsSplitOp, Value: string(payload)}, 13)
+	kvs.mu.Unlock()
+	if splitErr != nil {
+		store.Close()
+		t.Fatalf("split with active L0 failed: %v", splitErr)
+	}
+	if value, found, err := store.Get("0000000009"); err != nil || !found || value != "l0-value" {
+		store.Close()
+		t.Fatalf("active L0 value after split = %q,%v,%v", value, found, err)
+	}
+	if value, found, err := store.Get("0000000010"); err != nil || !found || value != "mem-value" {
+		store.Close()
+		t.Fatalf("active MemTable value after split = %q,%v,%v", value, found, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	base.closePool()
+
+	persisted, ok, err := loadKVState(kvs.stateFilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(persisted.Partitions) != 2 {
+		t.Fatalf("persisted active-L0 split state: ok=%v partitions=%d", ok, len(persisted.Partitions))
+	}
+	reopenSet, err := partitionSetFromMetadata(persisted.Partitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openBPHSStore(kvs, reopenSet, filepath.Join(dataDir, "data", "bphs"), 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if value, found, err := reopened.Get("0000000009"); err != nil || !found || value != "l0-value" {
+		t.Fatalf("recovered active L0 value = %q,%v,%v", value, found, err)
+	}
+	if value, found, err := reopened.Get("0000000010"); err != nil || !found || value != "mem-value" {
+		t.Fatalf("recovered active MemTable value = %q,%v,%v", value, found, err)
+	}
+}
+
 func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	dataDir := t.TempDir()
 	valuelogDir := filepath.Join(dataDir, "data", "valuelog")
