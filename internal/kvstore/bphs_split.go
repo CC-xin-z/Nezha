@@ -1,13 +1,12 @@
 package kvstore
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -101,7 +100,7 @@ func writeBPHSPartitionManifest(dir string, partition int, meta bphsPartitionMan
 	return raft.WriteFileAtomic(bphsPartitionManifestPath(dir, partition), data)
 }
 
-// chooseSplitCandidate selects the largest idle local partition above the
+// chooseSplitCandidate selects the largest local partition above the
 // logical size budget. The exact split key is carried in the Raft command so
 // every replica applies the same ownership boundary.
 func (s *bphsStore) chooseSplitCandidate(maxLogicalBytes int64) (bphsSplitCandidate, bool) {
@@ -117,25 +116,17 @@ func (s *bphsStore) chooseSplitCandidate(maxLogicalBytes int64) (bphsSplitCandid
 	for _, part := range parts {
 		part.mu.RLock()
 		eligible := part.baseLocal && part.base != nil && !part.compacting &&
-			part.mem.Len() == 0 && len(part.l0) == 0 &&
-			part.records.Size() == 0 && part.vlog.Size() == 0 &&
+			part.vlog.Size() == 0 &&
 			part.logicalBytes > maxLogicalBytes
 		if !eligible {
 			part.mu.RUnlock()
 			continue
 		}
-		keys := make([]string, 0, len(part.base.Sparse))
-		for _, entry := range part.base.Sparse {
-			if part.ownsKey(entry.PaddedKey) {
-				keys = append(keys, entry.PaddedKey)
-			}
-		}
+		live, err := s.collectBPHSOwnedRecordsLocked(part)
 		size := part.logicalBytes
 		var splitKey string
-		if len(keys) >= 2 {
-			splitKey = keys[len(keys)/2]
-		} else {
-			splitKey, _ = chooseBPHSSplitKey(part.base.FilePath, part)
+		if err == nil && len(live) >= 3 {
+			splitKey = live[len(live)/2].Key
 		}
 		part.mu.RUnlock()
 		if splitKey == "" || size <= bestSize {
@@ -150,89 +141,71 @@ func (s *bphsStore) chooseSplitCandidate(maxLogicalBytes int64) (bphsSplitCandid
 	return best, bestSize > 0
 }
 
-func chooseBPHSSplitKey(path string, part *bphsPartition) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	reader := bufio.NewReaderSize(file, 1<<20)
-	count := 0
-	for {
-		entry, _, err := ReadEntry(reader, 0)
-		if err == io.EOF {
-			break
+// collectBPHSOwnedRecordsLocked merges Base, immutable L0 runs and the active
+// MemTable into one latest-version view. Caller holds part.mu.
+func (s *bphsStore) collectBPHSOwnedRecordsLocked(part *bphsPartition) ([]bphsRecord, error) {
+	latest := make(map[string]bphsRecord)
+	put := func(rec bphsRecord) {
+		if !part.ownsKey(rec.Key) {
+			return
 		}
+		old, ok := latest[rec.Key]
+		if !ok || rec.Version >= old.Version {
+			latest[rec.Key] = rec
+		}
+	}
+	if part.base != nil {
+		records, err := readRawSortedFile(part.base.FilePath)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if part.ownsKey(entry.Key) {
-			count++
+		for _, rec := range records {
+			put(rec)
 		}
 	}
-	if count < 3 {
-		return "", fmt.Errorf("partition %d has too few owned keys to split", part.index)
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", err
-	}
-	reader = bufio.NewReaderSize(file, 1<<20)
-	target := count / 2
-	seen := 0
-	for {
-		entry, _, err := ReadEntry(reader, 0)
-		if err == io.EOF {
-			break
-		}
+	for _, run := range part.l0 {
+		records, err := readBPHSSortedFile(run.FilePath)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if !part.ownsKey(entry.Key) {
-			continue
+		for _, rec := range records {
+			put(rec)
 		}
-		if seen == target {
-			return entry.Key, nil
-		}
-		seen++
 	}
-	return "", fmt.Errorf("failed to choose split key for partition %d", part.index)
+	for _, rec := range part.mem.Sorted() {
+		put(rec)
+	}
+	out := make([]bphsRecord, 0, len(latest))
+	for _, rec := range latest {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
 }
 
-func scanBPHSSplitBounds(path string, part *bphsPartition, splitKey string) (bphsSplitBounds, error) {
+func (s *bphsStore) scanBPHSSplitBounds(part *bphsPartition, splitKey string) (bphsSplitBounds, error) {
 	if splitKey == "" || !part.ownsKey(splitKey) {
 		return bphsSplitBounds{}, fmt.Errorf("split key %q is outside partition %d ownership", splitKey, part.index)
 	}
-	file, err := os.Open(path)
+	records, err := s.collectBPHSOwnedRecordsLocked(part)
 	if err != nil {
 		return bphsSplitBounds{}, err
 	}
-	defer file.Close()
-	reader := bufio.NewReaderSize(file, 1<<20)
 	var out bphsSplitBounds
-	for {
-		entry, _, err := ReadEntry(reader, 0)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return bphsSplitBounds{}, err
-		}
-		if !part.ownsKey(entry.Key) {
-			continue
-		}
-		size := int64(20 + len(entry.Key) + len(entry.Value))
-		if entry.Key < splitKey {
+	for _, rec := range records {
+		size := bphsRecordBytes(rec)
+		if rec.Key < splitKey {
 			if out.leftLo == "" {
-				out.leftLo = entry.Key
+				out.leftLo = rec.Key
 			}
-			out.leftHi = entry.Key
+			out.leftHi = rec.Key
 			out.leftBytes += size
 			out.leftEntries++
 		} else {
 			if out.rightLo == "" {
-				out.rightLo = entry.Key
+				out.rightLo = rec.Key
 			}
-			out.rightHi = entry.Key
+			out.rightHi = rec.Key
 			out.rightBytes += size
 			out.rightEntries++
 		}
@@ -290,7 +263,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		return fmt.Errorf("partition %d has an active VLog delta unsupported by hot split", parentID)
 	}
 	parentOwnershipHi := part.ownershipHi
-	bounds, err := scanBPHSSplitBounds(part.base.FilePath, part, splitKey)
+	bounds, err := s.scanBPHSSplitBounds(part, splitKey)
 	if err != nil {
 		return err
 	}
