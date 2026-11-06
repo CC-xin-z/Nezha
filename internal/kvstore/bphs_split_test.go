@@ -6,10 +6,76 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gitee.com/dong-shuishui/FlexSync/api/raftrpc"
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
+
+func TestBPHSSplitWaitsForConcurrentMaterialization(t *testing.T) {
+	dataDir := t.TempDir()
+	valuelogDir := filepath.Join(dataDir, "data", "valuelog")
+	if err := os.MkdirAll(valuelogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kvs := &KVServer{
+		dataDir:         dataDir,
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 512,
+		numGC:           1,
+		currentLog:      filepath.Join(valuelogDir, "RaftState.log"),
+		currentDBPath:   filepath.Join(dataDir, "data", "dbfile"),
+	}
+	records := make([]bphsRecord, 0, 10)
+	for i := 1; i <= 10; i++ {
+		records = append(records, bphsRecord{
+			Key:     fmt.Sprintf("%010d", i),
+			Version: uint32(i),
+			Kind:    bphsInlineRecord,
+			Value:   fmt.Sprintf("value-%02d", i),
+		})
+	}
+	base, err := kvs.flushBPHSBaseFile(
+		records,
+		filepath.Join(valuelogDir, "RaftState_sorted_1.p0"),
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSet := &PartitionSet{parts: []*SortedFileIndex{base}, ids: []int{0}}
+	baseSet.assignOwnershipRanges()
+	kvs.lastPartitions = baseSet
+	kvs.sortedFilePath = filepath.Join(valuelogDir, "RaftState_sorted_1")
+
+	store, err := openBPHSStore(kvs, baseSet, filepath.Join(dataDir, "data", "bphs"), 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	part := store.parts[0]
+	part.mu.Lock()
+	part.compacting = true
+	part.mu.Unlock()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		part.mu.Lock()
+		part.compacting = false
+		part.mu.Unlock()
+	}()
+
+	if err := store.ensureAllPartitionsMaterialized(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	part.mu.RLock()
+	defer part.mu.RUnlock()
+	if !part.baseLocal || part.base == nil || part.compacting {
+		t.Fatalf("partition not materialized: local=%v base=%v compacting=%v",
+			part.baseLocal, part.base != nil, part.compacting)
+	}
+}
 
 func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	dataDir := t.TempDir()

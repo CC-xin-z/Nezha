@@ -17,6 +17,10 @@ import (
 const bphsSplitOp = "BPHSSplit"
 
 const bphsSplitPoll = 10 * time.Second
+const (
+	bphsSplitMaterializeTimeout = 5 * time.Minute
+	bphsSplitMaterializePoll    = 100 * time.Millisecond
+)
 
 type bphsSplitCommand struct {
 	ParentID int    `json:"parent_id"`
@@ -245,7 +249,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		return fmt.Errorf("BPHS split requires a store")
 	}
 	if !s.kvs.legacyPartitionsRetired {
-		if _, err := s.CompactForRead(); err != nil {
+		if err := s.ensureAllPartitionsMaterialized(bphsSplitMaterializeTimeout); err != nil {
 			return fmt.Errorf("materialize before split: %w", err)
 		}
 		reclaimed, err := s.kvs.reclaimLegacyPartitionsLocked()
@@ -253,7 +257,11 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 			return err
 		}
 		if !reclaimed {
-			return fmt.Errorf("partition layout did not become split-ready")
+			return fmt.Errorf(
+				"legacy retirement declined: covered=%v materialized=%v installing=%v gcActive=%v gcInProgress=%v",
+				s.CoversLegacy(), s.AllPartitionsMaterialized(),
+				s.kvs.installing, s.kvs.gcActive, s.kvs.gcInProgress,
+			)
 		}
 	}
 	s.mu.RLock()
@@ -413,6 +421,39 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		parentID, newID, splitKey, bounds.leftBytes, bounds.rightBytes,
 	)
 	return nil
+}
+
+// ensureAllPartitionsMaterialized waits until every partition has a complete
+// local Base and no compaction is in flight. CompactForRead can legitimately
+// schedule another compaction from its completion callback, so a single pass
+// followed by an immediate readiness check has a race: a slow follower may
+// see compacting=true and reject a Raft split that it must apply.
+func (s *bphsStore) ensureAllPartitionsMaterialized(timeout time.Duration) error {
+	if s == nil {
+		return fmt.Errorf("BPHS store is nil")
+	}
+	deadline := time.Now().Add(timeout)
+	var lastReport time.Time
+	for {
+		if s.AllPartitionsMaterialized() {
+			return nil
+		}
+		if _, err := s.CompactForRead(); err != nil {
+			return err
+		}
+		if s.AllPartitionsMaterialized() {
+			return nil
+		}
+		now := time.Now()
+		if now.After(deadline) {
+			return fmt.Errorf("BPHS partitions did not become materialized within %v", timeout)
+		}
+		if lastReport.IsZero() || now.Sub(lastReport) >= 5*time.Second {
+			fmt.Printf("[BPHS-SPLIT] waiting for all partitions to materialize before split\n")
+			lastReport = now
+		}
+		time.Sleep(bphsSplitMaterializePoll)
+	}
 }
 
 func (kvs *KVServer) applyBPHSSplit(op *raftrpc.DetailCod, index int) error {
