@@ -22,6 +22,15 @@ func noopEntry(index, term int) *Entry {
 	return &Entry{Index: uint32(index), CurrentTerm: uint32(term), NoOp: true}
 }
 
+func internalOpEntry(index, term int, opType, value string) *Entry {
+	return &Entry{
+		Index:       uint32(index),
+		CurrentTerm: uint32(term),
+		Key:         InternalOpKey(opType),
+		Value:       value,
+	}
+}
+
 // A representative log: a no-op on taking office, some writes, a no-op for a new term, more writes.
 func writeSampleLog(t *testing.T, rf *Raft) {
 	t.Helper()
@@ -95,6 +104,41 @@ func TestRecoverLogRebuildsEntriesAndPendingOffsets(t *testing.T) {
 	// applied entries kept only in rf.log must still carry the right term (consistency checks use it)
 	if rf.termAt(9) != 2 || rf.termAt(3) != 1 {
 		t.Fatalf("termAt(9)=%d termAt(3)=%d, want 2 / 1", rf.termAt(9), rf.termAt(3))
+	}
+}
+
+func TestRecoverLogRestoresInternalOperationType(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "RaftState.log")
+	w := newLogWriter(t, logPath, 0)
+	w.AppendToLogFile([]*Entry{
+		noopEntry(1, 3),
+		putEntry(2, 3, "user-key", "user-value"),
+		internalOpEntry(3, 3, "BPHSSplit", `{"parent_id":7,"split_key":"k"}`),
+	})
+	w.CloseLogFile()
+
+	rf := &Raft{persister: &Persister{}}
+	last, err := rf.RecoverLog([]LogFile{{Path: logPath, Version: 0}}, 0)
+	if err != nil {
+		t.Fatalf("RecoverLog: %v", err)
+	}
+	if last != 3 {
+		t.Fatalf("lastIndex = %d, want 3", last)
+	}
+
+	internal := rf.log[2].Command
+	if internal.OpType != "BPHSSplit" {
+		t.Fatalf("internal OpType = %q, want BPHSSplit", internal.OpType)
+	}
+	if internal.Key != "" {
+		t.Fatalf("internal Key = %q, want empty after recovery", internal.Key)
+	}
+	if internal.Value != `{"parent_id":7,"split_key":"k"}` {
+		t.Fatalf("internal Value = %q", internal.Value)
+	}
+	if rf.Offsets[2] == 0 {
+		t.Fatal("internal operation did not receive a durable log offset")
 	}
 }
 

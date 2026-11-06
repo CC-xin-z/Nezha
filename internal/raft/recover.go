@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"gitee.com/dong-shuishui/FlexSync/api/raftrpc"
 	"gitee.com/dong-shuishui/FlexSync/internal/util"
@@ -16,6 +17,24 @@ import (
 type LogFile struct {
 	Path    string
 	Version int32
+}
+
+// Internal Raft operations have no user key, so the on-disk key/value log
+// would otherwise classify them as TermLog during recovery. User keys may not
+// begin with NUL, making this prefix an unambiguous internal-op marker.
+const internalOpKeyPrefix = "\x00raft-internal:"
+
+// InternalOpKey returns the durable key used to preserve an internal command's
+// operation type in the Raft log.
+func InternalOpKey(opType string) string {
+	return internalOpKeyPrefix + opType
+}
+
+func decodeInternalOpKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, internalOpKeyPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(key, internalOpKeyPrefix), true
 }
 
 // Record size limits used only to recognise a corrupt header; real records are far smaller.
@@ -100,9 +119,15 @@ func (rf *Raft) RecoverLog(files []LogFile, lastApplied int) (lastIndex int, err
 			if ks == 0 {
 				cmd.OpType = "TermLog" // no-op marker: zero-length key; real keys are always KeyLength bytes
 			} else {
-				cmd.OpType = "Put"
-				cmd.Key = string(body[:ks]) // 原样存原样取，不再有填充要剥
-				cmd.Value = string(body[ks:])
+				rawKey := string(body[:ks])
+				if opType, internal := decodeInternalOpKey(rawKey); internal {
+					cmd.OpType = opType
+					cmd.Value = string(body[ks:])
+				} else {
+					cmd.OpType = "Put"
+					cmd.Key = rawKey // 原样存原样取，不再有填充要剥
+					cmd.Value = string(body[ks:])
+				}
 			}
 			entries = append(entries, &raftrpc.LogEntry{Term: term, Command: cmd})
 			if index > lastApplied {

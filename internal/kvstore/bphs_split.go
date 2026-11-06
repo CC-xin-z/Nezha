@@ -76,7 +76,11 @@ func (kvs *KVServer) bphsSplitLoop(ctx context.Context) {
 				fmt.Printf("[BPHS-SPLIT] encode candidate failed: %v\n", err)
 				continue
 			}
-			op := &raftrpc.DetailCod{OpType: bphsSplitOp, Value: string(payload)}
+			op := &raftrpc.DetailCod{
+				OpType: bphsSplitOp,
+				Key:    raft.InternalOpKey(bphsSplitOp),
+				Value:  string(payload),
+			}
 			_, _, leader := kvs.raft.Start(op)
 			kvs.mu.Lock()
 			if leader {
