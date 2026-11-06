@@ -285,8 +285,8 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	if !part.baseLocal || part.base == nil {
 		return fmt.Errorf("partition %d has no local base", parentID)
 	}
-	if part.mem.Len() != 0 || len(part.l0) != 0 || part.records.Size() != 0 || part.vlog.Size() != 0 {
-		return fmt.Errorf("partition %d is not idle enough to split", parentID)
+	if len(part.l0) != 0 || part.vlog.Size() != 0 {
+		return fmt.Errorf("partition %d has an active L0/VLog delta unsupported by hot-memory split", parentID)
 	}
 	parentOwnershipHi := part.ownershipHi
 	bounds, err := scanBPHSSplitBounds(part.base.FilePath, part, splitKey)
@@ -318,6 +318,30 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		os.Remove(bphsPartitionManifestPath(s.dir, newID))
 	}
 
+	var splitMem []bphsRecord
+	for _, rec := range part.mem.Sorted() {
+		if rec.Kind != bphsInlineRecord {
+			cleanupChild()
+			return fmt.Errorf("partition %d active MemTable contains BlobRecord for key %q", parentID, rec.Key)
+		}
+		if rec.Key < splitKey {
+			continue
+		}
+		splitMem = append(splitMem, rec)
+		if _, err := childRecords.Append(rec); err != nil {
+			cleanupChild()
+			return fmt.Errorf("persist child split MemTable key %q: %w", rec.Key, err)
+		}
+	}
+	if err := childRecords.Sync(); err != nil {
+		cleanupChild()
+		return fmt.Errorf("sync child split MemTable: %w", err)
+	}
+	childMem := newPartitionMemtable(s.memtableBytes)
+	for _, rec := range splitMem {
+		childMem.Put(rec)
+	}
+
 	parentMeta.LogicalBytes = bounds.leftBytes
 	if err := writeBPHSPartitionManifest(s.dir, parentID, parentMeta); err != nil {
 		cleanupChild()
@@ -344,7 +368,7 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 		index:        newID,
 		base:         childBase,
 		baseLocal:    true,
-		mem:          newPartitionMemtable(s.memtableBytes),
+		mem:          childMem,
 		records:      childRecords,
 		vlog:         childVLog,
 		gen:          parentMeta.Generation,

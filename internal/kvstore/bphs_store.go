@@ -1580,21 +1580,33 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		part := s.parts[base.partitionID(i)]
 		part.mu.RLock()
 
+		partStart, partEnd := startKey, endKey
+		if part.ownershipLo != "" && partStart < part.ownershipLo {
+			partStart = part.ownershipLo
+		}
+		if part.ownershipHi != "" && partEnd > part.ownershipHi {
+			partEnd = part.ownershipHi
+		}
+		if partStart > partEnd {
+			part.mu.RUnlock()
+			continue
+		}
+
 		if len(part.l0) == 0 {
 			// The ready/local steady state has one run. Keep the original
 			// direct streaming path and avoid merge bookkeeping.
 			if part.base != nil {
-				if err := s.kvs.scanFromSortedFileInto(result, startKey, endKey, part.base); err != nil {
+				if err := s.kvs.scanFromSortedFileInto(result, partStart, partEnd, part.base); err != nil {
 					part.mu.RUnlock()
 					return nil, err
 				}
 			}
-		} else if err := s.scanBPHSPartitionMergedInto(result, startKey, endKey, part); err != nil {
+		} else if err := s.scanBPHSPartitionMergedInto(result, partStart, partEnd, part); err != nil {
 			part.mu.RUnlock()
 			return nil, err
 		}
 		l0Runs += len(part.l0)
-		for _, rec := range part.mem.SortedRange(startKey, endKey) {
+		for _, rec := range part.mem.SortedRange(partStart, partEnd) {
 			value, err := s.recordValue(part, rec)
 			if err != nil {
 				part.mu.RUnlock()
