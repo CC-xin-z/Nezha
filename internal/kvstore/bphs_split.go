@@ -64,7 +64,7 @@ func (kvs *KVServer) bphsSplitLoop(ctx context.Context) {
 			store := kvs.bphs
 			kvs.mu.Unlock()
 
-			candidate, ok := store.chooseSplitCandidate(kvs.partitionTargetBytes * 2)
+			candidate, ok := store.chooseSplitCandidate(kvs.bphsSplitThresholdBytes())
 			if !ok {
 				continue
 			}
@@ -90,6 +90,14 @@ func (kvs *KVServer) bphsSplitLoop(ctx context.Context) {
 			kvs.mu.Unlock()
 		}
 	}
+}
+
+func (kvs *KVServer) bphsSplitThresholdBytes() int64 {
+	percent := kvs.bphsSplitThresholdPercent
+	if percent <= 0 {
+		percent = 150
+	}
+	return kvs.partitionTargetBytes * int64(percent) / 100
 }
 
 func writeBPHSPartitionManifest(dir string, partition int, meta bphsPartitionManifest) error {

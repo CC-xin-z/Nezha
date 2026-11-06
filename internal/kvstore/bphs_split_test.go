@@ -453,6 +453,17 @@ func TestBPHSChooseSplitCandidateIncludesActiveNewKeys(t *testing.T) {
 	}
 }
 
+func TestBPHSSplitThresholdBytes(t *testing.T) {
+	kvs := &KVServer{partitionTargetBytes: 256 << 20}
+	if got, want := kvs.bphsSplitThresholdBytes(), int64(384<<20); got != want {
+		t.Fatalf("default split threshold = %d, want %d", got, want)
+	}
+	kvs.bphsSplitThresholdPercent = 200
+	if got, want := kvs.bphsSplitThresholdBytes(), int64(512<<20); got != want {
+		t.Fatalf("configured split threshold = %d, want %d", got, want)
+	}
+}
+
 func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	dataDir := t.TempDir()
 	valuelogDir := filepath.Join(dataDir, "data", "valuelog")

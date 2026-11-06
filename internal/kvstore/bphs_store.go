@@ -136,6 +136,11 @@ type bphsStore struct {
 	errMu       sync.Mutex
 	compactErr  error
 	compactFail atomic.Bool
+
+	// Test-only barriers for proving that L0 merge construction runs outside
+	// part.mu. Production stores leave both nil.
+	l0MergeBuildStart   chan struct{}
+	l0MergeBuildRelease chan struct{}
 }
 
 func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes, inlineCacheBytes int64, maxVersion uint32) (*bphsStore, error) {
@@ -474,14 +479,28 @@ func (s *bphsStore) compactLoop() {
 			return
 		case idx := <-s.compactCh:
 			part := s.parts[idx]
+			part.mu.RLock()
+			l0Only := part.vlog.Size() == 0 && len(part.l0) >= bphsL0CompactionTrigger
+			part.mu.RUnlock()
 			t0 := time.Now()
-			err := s.runPartitionCompaction(part)
+			var err error
+			if l0Only {
+				err = s.compactL0Snapshot(part)
+				recordBPHSL0Merge(time.Since(t0))
+			} else {
+				err = s.runPartitionCompaction(part)
+				recordBPHSBaseCompaction(time.Since(t0))
+			}
 			part.mu.RLock()
 			generation := part.gen
 			part.mu.RUnlock()
-			recordBPHSBaseCompaction(time.Since(t0))
-			fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
-				idx, time.Since(t0), generation, err)
+			if l0Only {
+				fmt.Printf("[BPHS-L0-ASYNC] partition=%d elapsed=%v generation=%d err=%v\n",
+					idx, time.Since(t0), generation, err)
+			} else {
+				fmt.Printf("[BPHS-COMPACTION] partition=%d elapsed=%v generation=%d err=%v\n",
+					idx, time.Since(t0), generation, err)
+			}
 			if err != nil {
 				s.errMu.Lock()
 				if s.compactErr == nil {
@@ -854,20 +873,21 @@ func (s *bphsStore) flushPartitionLocked(part *bphsPartition) error {
 		return fmt.Errorf("reset partition %d record log after L0: %w", part.index, err)
 	}
 	part.recordsDirty = false
-	// A snapshot compaction may still be reading the current L0 prefix.
-	// Appending a new run is safe; merging or deleting an old run is not.
-	if !part.compacting && len(part.l0) >= bphsL0CompactionTrigger {
-		mergeStart := time.Now()
-		if err := s.compactL0Locked(part); err != nil {
-			recordBPHSL0Merge(time.Since(mergeStart))
-			return fmt.Errorf("compact partition %d L0: %w", part.index, err)
-		}
-		recordBPHSL0Merge(time.Since(mergeStart))
+	if s.shouldMergeBPHSL0Locked(part) {
+		// L0 merge is snapshot-based and runs on the compaction worker. The PUT
+		// path only freezes the prefix, so hot-partition writes do not wait for
+		// the merge I/O.
+		s.scheduleCompactionLocked(part)
 	}
 	if s.shouldCompactPartitionLocked(part) {
 		s.scheduleCompactionLocked(part)
 	}
 	return nil
+}
+
+func (s *bphsStore) shouldMergeBPHSL0Locked(part *bphsPartition) bool {
+	return s != nil && part != nil && !part.compacting &&
+		part.vlog.Size() == 0 && len(part.l0) >= bphsL0CompactionTrigger
 }
 
 func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
@@ -1213,15 +1233,46 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	return nil
 }
 
-func (s *bphsStore) compactL0Locked(part *bphsPartition) error {
-	if part == nil || len(part.l0) < 2 {
+// compactL0Snapshot merges a frozen immutable L0 prefix outside part.mu.
+// Writes may append newer L0 runs while the merge runs; installation only
+// replaces the captured prefix and preserves the suffix.
+func (s *bphsStore) compactL0Snapshot(part *bphsPartition) (err error) {
+	defer func() {
+		part.mu.Lock()
+		if part.compacting {
+			part.compacting = false
+			if err == nil && (s.shouldMergeBPHSL0Locked(part) ||
+				s.shouldCompactPartitionLocked(part)) {
+				s.scheduleCompactionLocked(part)
+			}
+		}
+		part.mu.Unlock()
+	}()
+
+	part.mu.Lock()
+	if !part.compacting {
+		part.mu.Unlock()
 		return nil
 	}
 	mergeCount := bphsL0CompactionTrigger
 	if mergeCount > len(part.l0) {
 		mergeCount = len(part.l0)
 	}
+	if mergeCount < 2 {
+		part.mu.Unlock()
+		return nil
+	}
 	old := append([]*SortedFileIndex(nil), part.l0[:mergeCount]...)
+	generation := part.gen
+	part.mu.Unlock()
+
+	if s.l0MergeBuildStart != nil {
+		s.l0MergeBuildStart <- struct{}{}
+	}
+	if s.l0MergeBuildRelease != nil {
+		<-s.l0MergeBuildRelease
+	}
+
 	merged := newPartitionMemtable(0)
 	for _, run := range old {
 		records, err := readBPHSSortedFile(run.FilePath)
@@ -1244,10 +1295,21 @@ func (s *bphsStore) compactL0Locked(part *bphsPartition) error {
 	}
 	l0.InlineValues = s.inline
 
-	part.l0 = append([]*SortedFileIndex{l0}, part.l0[mergeCount:]...)
+	part.mu.Lock()
+	if !part.compacting || part.gen != generation || !sameBHPSL0Prefix(part.l0, old) {
+		part.mu.Unlock()
+		l0.closePool()
+		removeBPHSSortedFile(l0)
+		return fmt.Errorf("partition %d L0 snapshot changed before install", part.index)
+	}
+	part.l0 = append([]*SortedFileIndex{l0}, part.l0[len(old):]...)
 	part.l0Merges++
+	remaining := len(part.l0)
+	mergeRounds := part.l0Merges
+	part.mu.Unlock()
+
 	fmt.Printf("[BPHS-L0] partition=%d merged=%d remaining=%d l0_merge_rounds=%d\n",
-		part.index, mergeCount, len(part.l0), part.l0Merges)
+		part.index, mergeCount, remaining, mergeRounds)
 	for _, run := range old {
 		run.closePool()
 		for _, p := range []string{run.FilePath, sparseIndexPath(run.FilePath)} {

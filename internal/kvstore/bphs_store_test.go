@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -543,6 +544,107 @@ func TestBPHSStoreFlushL0AndRecoverFromNewerRecords(t *testing.T) {
 		if !found || got != want {
 			t.Fatalf("get(%d) = %q,%v; want %q,true", i, got, found, want)
 		}
+	}
+}
+
+func TestBPHSAsyncL0MergeDoesNotBlockWrites(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000000", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs,
+		base,
+		filepath.Join(t.TempDir(), "bphs"),
+		1<<20,
+		0,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildStart := make(chan struct{}, 1)
+	buildRelease := make(chan struct{})
+	store.l0MergeBuildStart = buildStart
+	store.l0MergeBuildRelease = buildRelease
+	var releaseOnce sync.Once
+	releaseBuild := func() {
+		releaseOnce.Do(func() { close(buildRelease) })
+	}
+	defer func() {
+		releaseBuild()
+		store.Close()
+	}()
+
+	part := store.parts[0]
+	for i := 1; i <= bphsL0CompactionTrigger; i++ {
+		if _, err := store.Put(fmt.Sprintf("%010d", i), fmt.Sprintf("value-%d", i), uint32(i)); err != nil {
+			t.Fatal(err)
+		}
+		part.mu.Lock()
+		err := store.flushPartitionLocked(part)
+		part.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case <-buildStart:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background L0 merge did not reach the build barrier")
+	}
+
+	const concurrentVersion = 50
+	const concurrentValue = "written-during-l0-merge"
+	putDone := make(chan error, 1)
+	go func() {
+		_, err := store.Put("0000000005", concurrentValue, concurrentVersion)
+		putDone <- err
+	}()
+	select {
+	case err := <-putDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("PUT blocked on an L0 merge that holds no partition lock")
+	}
+
+	releaseBuild()
+	if err := store.WaitForCompactions(); err != nil {
+		t.Fatal(err)
+	}
+
+	part.mu.RLock()
+	l0Runs := len(part.l0)
+	compacting := part.compacting
+	part.mu.RUnlock()
+	if l0Runs != 1 {
+		t.Fatalf("L0 runs after async merge = %d, want 1", l0Runs)
+	}
+	if compacting {
+		t.Fatal("partition remained marked compacting after async L0 merge")
+	}
+	for i := 1; i <= bphsL0CompactionTrigger; i++ {
+		got, found, err := store.Get(fmt.Sprintf("%010d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("value-%d", i)
+		if !found || got != want {
+			t.Fatalf("get(%d) = %q,%v; want %q,true", i, got, found, want)
+		}
+	}
+	got, found, err := store.Get("0000000005")
+	if err != nil || !found || got != concurrentValue {
+		t.Fatalf("concurrent get = %q,%v,%v; want %q,true,nil",
+			got, found, err, concurrentValue)
 	}
 }
 

@@ -33,11 +33,10 @@ var (
 	// 实测每一轮都是"复用分区=0"（results/amplification/2026-09-09-writeamp）。
 	// 窗口外的分区一个 key 都不会被碰到，预期复用比例约 1-rangeFrac，可直接证伪。
 	rangeFrac = flag.Float64("rangeFrac", 0.25, "dist=range: 覆盖写集中在键空间中一段连续窗口，窗口占这个比例")
-	// keystart 让装载模式写 [keystart, keystart+dnums) 而不是 [0, dnums)。
-	// 用途：在一份已经被 GC 整理过的数据之上，再写一段**全新的** key——这些 key
-	// 只存在于 valuelog 尾部，还没被 GC 搬进分区。AVP（小值内联）与 nezha 唯一不同
-	// 的地方就在这一段：读已整理的数据两者走同一条路，读新写入的数据才分得开。
-	keystart = flag.Int("keystart", 0, "unique load: write keys [keystart, keystart+dnums) instead of [0, dnums)")
+	// keystart 把写入窗口平移到 [keystart, keystart+dnums)（装载模式）或
+	// keystart+[0, keyspace)（覆盖模式）。覆盖模式必须能指定窗口，否则无法只更新
+	// 既有键空间中固定的一段热 range。
+	keystart = flag.Int("keystart", 0, "offset the write window by this key; applies to load and overwrite modes")
 )
 
 type KVClient struct {
@@ -216,7 +215,7 @@ func keysFor(allKeys []int, start, end, worker int) []int {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(worker)))
 	if *dist == "uniform" {
 		for j := range out {
-			out[j] = rnd.Intn(*keyspace)
+			out[j] = *keystart + rnd.Intn(*keyspace)
 		}
 		return out
 	}
@@ -229,13 +228,13 @@ func keysFor(allKeys []int, start, end, worker int) []int {
 		}
 		lo := rand.New(rand.NewSource(int64(*keyspace))).Intn(*keyspace - w + 1)
 		for j := range out {
-			out[j] = lo + rnd.Intn(w)
+			out[j] = *keystart + lo + rnd.Intn(w)
 		}
 		return out
 	}
 	z := rand.NewZipf(rnd, 1.01, 1, uint64(*keyspace-1))
 	for j := range out {
-		out[j] = int(z.Uint64())
+		out[j] = *keystart + int(z.Uint64())
 	}
 	return out
 }

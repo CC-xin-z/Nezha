@@ -33,6 +33,7 @@ var (
 	// 于是 goodPut 归零、吞吐算出 NaN。这与 zipf_read 早先 keyspace 默认 1 亿
 	// 是同一类错误——读的键空间必须等于实际写入量。
 	keyspaceArg = flag.Int("keyspace", 370000, "扫描起点的采样上界；应设为实际写入的记录数")
+	keystartArg = flag.Int("keystart", 0, "扫描窗口起点；key 取自 keystart + [0, keyspace)")
 	outputFile  = flag.String("output", "scan_benchmark_results.txt", "输出结果文件名")
 	// 每轮都要扫遍整个数据集，耗时随数据量线性增长：50 万 key 时一轮约 30s，
 	// 300 万 key 时一轮 3 分钟以上，跑满 100 轮就是 5 小时以上。
@@ -41,6 +42,7 @@ var (
 	numTestsFlag = flag.Int("tests", 100, "测试轮数（结果取各轮平均）")
 	// 轮间静置。原先固定 5 秒，100 轮即 500 秒纯等待，而每轮扫描往往只要几毫秒。
 	restSecFlag = flag.Int("rest", 5, "轮间静置秒数，让系统状态回稳")
+	stopFile    = flag.String("stopFile", "", "如果该文件存在，SCAN 客户端在当前请求后尽快结束")
 )
 
 type KVClient struct {
@@ -117,16 +119,25 @@ func (kvc *KVClient) scan(gapkey int) (float64, time.Duration, float64) {
 			// var totalActualLatency time.Duration
 
 			// 每次范围查询单独计时，攒在本地切片里，本 goroutine 跑完一次性交出去。
-			samples := make([]time.Duration, 0, requestCounts[i])
+			capacity := requestCounts[i]
+			if capacity > 1<<20 {
+				capacity = 1 << 20
+			}
+			samples := make([]time.Duration, 0, capacity)
 
 			for j := 0; j < requestCounts[i]; j++ {
+				if j&63 == 0 && *stopFile != "" {
+					if _, err := os.Stat(*stopFile); err == nil {
+						break
+					}
+				}
 				// 起点上界要留出一个 gapkey，否则区间尾部越过数据末端，
 				// 扫回来的条数比 gapkey 少，吞吐被系统性低估。
 				upper := *keyspaceArg - gapkey
 				if upper < 1 {
 					upper = 1
 				}
-				k1 := rand.Intn(upper)
+				k1 := *keystartArg + rand.Intn(upper)
 				// k1 := (i*base + j) * gapkey
 				k2 := k1 + gapkey - 1
 				startKey := strconv.Itoa(k1)

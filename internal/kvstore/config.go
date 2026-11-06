@@ -159,8 +159,10 @@ type Config struct {
 	// size, so using L0 alone would never reclaim a growing partition VLog.
 	BPHSPartitionGCThresholdMB int
 	// BPHSDynamicSplit enables Raft-replicated logical split when an idle local
-	// partition exceeds twice the configured partition target.
-	BPHSDynamicSplit bool
+	// partition exceeds the configured percentage of the partition target.
+	// Values <= 0 use 150%.
+	BPHSDynamicSplit          bool
+	BPHSSplitThresholdPercent int
 
 	// LSM-Raft baseline (lsmraft.go): span size and idle cut.
 	SSTSpanMB int
