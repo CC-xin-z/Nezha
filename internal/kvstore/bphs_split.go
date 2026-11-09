@@ -306,35 +306,15 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	newID := len(s.parts)
 	s.mu.RUnlock()
 
-	// A split command is already in the Raft apply path. If an asynchronous
-	// flush detached the parent MemTable after candidate selection, wait for
-	// its L0 to become visible before computing ownership bounds. Waiting here
-	// preserves correctness without letting the child miss those versions.
-	var partLocked bool
-	for !partLocked {
-		part.mu.RLock()
-		flushing, done := part.flushing, part.flushDone
-		part.mu.RUnlock()
-		if flushing {
-			if done != nil {
-				<-done
-			}
-			continue
-		}
-
-		part.mu.Lock()
-		if part.compacting {
-			part.mu.Unlock()
-			if err := s.WaitForCompactions(); err != nil {
-				return fmt.Errorf("wait for partition %d compaction before split: %w", parentID, err)
-			}
-			continue
-		}
-		partLocked = true
-	}
+	part.mu.Lock()
 	defer part.mu.Unlock()
-	if part.immutable != nil {
-		return fmt.Errorf("partition %d has an uninstalled immutable MemTable", parentID)
+	if part.compacting || part.flushing || part.immutable != nil {
+		// A committed split must not wait for asynchronous maintenance inside
+		// the serialized Raft apply loop. The next candidate poll will submit a
+		// new command once this partition is stable again.
+		fmt.Printf("[BPHS-SPLIT] deferred parent=%d compacting=%v flushing=%v immutable=%v\n",
+			parentID, part.compacting, part.flushing, part.immutable != nil)
+		return nil
 	}
 	if !part.baseLocal || part.base == nil {
 		return fmt.Errorf("partition %d has no local base", parentID)
