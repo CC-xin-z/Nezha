@@ -122,21 +122,27 @@ func (s *bphsStore) chooseSplitCandidate(maxLogicalBytes int64) (bphsSplitCandid
 	var best bphsSplitCandidate
 	var bestSize int64
 	for _, part := range parts {
+		s.snapshotMu.RLock()
 		part.mu.RLock()
-		eligible := part.baseLocal && part.base != nil && !part.compacting &&
+		eligible := part.baseLocal && part.base != nil &&
+			!part.compacting && !part.flushing && part.immutable == nil &&
 			part.vlog.Size() == 0 &&
 			part.logicalBytes > maxLogicalBytes
 		if !eligible {
 			part.mu.RUnlock()
+			s.snapshotMu.RUnlock()
 			continue
 		}
-		live, err := s.collectBPHSOwnedRecordsLocked(part)
+		view := s.partitionReadViewLocked(part)
+		view.mem = append([]bphsRecord(nil), part.mem.Sorted()...)
 		size := part.logicalBytes
+		part.mu.RUnlock()
+		live, err := s.collectBPHSViewRecords(view)
+		s.snapshotMu.RUnlock()
 		var splitKey string
 		if err == nil && len(live) >= 3 {
 			splitKey = live[len(live)/2].Key
 		}
-		part.mu.RUnlock()
 		if splitKey == "" || size <= bestSize {
 			continue
 		}
@@ -147,6 +153,47 @@ func (s *bphsStore) chooseSplitCandidate(maxLogicalBytes int64) (bphsSplitCandid
 		bestSize = size
 	}
 	return best, bestSize > 0
+}
+
+func (s *bphsStore) collectBPHSViewRecords(view bphsPartitionReadView) ([]bphsRecord, error) {
+	latest := make(map[string]bphsRecord)
+	put := func(rec bphsRecord) {
+		if (view.ownershipLo != "" && rec.Key < view.ownershipLo) ||
+			(view.ownershipHi != "" && rec.Key >= view.ownershipHi) {
+			return
+		}
+		old, ok := latest[rec.Key]
+		if !ok || rec.Version >= old.Version {
+			latest[rec.Key] = rec
+		}
+	}
+	if view.base != nil {
+		records, err := readRawSortedFile(view.base.FilePath)
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range records {
+			put(rec)
+		}
+	}
+	for _, run := range view.l0 {
+		records, err := readBPHSSortedFile(run.FilePath)
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range records {
+			put(rec)
+		}
+	}
+	for _, rec := range view.mem {
+		put(rec)
+	}
+	out := make([]bphsRecord, 0, len(latest))
+	for _, rec := range latest {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
 }
 
 // collectBPHSOwnedRecordsLocked merges Base, immutable L0 runs and the active
@@ -259,10 +306,35 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	newID := len(s.parts)
 	s.mu.RUnlock()
 
-	part.mu.Lock()
+	// A split command is already in the Raft apply path. If an asynchronous
+	// flush detached the parent MemTable after candidate selection, wait for
+	// its L0 to become visible before computing ownership bounds. Waiting here
+	// preserves correctness without letting the child miss those versions.
+	var partLocked bool
+	for !partLocked {
+		part.mu.RLock()
+		flushing, done := part.flushing, part.flushDone
+		part.mu.RUnlock()
+		if flushing {
+			if done != nil {
+				<-done
+			}
+			continue
+		}
+
+		part.mu.Lock()
+		if part.compacting {
+			part.mu.Unlock()
+			if err := s.WaitForCompactions(); err != nil {
+				return fmt.Errorf("wait for partition %d compaction before split: %w", parentID, err)
+			}
+			continue
+		}
+		partLocked = true
+	}
 	defer part.mu.Unlock()
-	if part.compacting {
-		return fmt.Errorf("partition %d is compacting", parentID)
+	if part.immutable != nil {
+		return fmt.Errorf("partition %d has an uninstalled immutable MemTable", parentID)
 	}
 	if !part.baseLocal || part.base == nil {
 		return fmt.Errorf("partition %d has no local base", parentID)
@@ -407,8 +479,11 @@ func (s *bphsStore) splitPartition(parentID int, splitKey string, commandIndex u
 	s.mu.Lock()
 	if len(s.parts) != newID {
 		s.mu.Unlock()
-		s.releaseBase(childBase.FilePath)
-		removeBPHSSortedFile(childBase)
+		if s.releaseBase(childBase.FilePath) {
+			removeBPHSSortedFile(childBase)
+		} else {
+			childBase.closePool()
+		}
 		cleanupChild()
 		return fmt.Errorf("partition layout changed concurrently during split")
 	}

@@ -1,6 +1,7 @@
 package kvstore
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,6 +60,62 @@ func TestPartitionRecordLogRoundTripAndScan(t *testing.T) {
 			got[i].Blob != want[i].Blob || got[i].LogOffset != offsets[i] {
 			t.Fatalf("scan record %d = %+v, want %+v at offset %d", i, got[i], want[i], offsets[i])
 		}
+	}
+}
+
+func TestPartitionRecordLogDiscardDurablePrefix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p0.records")
+	log, err := openPartitionRecordLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	for i := 1; i <= 4; i++ {
+		if _, err := log.Append(bphsRecord{
+			Key:     fmt.Sprintf("key-%d", i),
+			Version: uint32(i),
+			Kind:    bphsInlineRecord,
+			Value:   fmt.Sprintf("value-%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first two records are already durable in an L0. Only the suffix
+	// containing records 3 and 4 must survive prefix compaction.
+	first, err := log.ReadAt(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := log.ReadAt(int64(partitionRecordHeaderBytes + len(first.Key) + len(first.Value)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := int64(partitionRecordHeaderBytes + len(first.Key) + len(first.Value))
+	boundary += int64(partitionRecordHeaderBytes + len(second.Key) + len(second.Value))
+
+	if err := log.DiscardPrefix(boundary); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ScanAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Version != 3 || records[1].Version != 4 {
+		t.Fatalf("records after prefix discard = %+v, want versions [3 4]", records)
+	}
+
+	reopened, err := openPartitionRecordLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	records, err = reopened.ScanAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Version != 3 || records[1].Version != 4 {
+		t.Fatalf("reopened records after prefix discard = %+v, want versions [3 4]", records)
 	}
 }
 

@@ -648,6 +648,177 @@ func TestBPHSAsyncL0MergeDoesNotBlockWrites(t *testing.T) {
 	}
 }
 
+func TestBPHSScanSnapshotDoesNotBlockWrites(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000000", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs,
+		base,
+		filepath.Join(t.TempDir(), "bphs"),
+		1<<20,
+		0,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotStart := make(chan struct{}, 1)
+	snapshotRelease := make(chan struct{})
+	store.scanSnapshotStart = snapshotStart
+	store.scanSnapshotRelease = snapshotRelease
+	var releaseOnce sync.Once
+	releaseSnapshot := func() {
+		releaseOnce.Do(func() { close(snapshotRelease) })
+	}
+	defer func() {
+		releaseSnapshot()
+		store.Close()
+	}()
+
+	if _, err := store.Put("0000000001", "before-scan", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	type scanReply struct {
+		result map[string]string
+		err    error
+	}
+	scanDone := make(chan scanReply, 1)
+	go func() {
+		result, err := store.Scan("0000000001", "0000000009")
+		scanDone <- scanReply{result: result, err: err}
+	}()
+
+	select {
+	case <-snapshotStart:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SCAN did not capture its partition snapshot")
+	}
+
+	putDone := make(chan error, 1)
+	go func() {
+		_, err := store.Put("0000000002", "during-scan", 2)
+		putDone <- err
+	}()
+	select {
+	case err := <-putDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("PUT blocked behind SCAN file I/O")
+	}
+
+	releaseSnapshot()
+	select {
+	case reply := <-scanDone:
+		if reply.err != nil {
+			t.Fatal(reply.err)
+		}
+		if got := reply.result["0000000001"]; got != "before-scan" {
+			t.Fatalf("snapshot value = %q, want before-scan", got)
+		}
+		if _, exists := reply.result["0000000002"]; exists {
+			t.Fatal("SCAN observed a write committed after its snapshot")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SCAN did not finish after releasing its snapshot")
+	}
+
+	got, found, err := store.Get("0000000002")
+	if err != nil || !found || got != "during-scan" {
+		t.Fatalf("GET concurrent write = %q,%v,%v", got, found, err)
+	}
+}
+
+func TestBPHSAsyncFlushDoesNotBlockWrites(t *testing.T) {
+	kvs := &KVServer{
+		persister:       &raft.Persister{},
+		inlineThreshold: 512,
+		indexBlockBytes: 128,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000000", "base")
+	defer base.Close()
+
+	store, err := openBPHSStore(
+		kvs,
+		base,
+		filepath.Join(t.TempDir(), "bphs"),
+		1,
+		0,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	flushStart := make(chan struct{}, 1)
+	flushRelease := make(chan struct{})
+	store.flushBuildStart = flushStart
+	store.flushBuildRelease = flushRelease
+	var releaseOnce sync.Once
+	releaseFlush := func() {
+		releaseOnce.Do(func() { close(flushRelease) })
+	}
+	defer func() {
+		releaseFlush()
+		store.Close()
+	}()
+
+	if _, err := store.Put("0000000001", "first", 1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-flushStart:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async flush did not reach its build barrier")
+	}
+
+	putDone := make(chan error, 1)
+	go func() {
+		_, err := store.Put("0000000002", "second", 2)
+		putDone <- err
+	}()
+	select {
+	case err := <-putDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("PUT blocked behind L0 file construction")
+	}
+
+	value, found, err := store.Get("0000000001")
+	if err != nil || !found || value != "first" {
+		t.Fatalf("GET immutable value = %q,%v,%v", value, found, err)
+	}
+	value, found, err = store.Get("0000000002")
+	if err != nil || !found || value != "second" {
+		t.Fatalf("GET active value = %q,%v,%v", value, found, err)
+	}
+
+	releaseFlush()
+	if err := store.WaitForCompactions(); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"0000000001": "first",
+		"0000000002": "second",
+	} {
+		value, found, err := store.Get(key)
+		if err != nil || !found || value != want {
+			t.Fatalf("GET %s after flush = %q,%v,%v", key, value, found, err)
+		}
+	}
+}
+
 func TestBPHSFullPartitionCompaction(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},

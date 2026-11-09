@@ -123,6 +123,80 @@ func (l *partitionRecordLog) Reset() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.resetLocked()
+}
+
+// DiscardPrefix atomically rewrites the record log without its first
+// prefixBytes. The caller must ensure prefixBytes is a record boundary and
+// must serialize this operation with Append (the BPHS partition lock does
+// that). New writes appended after the flush snapshot are retained.
+func (l *partitionRecordLog) DiscardPrefix(prefixBytes int64) error {
+	if l == nil {
+		return fmt.Errorf("nil partition record log")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return os.ErrClosed
+	}
+	if err := l.writer.Flush(); err != nil {
+		return err
+	}
+	if prefixBytes <= 0 {
+		return nil
+	}
+	if prefixBytes > l.size {
+		return fmt.Errorf("partition record prefix %d exceeds log size %d", prefixBytes, l.size)
+	}
+	if prefixBytes == l.size {
+		return l.resetLocked()
+	}
+
+	tmpPath := l.path + ".prefix-rewrite"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(tmp, io.NewSectionReader(l.file, prefixBytes, l.size-prefixBytes))
+	if copyErr == nil {
+		copyErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if copyErr != nil {
+		os.Remove(tmpPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		os.Remove(tmpPath)
+		return closeErr
+	}
+
+	if err := l.file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	l.file = nil
+	l.writer = nil
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		// Keep the object usable for diagnosis even if the replacement fails.
+		l.file, _ = os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		if l.file != nil {
+			l.writer = bufio.NewWriterSize(l.file, 256<<10)
+		}
+		os.Remove(tmpPath)
+		return err
+	}
+	l.size -= prefixBytes
+	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	l.file = file
+	l.writer = bufio.NewWriterSize(file, 256<<10)
+	return nil
+}
+
+func (l *partitionRecordLog) resetLocked() error {
 	if l.file != nil {
 		l.writer = nil
 		if err := l.file.Close(); err != nil {

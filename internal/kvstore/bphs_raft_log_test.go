@@ -70,6 +70,9 @@ func TestBPHSRaftLogWALAdvancesDurableIndexAfterL0(t *testing.T) {
 	if _, err := store.Put("0000000001", "flush-to-l0", 2); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.WaitForCompactions(); err != nil {
+		t.Fatal(err)
+	}
 	if got := store.DurableIndex(); got < 2 {
 		t.Fatalf("durable index = %d, want at least 2 after L0 flush", got)
 	}
