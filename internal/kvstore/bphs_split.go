@@ -319,7 +319,8 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	s.mu.RLock()
 	if parentID < 0 || parentID >= len(s.parts) {
 		s.mu.RUnlock()
-		return fmt.Errorf("invalid parent partition id %d", parentID)
+		fmt.Printf("[BPHS-SPLIT] stale parent=%d: partition id is absent locally\n", parentID)
+		return nil
 	}
 	part := s.parts[parentID]
 	newID := len(s.parts)
@@ -329,13 +330,13 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		fmt.Printf("[BPHS-SPLIT] stale parent=%d: partition is no longer in the current layout\n", parentID)
 		return nil
 	}
-	if (cmd.ParentLo != "" && cmd.ParentLo != owner.ownershipLo) ||
-		(cmd.ParentHi != "" && cmd.ParentHi != owner.ownershipHi) {
+	rangeMismatch := (cmd.ParentLo != "" && cmd.ParentLo != owner.ownershipLo) ||
+		(cmd.ParentHi != "" && cmd.ParentHi != owner.ownershipHi)
+	if rangeMismatch {
 		fmt.Printf(
-			"[BPHS-SPLIT] stale parent=%d range=[%q,%q), command=[%q,%q)\n",
+			"[BPHS-SPLIT] local range parent=%d range=[%q,%q), command=[%q,%q); using local ownership\n",
 			parentID, owner.ownershipLo, owner.ownershipHi, cmd.ParentLo, cmd.ParentHi,
 		)
-		return nil
 	}
 	if splitKey == "" ||
 		(owner.ownershipLo != "" && splitKey < owner.ownershipLo) ||
@@ -381,7 +382,7 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	}
 
 	bounds := cmd.Bounds
-	if bounds.LeftEntries <= 0 || bounds.RightEntries <= 0 {
+	if rangeMismatch || bounds.LeftEntries <= 0 || bounds.RightEntries <= 0 {
 		live, err := s.collectBPHSViewRecords(view)
 		if err != nil {
 			return err

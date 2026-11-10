@@ -292,6 +292,8 @@ func TestBPHSSplitWithActiveMemTable(t *testing.T) {
 
 	payload, err := json.Marshal(bphsSplitCommand{
 		ParentID: 0,
+		ParentLo: "0000000001",
+		ParentHi: "0000000099",
 		SplitKey: "0000000006",
 	})
 	if err != nil {
@@ -702,6 +704,22 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	if len(store.parts) != 2 {
 		t.Fatalf("duplicate split changed partition count to %d", len(store.parts))
 	}
+	stalePayload, err := json.Marshal(bphsSplitCommand{ParentID: 2, SplitKey: "0000000008"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kvs.mu.Lock()
+	staleErr := kvs.applyBPHSSplit(&raftrpc.DetailCod{
+		OpType: bphsSplitOp,
+		Value:  string(stalePayload),
+	}, 14)
+	kvs.mu.Unlock()
+	if staleErr != nil {
+		t.Fatalf("stale split with an absent parent must be a no-op: %v", staleErr)
+	}
+	if len(store.parts) != 2 {
+		t.Fatalf("stale split changed partition count to %d", len(store.parts))
+	}
 
 	left, err := store.route("0000000001")
 	if err != nil {
@@ -717,7 +735,7 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	if value, found, err := store.Get("0000000005"); err != nil || !found || value != "value-updated" {
 		t.Fatalf("GET after split = %q,%v,%v", value, found, err)
 	}
-	if childID, err := store.Put("0000000006", "gap-value", 13); err != nil || childID != 1 {
+	if childID, err := store.Put("0000000006", "gap-value", 15); err != nil || childID != 1 {
 		t.Fatalf("PUT in split gap routed to %d, err=%v", childID, err)
 	}
 	if got, err := store.Scan("0000000001", "0000000010"); err != nil || len(got) != 10 {
