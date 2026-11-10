@@ -31,6 +31,17 @@ func newKeyTestKV(t *testing.T) *KVServer {
 	return kvs
 }
 
+func TestStartScanNilPersisterReturnsError(t *testing.T) {
+	kvs := &KVServer{}
+	reply := kvs.StartScan_opt(&kvrpc.ScanRangeRequest{
+		StartKey: "0000000000",
+		EndKey:   "0000000010",
+	}, nil, "")
+	if reply.Err == raft.OK {
+		t.Fatal("nil persister scan unexpectedly succeeded")
+	}
+}
+
 func TestServerKeepsAwkwardKeysDistinct(t *testing.T) {
 	kvs := newKeyTestKV(t)
 

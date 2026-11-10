@@ -215,6 +215,13 @@ func (kvs *KVServer) StartScan_opt(args *kvrpc.ScanRangeRequest, persister *raft
 	startKey := args.GetStartKey()
 	endKey := args.GetEndKey()
 	reply := &kvrpc.ScanRangeResponse{Err: raft.OK}
+	if persister == nil {
+		// A GC snapshot can observe a store that is already retired. Treat this
+		// as a retryable read failure; dereferencing the nil persister would
+		// terminate the node and can cost the cluster its quorum.
+		reply.Err = raft.ErrInternal
+		return reply
+	}
 
 	// 执行范围查询
 	result, err := kvs.scanNewFile(startKey, endKey, persister, logLocation)
