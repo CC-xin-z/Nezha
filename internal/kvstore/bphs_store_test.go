@@ -133,7 +133,9 @@ func TestBPHSScanMergesBaseL0AndMemByNewestKey(t *testing.T) {
 		dir:    dir,
 		inline: NewInlineCache(0),
 	}
-	store.basePtr.Store(baseSet)
+	if err := store.publishLayout(baseSet, store.parts); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := store.Scan("a", "z")
 	if err != nil {
@@ -308,6 +310,11 @@ func TestBPHSRecordSyncQueueCoalescesPartitions(t *testing.T) {
 		recordSyncSignal:  make(chan struct{}, 1),
 		parts:             []*bphsPartition{p0, p1, p2},
 	}
+	store.layout.Store(&bphsLayout{byID: []bphsPartitionView{
+		{id: 0, part: p0},
+		{id: 1, part: p1},
+		{id: 2, part: p2},
+	}})
 	store.queueRecordSync(map[int]struct{}{0: {}, 1: {}})
 	store.queueRecordSync(map[int]struct{}{1: {}, 2: {}})
 

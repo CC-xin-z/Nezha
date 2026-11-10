@@ -77,7 +77,7 @@ func TestBPHSSplitWaitsForConcurrentMaterialization(t *testing.T) {
 	}
 }
 
-func TestBPHSSplitDefersDuringPartitionMaintenance(t *testing.T) {
+func TestBPHSSplitKeepsReadsAvailableDuringMaintenance(t *testing.T) {
 	dataDir := t.TempDir()
 	valuelogDir := filepath.Join(dataDir, "data", "valuelog")
 	if err := os.MkdirAll(valuelogDir, 0o755); err != nil {
@@ -119,6 +119,7 @@ func TestBPHSSplitDefersDuringPartitionMaintenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	kvs.bphs = store
 	if _, err := store.CompactForRead(); err != nil {
 		t.Fatal(err)
 	}
@@ -128,30 +129,109 @@ func TestBPHSSplitDefersDuringPartitionMaintenance(t *testing.T) {
 	part.mu.Lock()
 	part.compacting = true
 	part.mu.Unlock()
-	defer func() {
-		part.mu.Lock()
-		part.compacting = false
-		part.mu.Unlock()
+	store.scanSnapshotStart = make(chan struct{}, 1)
+	store.scanSnapshotRelease = make(chan struct{})
+
+	type scanOutcome struct {
+		rows map[string]string
+		err  error
+	}
+	scanDone := make(chan scanOutcome, 1)
+	go func() {
+		rows, err := store.Scan("0000000001", "0000000010")
+		scanDone <- scanOutcome{rows: rows, err: err}
 	}()
+	select {
+	case <-store.scanSnapshotStart:
+	case <-time.After(time.Second):
+		t.Fatal("SCAN did not capture its pre-split view")
+	}
+
+	store.splitPrepareStart = make(chan struct{}, 1)
+	store.splitPrepareRelease = make(chan struct{})
+	payload, err := json.Marshal(bphsSplitCommand{ParentID: 0, SplitKey: "0000000006"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	done := make(chan error, 1)
 	go func() {
-		done <- store.splitPartition(0, "0000000006", 11)
+		done <- kvs.applyBPHSSplitOutsideBatch(raft.ApplyMsg{
+			Command: &raftrpc.DetailCod{
+				OpType: bphsSplitOp,
+				Value:  string(payload),
+			},
+			CommandIndex: 11,
+		})
 	}()
 	select {
-	case err := <-done:
+	case <-store.splitPrepareStart:
+	case <-time.After(time.Second):
+		t.Fatal("split did not reach its preparation barrier")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		value, found, err := store.Get("0000000005")
 		if err != nil {
-			t.Fatalf("split defer returned error: %v", err)
+			readDone <- err
+			return
+		}
+		if !found || value != "value-05" {
+			readDone <- fmt.Errorf("GET during split = %q,%v", value, found)
+			return
+		}
+		readDone <- nil
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("split command blocked waiting for background maintenance")
+		t.Fatal("GET/SCAN blocked while split was preparing a child")
+	}
+	lockDone := make(chan struct{})
+	go func() {
+		kvs.mu.Lock()
+		kvs.mu.Unlock()
+		close(lockDone)
+	}()
+	select {
+	case <-lockDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("split preparation held kvs.mu and blocked new read snapshots")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("split completed before preparation was released: %v", err)
+	default:
+	}
+	close(store.splitPrepareRelease)
+	if err := <-done; err != nil {
+		t.Fatalf("split after preparation barrier failed: %v", err)
 	}
 
 	store.mu.RLock()
 	partCount := len(store.parts)
 	store.mu.RUnlock()
-	if partCount != 1 {
-		t.Fatalf("deferred split changed partition count to %d", partCount)
+	if partCount != 2 {
+		t.Fatalf("online split left %d partitions, want 2", partCount)
+	}
+	if value, found, err := store.Get("0000000009"); err != nil || !found || value != "value-09" {
+		t.Fatalf("right-side GET after online split = %q,%v,%v", value, found, err)
+	}
+	close(store.scanSnapshotRelease)
+	select {
+	case outcome := <-scanDone:
+		if outcome.err != nil {
+			t.Fatalf("pre-split SCAN failed after ownership publication: %v", outcome.err)
+		}
+		if len(outcome.rows) != 10 {
+			t.Fatalf("pre-split SCAN returned %d rows after split, want 10", len(outcome.rows))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pre-split SCAN did not finish after ownership publication")
 	}
 }
 
@@ -609,6 +689,18 @@ func TestBPHSLogicalSplitRoutesAndRecovers(t *testing.T) {
 	}
 	if len(store.parts) != 2 || kvs.lastPartitions.Len() != 2 {
 		t.Fatalf("split left store=%d route=%d partitions", len(store.parts), kvs.lastPartitions.Len())
+	}
+	kvs.mu.Lock()
+	duplicateErr := kvs.applyBPHSSplit(&raftrpc.DetailCod{
+		OpType: bphsSplitOp,
+		Value:  string(payload),
+	}, 13)
+	kvs.mu.Unlock()
+	if duplicateErr != nil {
+		t.Fatalf("duplicate split should be an idempotent no-op: %v", duplicateErr)
+	}
+	if len(store.parts) != 2 {
+		t.Fatalf("duplicate split changed partition count to %d", len(store.parts))
 	}
 
 	left, err := store.route("0000000001")

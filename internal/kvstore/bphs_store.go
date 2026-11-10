@@ -106,6 +106,22 @@ type bphsPartitionReadView struct {
 	ownershipHi string
 }
 
+// bphsLayout is an immutable ownership view used by request handling. A read
+// captures one layout for its whole lifetime, so a split can atomically publish
+// a new owner map without changing the meaning of an in-flight GET or SCAN.
+type bphsLayout struct {
+	version uint64
+	set     *PartitionSet
+	byID    []bphsPartitionView
+}
+
+type bphsPartitionView struct {
+	id          int
+	part        *bphsPartition
+	ownershipLo string
+	ownershipHi string
+}
+
 func (p *bphsPartition) ownsKey(key string) bool {
 	if p == nil {
 		return false
@@ -121,6 +137,7 @@ type bphsStore struct {
 	kvs                       *KVServer
 	base                      *PartitionSet
 	basePtr                   atomic.Pointer[PartitionSet]
+	layout                    atomic.Pointer[bphsLayout]
 	parts                     []*bphsPartition
 	dir                       string
 	memtableBytes             int64
@@ -164,6 +181,8 @@ type bphsStore struct {
 	flushBuildRelease   chan struct{}
 	scanSnapshotStart   chan struct{}
 	scanSnapshotRelease chan struct{}
+	splitPrepareStart   chan struct{}
+	splitPrepareRelease chan struct{}
 }
 
 func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes, inlineCacheBytes int64, maxVersion uint32) (*bphsStore, error) {
@@ -367,6 +386,10 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			return nil, fmt.Errorf("missing BPHS partition %d after recovery", i)
 		}
 	}
+	if err := s.publishLayout(base, s.parts); err != nil {
+		s.Close()
+		return nil, err
+	}
 	s.baseRefMu.Lock()
 	s.baseRefs = make(map[string]int)
 	for _, part := range s.parts {
@@ -507,7 +530,12 @@ func (s *bphsStore) compactLoop() {
 		case <-s.compactStop:
 			return
 		case idx := <-s.compactCh:
-			part := s.parts[idx]
+			owner, ok := s.currentLayoutView(idx)
+			if !ok {
+				s.compactJobs.Done()
+				continue
+			}
+			part := owner.part
 			part.mu.RLock()
 			l0Only := part.vlog.Size() == 0 && len(part.l0) >= bphsL0CompactionTrigger
 			part.mu.RUnlock()
@@ -707,7 +735,7 @@ func (s *bphsStore) SetBase(base *PartitionSet) error {
 	for pos := range base.parts {
 		s.parts[base.partitionID(pos)].base = base.parts[pos]
 	}
-	return nil
+	return s.publishLayout(base, s.parts)
 }
 
 // UseOwnershipMetadata replaces the activation-time partition object with a
@@ -719,7 +747,54 @@ func (s *bphsStore) UseOwnershipMetadata(base *PartitionSet) {
 	s.mu.Lock()
 	s.base = base
 	s.basePtr.Store(base)
+	_ = s.publishLayout(base, s.parts)
 	s.mu.Unlock()
+}
+
+// publishLayout builds and publishes one complete owner map. The caller holds
+// s.mu while mutating base/parts. publishLayout itself only allocates immutable
+// slices and performs the atomic publication.
+func (s *bphsStore) publishLayout(base *PartitionSet, parts []*bphsPartition) error {
+	if s == nil || base == nil {
+		return fmt.Errorf("BPHS layout requires a partition set")
+	}
+	layout := &bphsLayout{
+		set:  base,
+		byID: make([]bphsPartitionView, len(parts)),
+	}
+	if old := s.layout.Load(); old != nil {
+		layout.version = old.version + 1
+	} else {
+		layout.version = 1
+	}
+	for pos := range base.parts {
+		id := base.partitionID(pos)
+		if id < 0 || id >= len(parts) || parts[id] == nil {
+			return fmt.Errorf("BPHS layout references invalid partition id %d", id)
+		}
+		layout.byID[id] = bphsPartitionView{
+			id:          id,
+			part:        parts[id],
+			ownershipLo: base.parts[pos].OwnershipLo,
+			ownershipHi: base.parts[pos].OwnershipHi,
+		}
+	}
+	s.base = base
+	s.basePtr.Store(base)
+	s.layout.Store(layout)
+	return nil
+}
+
+func (s *bphsStore) currentLayoutView(id int) (bphsPartitionView, bool) {
+	if s == nil {
+		return bphsPartitionView{}, false
+	}
+	layout := s.layout.Load()
+	if layout == nil || id < 0 || id >= len(layout.byID) {
+		return bphsPartitionView{}, false
+	}
+	view := layout.byID[id]
+	return view, view.part != nil
 }
 
 func (s *bphsStore) retainBase(path string) {
@@ -791,15 +866,30 @@ func (s *bphsStore) AllPartitionsMaterialized() bool {
 }
 
 func (s *bphsStore) route(paddedKey string) (*bphsPartition, error) {
+	view, err := s.routeView(paddedKey)
+	if err != nil {
+		return nil, err
+	}
+	return view.part, nil
+}
+
+func (s *bphsStore) routeView(paddedKey string) (bphsPartitionView, error) {
 	if s == nil {
-		return nil, fmt.Errorf("BPHS store is nil")
+		return bphsPartitionView{}, fmt.Errorf("BPHS store is nil")
 	}
-	base := s.basePtr.Load()
-	_, idx, ok := base.findOwned(paddedKey)
-	if !ok || idx < 0 || idx >= len(s.parts) {
-		return nil, fmt.Errorf("no BPHS partition owns key %q", paddedKey)
+	layout := s.layout.Load()
+	if layout == nil || layout.set == nil {
+		return bphsPartitionView{}, fmt.Errorf("BPHS layout is not ready")
 	}
-	return s.parts[base.partitionID(idx)], nil
+	_, idx, ok := layout.set.findOwned(paddedKey)
+	if !ok || idx < 0 || idx >= len(layout.set.parts) {
+		return bphsPartitionView{}, fmt.Errorf("no BPHS partition owns key %q", paddedKey)
+	}
+	id := layout.set.partitionID(idx)
+	if id < 0 || id >= len(layout.byID) || layout.byID[id].part == nil {
+		return bphsPartitionView{}, fmt.Errorf("BPHS layout has no slot for partition %d", id)
+	}
+	return layout.byID[id], nil
 }
 
 func (s *bphsStore) Dir() string {
@@ -835,10 +925,11 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	if err := s.compactionError(); err != nil {
 		return -1, fmt.Errorf("background partition compaction: %w", err)
 	}
-	part, err := s.route(key)
+	owner, err := s.routeView(key)
 	if err != nil {
 		return -1, err
 	}
+	part := owner.part
 
 	lockStart := time.Now()
 	part.mu.Lock()
@@ -1092,10 +1183,12 @@ func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
 }
 
 type bphsCompactionSnapshot struct {
-	base       *SortedFileIndex
-	l0         []*SortedFileIndex
-	mem        []bphsRecord
-	generation uint64
+	base        *SortedFileIndex
+	l0          []*SortedFileIndex
+	mem         []bphsRecord
+	generation  uint64
+	ownershipLo string
+	ownershipHi string
 }
 
 func (s *bphsStore) captureCompactionSnapshot(
@@ -1107,9 +1200,11 @@ func (s *bphsStore) captureCompactionSnapshot(
 		return bphsCompactionSnapshot{}, false
 	}
 	snapshot := bphsCompactionSnapshot{
-		base:       part.base,
-		l0:         append([]*SortedFileIndex(nil), part.l0...),
-		generation: part.gen,
+		base:        part.base,
+		l0:          append([]*SortedFileIndex(nil), part.l0...),
+		generation:  part.gen,
+		ownershipLo: part.ownershipLo,
+		ownershipHi: part.ownershipHi,
 	}
 	if part.mem.Len() > 0 || (part.immutable != nil && part.immutable.Len() > 0) {
 		var immutable []bphsRecord
@@ -1222,6 +1317,8 @@ func (s *bphsStore) installCompactionSnapshot(
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
 		if s.releaseBase(oldBase.FilePath) {
 			removeBPHSSortedFile(oldBase)
+		} else {
+			oldBase.closePool()
 		}
 	}
 	return nil
@@ -1419,6 +1516,8 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
 		if s.releaseBase(oldBase.FilePath) {
 			removeBPHSSortedFile(oldBase)
+		} else {
+			oldBase.closePool()
 		}
 	}
 	return nil
@@ -1745,14 +1844,17 @@ func loadBPHSBaseFile(kvs *KVServer, dir string, meta bphsPartitionManifest, inl
 	}, nil
 }
 
-func (s *bphsStore) partitionReadViewLocked(part *bphsPartition) bphsPartitionReadView {
+func (s *bphsStore) partitionReadViewLocked(
+	part *bphsPartition,
+	ownershipLo, ownershipHi string,
+) bphsPartitionReadView {
 	view := bphsPartitionReadView{
 		index:       part.index,
 		base:        part.base,
 		generation:  part.gen,
 		vlog:        part.vlog,
-		ownershipLo: part.ownershipLo,
-		ownershipHi: part.ownershipHi,
+		ownershipLo: ownershipLo,
+		ownershipHi: ownershipHi,
 		immutable:   part.immutable,
 	}
 	if len(part.l0) > 0 {
@@ -1780,15 +1882,15 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if err := s.compactionError(); err != nil {
 		return "", false, fmt.Errorf("background partition compaction: %w", err)
 	}
-	part, err := s.route(key)
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+	owner, err := s.routeView(key)
 	if err != nil {
 		return "", false, err
 	}
-
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
+	part := owner.part
 	part.mu.RLock()
-	view := s.partitionReadViewLocked(part)
+	view := s.partitionReadViewLocked(part, owner.ownershipLo, owner.ownershipHi)
 	memRecord, memFound := part.mem.Get(key)
 	part.mu.RUnlock()
 
@@ -1864,7 +1966,11 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 
 	s.snapshotMu.RLock()
 	defer s.snapshotMu.RUnlock()
-	base := s.basePtr.Load()
+	layout := s.layout.Load()
+	if layout == nil || layout.set == nil {
+		return nil, fmt.Errorf("BPHS layout is not ready")
+	}
+	base := layout.set
 
 	result := make(map[string]string)
 	first, last := base.ownedOverlapBounds(startKey, endKey)
@@ -1874,9 +1980,14 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 	}()
 	snapshotSignaled := false
 	for i := first; i < last; i++ {
-		part := s.parts[base.partitionID(i)]
+		id := base.partitionID(i)
+		if id < 0 || id >= len(layout.byID) || layout.byID[id].part == nil {
+			return nil, fmt.Errorf("BPHS layout has no slot for partition %d", id)
+		}
+		owner := layout.byID[id]
+		part := owner.part
 		part.mu.RLock()
-		view := s.partitionReadViewLocked(part)
+		view := s.partitionReadViewLocked(part, owner.ownershipLo, owner.ownershipHi)
 		partStart, partEnd := startKey, endKey
 		if view.ownershipLo != "" && partStart < view.ownershipLo {
 			partStart = view.ownershipLo
@@ -2191,7 +2302,7 @@ func (s *bphsStore) syncRecordPartitions(indices map[int]uint32, concurrency int
 		return nil
 	}
 	for idx := range indices {
-		if idx < 0 || idx >= len(s.parts) {
+		if _, ok := s.currentLayoutView(idx); !ok {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
 	}
@@ -2207,7 +2318,12 @@ func (s *bphsStore) syncRecordPartitions(indices map[int]uint32, concurrency int
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			part := s.parts[idx]
+			owner, ok := s.currentLayoutView(idx)
+			if !ok {
+				results <- fmt.Errorf("invalid BPHS partition id %d", idx)
+				return
+			}
+			part := owner.part
 			lockStart := time.Now()
 			part.mu.Lock()
 			defer part.mu.Unlock()
@@ -2289,7 +2405,11 @@ func (s *bphsStore) queueRecordSync(indices map[int]struct{}) {
 	s.recordSyncMu.Lock()
 	deduped := 0
 	for idx := range indices {
-		version := s.parts[idx].pendingDurableVersion.Load()
+		owner, ok := s.currentLayoutView(idx)
+		if !ok {
+			continue
+		}
+		version := owner.part.pendingDurableVersion.Load()
 		if version == 0 {
 			deduped++
 			continue
@@ -2312,9 +2432,17 @@ func (s *bphsStore) checkpointSharedWAL() error {
 	if s.walMaxBytes <= 0 || s.wal.Size() < s.walMaxBytes {
 		return nil
 	}
-	allVersions := make(map[int]uint32, len(s.parts))
-	for i := range s.parts {
-		allVersions[i] = s.parts[i].pendingDurableVersion.Load()
+	layout := s.layout.Load()
+	if layout == nil {
+		return fmt.Errorf("BPHS layout is not ready")
+	}
+	allVersions := make(map[int]uint32, len(layout.byID))
+	for i := range layout.byID {
+		part := layout.byID[i].part
+		if part == nil {
+			continue
+		}
+		allVersions[i] = part.pendingDurableVersion.Load()
 	}
 	if err := s.syncRecordPartitions(allVersions, s.syncConcurrency); err != nil {
 		return err
@@ -2341,7 +2469,7 @@ func (s *bphsStore) SyncPartitionsFast(indices map[int]struct{}) error {
 		return fmt.Errorf("background BPHS record sync: %w", err)
 	}
 	for idx := range indices {
-		if idx < 0 || idx >= len(s.parts) {
+		if _, ok := s.currentLayoutView(idx); !ok {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
 	}
@@ -2373,7 +2501,12 @@ func (s *bphsStore) SyncPartitionsFast(indices map[int]struct{}) error {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			part := s.parts[idx]
+			owner, ok := s.currentLayoutView(idx)
+			if !ok {
+				results <- syncResult{idx: idx, err: fmt.Errorf("invalid BPHS partition id %d", idx)}
+				return
+			}
+			part := owner.part
 			lockStart := time.Now()
 			part.mu.Lock()
 			defer part.mu.Unlock()
@@ -2414,7 +2547,7 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 		return fmt.Errorf("background partition compaction: %w", err)
 	}
 	for idx := range indices {
-		if idx < 0 || idx >= len(s.parts) {
+		if _, ok := s.currentLayoutView(idx); !ok {
 			return fmt.Errorf("invalid BPHS partition id %d", idx)
 		}
 	}
@@ -2440,7 +2573,12 @@ func (s *bphsStore) SyncPartitions(indices map[int]struct{}) error {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			part := s.parts[idx]
+			owner, ok := s.currentLayoutView(idx)
+			if !ok {
+				results <- syncResult{idx: idx, err: fmt.Errorf("invalid BPHS partition id %d", idx)}
+				return
+			}
+			part := owner.part
 			lockStart := time.Now()
 			part.mu.Lock()
 			defer part.mu.Unlock()

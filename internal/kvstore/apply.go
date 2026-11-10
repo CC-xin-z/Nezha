@@ -3,6 +3,7 @@
 package kvstore
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -112,29 +113,109 @@ func (kvs *KVServer) applyLoop() {
 	}
 }
 
-// applyUnderLock 在 kvs.mu 之下应用一批。batch 只有一条时就是逐条路径，
-// 两条路径共用这一份实现（同一段逻辑写两遍这件事这个仓库已经栽过）。
+// applyUnderLock applies one pulled apply batch. Normal writes use kvs.mu;
+// BPHS ownership splits are segmented out of that batch and prepare their child
+// without holding kvs.mu so reads remain available.
 func (kvs *KVServer) applyUnderLock(idle time.Duration, batch []raft.ApplyMsg) {
 	tLock := time.Now()
-	kvs.mu.Lock()
-	lockWait := time.Since(tLock)
 	// In lsm-raft mode a follower holds committed entries and ingests the leader's
 	// SSTables instead of replaying them (lsmraft.go).
 	//
 	// **lsm 模式下不能批。** lsmHoldOrApply 要逐条决定"扣住还是应用"，
 	// 而它的判定依赖前一条的处理结果（held 队列与 lastAppliedIndex）。
 	// 那个模式不在被测的四个系统里，保持逐条是最省事也最安全的。
+	var lockWait time.Duration
 	if kvs.lsm != nil {
+		tAcquire := time.Now()
+		kvs.mu.Lock()
+		lockWait = time.Since(tAcquire)
 		for i := range batch {
 			if !kvs.lsmHoldOrApply(batch[i]) {
 				kvs.applyCommand(batch[i])
 			}
 		}
+		kvs.mu.Unlock()
 	} else {
-		kvs.applyBatch(batch)
+		lockWait = kvs.applyBatchWithBPHSSplit(batch)
 	}
-	kvs.mu.Unlock()
 	recordApplyLoop(idle, lockWait, time.Since(tLock), len(batch))
+}
+
+// applyBatchWithBPHSSplit keeps a dynamic ownership split out of the normal
+// write batch lock. The serialized apply loop guarantees that no following PUT
+// is installed while the split prepares its child. Reads only need kvs.mu to
+// capture their state view, so they continue while the child files and records
+// are prepared. The lock is retaken only for the short ownership publication.
+func (kvs *KVServer) applyBatchWithBPHSSplit(batch []raft.ApplyMsg) time.Duration {
+	kvs.stateMu.RLock()
+	defer kvs.stateMu.RUnlock()
+
+	var lockWait time.Duration
+	applySegment := func(msgs []raft.ApplyMsg) {
+		if len(msgs) == 0 {
+			return
+		}
+		tAcquire := time.Now()
+		kvs.mu.Lock()
+		lockWait += time.Since(tAcquire)
+		kvs.applyBatchWithStateReadLocked(msgs)
+		kvs.mu.Unlock()
+	}
+
+	for start := 0; start < len(batch); {
+		splitPos := -1
+		for i := start; i < len(batch); i++ {
+			op, ok := batch[i].Command.(*raftrpc.DetailCod)
+			if ok && op.OpType == bphsSplitOp {
+				splitPos = i
+				break
+			}
+		}
+		if splitPos < 0 {
+			applySegment(batch[start:])
+			break
+		}
+		applySegment(batch[start:splitPos])
+		if err := kvs.applyBPHSSplitOutsideBatchStateLocked(batch[splitPos]); err != nil {
+			log.Fatalf("apply BPHS split at index=%d: %v", batch[splitPos].CommandIndex, err)
+		}
+		start = splitPos + 1
+	}
+	return lockWait
+}
+
+func (kvs *KVServer) applyBPHSSplitOutsideBatch(msg raft.ApplyMsg) error {
+	kvs.stateMu.RLock()
+	defer kvs.stateMu.RUnlock()
+	return kvs.applyBPHSSplitOutsideBatchStateLocked(msg)
+}
+
+func (kvs *KVServer) applyBPHSSplitOutsideBatchStateLocked(msg raft.ApplyMsg) error {
+	op, ok := msg.Command.(*raftrpc.DetailCod)
+	if !ok || op.OpType != bphsSplitOp {
+		return fmt.Errorf("expected a BPHS split command")
+	}
+
+	kvs.mu.Lock()
+	store := kvs.bphs
+	kvs.mu.Unlock()
+	if store == nil {
+		return fmt.Errorf("BPHS split received without BPHS enabled")
+	}
+
+	var cmd bphsSplitCommand
+	if err := json.Unmarshal([]byte(op.Value), &cmd); err != nil {
+		return fmt.Errorf("decode BPHS split: %w", err)
+	}
+	if err := store.splitPartitionCommandConcurrent(cmd, uint32(msg.CommandIndex)); err != nil {
+		return err
+	}
+
+	kvs.mu.Lock()
+	kvs.lastAppliedIndex = msg.CommandIndex
+	kvs.noteRecoveryApplied(msg.CommandIndex)
+	kvs.mu.Unlock()
+	return nil
 }
 
 // takeInlineBudget 从当前这一代库的内联额度里扣 n 字节，扣得下就返回 true。
@@ -182,10 +263,16 @@ func (kvs *KVServer) applyCommand(msg raft.ApplyMsg) {
 	kvs.applyBatch([]raft.ApplyMsg{msg})
 }
 
+func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
+	kvs.stateMu.RLock()
+	defer kvs.stateMu.RUnlock()
+	kvs.applyBatchWithStateReadLocked(msgs)
+}
+
 // applyBatch 应用一批已提交的条目：所有写进**当前库**的行攒成一个 WriteBatch，
 // 连同**一个** applied 标记落库，然后才唤醒等在这些条目上的客户端。
 // 调用方持有 kvs.mu。批大小为 1 时与逐条应用完全等价。
-func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
+func (kvs *KVServer) applyBatchWithStateReadLocked(msgs []raft.ApplyMsg) {
 	// 与装快照互斥。**理由不是这条注释原来写的那个**：原先写的是"一条 apply 中途被换掉
 	// 状态机就会把这一行写进新库、偏移却指着旧日志"，而那件事已经由 kvs.mu 挡住了——
 	// applyBatch 的调用点都在 kvs.mu 之下（applyLoop 与 lsmReplayHeld），
@@ -197,9 +284,6 @@ func (kvs *KVServer) applyBatch(msgs []raft.ApplyMsg) {
 	// 就是**往回退**，而那几条已应用的数据在旧库里、随后会被删掉。
 	// 所以这把读锁要保留。批量之后它的持有时长从"一条"变成"一批"，
 	// 由 maxApplyBatch 封住（理由见那里）。
-	kvs.stateMu.RLock()
-	defer kvs.stateMu.RUnlock()
-
 	// 两个切片都复用 KVServer 上的缓冲，不每次 make：逐条路径上那会是每条两次分配
 	// （攒批之前一次都没有）。append 扩容后要在函数末尾写回，否则涨出来的容量下次用不上。
 	rows := kvs.applyRowsBuf[:0]

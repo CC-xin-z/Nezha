@@ -13,6 +13,10 @@ func TestBPHSDurableIndexUsesMinimumPartitionCoverage(t *testing.T) {
 		durablePath: dir + "/durable_index.json",
 		parts:       parts,
 	}
+	store.layout.Store(&bphsLayout{byID: []bphsPartitionView{
+		{id: 0, part: parts[0]},
+		{id: 1, part: parts[1]},
+	}})
 	if err := store.refreshDurableIndex(); err != nil {
 		t.Fatal(err)
 	}

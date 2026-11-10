@@ -233,7 +233,8 @@ func (s *bphsStore) writeStreamingCompactionBase(
 		if winner.Version > maxVersion {
 			maxVersion = winner.Version
 		}
-		if !part.ownsKey(winner.Key) {
+		if (snapshot.ownershipLo != "" && winner.Key < snapshot.ownershipLo) ||
+			(snapshot.ownershipHi != "" && winner.Key >= snapshot.ownershipHi) {
 			continue
 		}
 		if entries == 0 {

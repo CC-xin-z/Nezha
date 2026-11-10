@@ -108,8 +108,14 @@ func (s *bphsStore) MarkAllDurable(index uint32) error {
 	if s == nil {
 		return nil
 	}
-	for _, part := range s.parts {
-		part.durableIndex.Store(index)
+	layout := s.layout.Load()
+	if layout == nil {
+		return fmt.Errorf("BPHS layout is not ready")
+	}
+	for _, view := range layout.byID {
+		if view.part != nil {
+			view.part.durableIndex.Store(index)
+		}
 	}
 	return s.refreshDurableIndex()
 }
@@ -128,15 +134,24 @@ func (s *bphsStore) advancePartitionDurable(part *bphsPartition, index uint32) e
 }
 
 func (s *bphsStore) refreshDurableIndex() error {
-	if s == nil || len(s.parts) == 0 {
+	if s == nil {
+		return nil
+	}
+	layout := s.layout.Load()
+	if layout == nil || len(layout.byID) == 0 {
 		return nil
 	}
 	var minVersion uint32
-	for i, part := range s.parts {
-		version := part.durableIndex.Load()
-		if i == 0 || version < minVersion {
+	seen := 0
+	for _, view := range layout.byID {
+		if view.part == nil {
+			continue
+		}
+		version := view.part.durableIndex.Load()
+		if seen == 0 || version < minVersion {
 			minVersion = version
 		}
+		seen++
 	}
 	if minVersion == 0 {
 		return nil
@@ -145,11 +160,13 @@ func (s *bphsStore) refreshDurableIndex() error {
 	s.durableMu.Lock()
 	if minVersion > s.durableIndex {
 		state := bphsDurableState{
-			Partitions:   make([]uint32, len(s.parts)),
+			Partitions:   make([]uint32, len(layout.byID)),
 			DurableIndex: minVersion,
 		}
-		for i, part := range s.parts {
-			state.Partitions[i] = part.durableIndex.Load()
+		for i, view := range layout.byID {
+			if view.part != nil {
+				state.Partitions[i] = view.part.durableIndex.Load()
+			}
 		}
 		path := s.durablePath
 		if path == "" {
