@@ -162,6 +162,9 @@ type bphsStore struct {
 	legacyCovered             bool
 	baseRefMu                 sync.Mutex
 	baseRefs                  map[string]int
+	readRefMu                 sync.Mutex
+	readRefs                  map[string]int
+	retiredReadFiles          map[string]*SortedFileIndex
 	snapshotMu                sync.RWMutex
 
 	compactCh   chan int
@@ -797,6 +800,77 @@ func (s *bphsStore) currentLayoutView(id int) (bphsPartitionView, bool) {
 	return view, view.part != nil
 }
 
+type bphsFileLease struct {
+	store *bphsStore
+	paths []string
+}
+
+func (l *bphsFileLease) release() {
+	if l == nil || l.store == nil {
+		return
+	}
+	var removals []*SortedFileIndex
+	l.store.readRefMu.Lock()
+	for _, path := range l.paths {
+		count := l.store.readRefs[path]
+		if count <= 1 {
+			delete(l.store.readRefs, path)
+			if index := l.store.retiredReadFiles[path]; index != nil {
+				delete(l.store.retiredReadFiles, path)
+				removals = append(removals, index)
+			}
+			continue
+		}
+		l.store.readRefs[path] = count - 1
+	}
+	l.store.readRefMu.Unlock()
+	for _, index := range removals {
+		removeBPHSSortedFile(index)
+	}
+}
+
+func (s *bphsStore) pinReadView(view bphsPartitionReadView) *bphsFileLease {
+	paths := make([]string, 0, 1+len(view.l0))
+	if view.base != nil {
+		paths = append(paths, view.base.FilePath)
+	}
+	for _, run := range view.l0 {
+		paths = append(paths, run.FilePath)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	s.readRefMu.Lock()
+	if s.readRefs == nil {
+		s.readRefs = make(map[string]int)
+	}
+	for _, path := range paths {
+		s.readRefs[path]++
+	}
+	s.readRefMu.Unlock()
+	return &bphsFileLease{store: s, paths: paths}
+}
+
+func (s *bphsStore) retireReadFile(index *SortedFileIndex) {
+	if s == nil || index == nil || index.FilePath == "" {
+		return
+	}
+	removeNow := false
+	s.readRefMu.Lock()
+	if s.retiredReadFiles == nil {
+		s.retiredReadFiles = make(map[string]*SortedFileIndex)
+	}
+	if s.readRefs[index.FilePath] == 0 {
+		removeNow = true
+	} else {
+		s.retiredReadFiles[index.FilePath] = index
+	}
+	s.readRefMu.Unlock()
+	if removeNow {
+		removeBPHSSortedFile(index)
+	}
+}
+
 func (s *bphsStore) retainBase(path string) {
 	if s == nil || path == "" {
 		return
@@ -1056,15 +1130,13 @@ func (s *bphsStore) flushImmutableMemtable(
 	}
 	l0.InlineValues = s.inline
 
-	// Publish the L0 only after its file and sparse index are durable. Reads
-	// hold snapshotMu while pinning file indexes; the write side only needs
-	// part.mu for the short pointer swap.
-	s.snapshotMu.Lock()
+	// Publish the L0 only after its file and sparse index are durable. Readers
+	// pin the old view under part.mu and hold per-file leases, so the write side
+	// only needs the short pointer swap.
 	part.mu.Lock()
 	if part.immutable != snapshot {
 		s.finishFlushLocked(part)
 		part.mu.Unlock()
-		s.snapshotMu.Unlock()
 		removeBPHSSortedFile(l0)
 		s.recordBackgroundError(fmt.Errorf("partition %d immutable MemTable changed before L0 install", part.index))
 		return
@@ -1086,7 +1158,6 @@ func (s *bphsStore) flushImmutableMemtable(
 		}
 	}
 	part.mu.Unlock()
-	s.snapshotMu.Unlock()
 	if discardErr != nil {
 		s.recordBackgroundError(fmt.Errorf("discard durable partition %d record prefix: %w", part.index, discardErr))
 	}
@@ -1270,8 +1341,6 @@ func (s *bphsStore) installCompactionSnapshot(
 	newBase *SortedFileIndex,
 	meta bphsPartitionManifest,
 ) error {
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
 	part.mu.Lock()
 	defer part.mu.Unlock()
 	s.retainBase(newBase.FilePath)
@@ -1312,11 +1381,11 @@ func (s *bphsStore) installCompactionSnapshot(
 		return err
 	}
 	for _, run := range oldL0 {
-		removeBPHSSortedFile(run)
+		s.retireReadFile(run)
 	}
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
 		if s.releaseBase(oldBase.FilePath) {
-			removeBPHSSortedFile(oldBase)
+			s.retireReadFile(oldBase)
 		} else {
 			oldBase.closePool()
 		}
@@ -1588,11 +1657,9 @@ func (s *bphsStore) compactL0Snapshot(part *bphsPartition) (err error) {
 	}
 	l0.InlineValues = s.inline
 
-	s.snapshotMu.Lock()
 	part.mu.Lock()
 	if !part.compacting || part.gen != generation || !sameBHPSL0Prefix(part.l0, old) {
 		part.mu.Unlock()
-		s.snapshotMu.Unlock()
 		l0.closePool()
 		removeBPHSSortedFile(l0)
 		return fmt.Errorf("partition %d L0 snapshot changed before install", part.index)
@@ -1606,15 +1673,8 @@ func (s *bphsStore) compactL0Snapshot(part *bphsPartition) (err error) {
 	fmt.Printf("[BPHS-L0] partition=%d merged=%d remaining=%d l0_merge_rounds=%d\n",
 		part.index, mergeCount, remaining, mergeRounds)
 	for _, run := range old {
-		run.closePool()
-		for _, p := range []string{run.FilePath, sparseIndexPath(run.FilePath)} {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				s.snapshotMu.Unlock()
-				return err
-			}
-		}
+		s.retireReadFile(run)
 	}
-	s.snapshotMu.Unlock()
 	return nil
 }
 
@@ -1882,17 +1942,31 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if err := s.compactionError(); err != nil {
 		return "", false, fmt.Errorf("background partition compaction: %w", err)
 	}
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
 	owner, err := s.routeView(key)
 	if err != nil {
 		return "", false, err
 	}
 	part := owner.part
 	part.mu.RLock()
+	snapshotPinned := false
+	if part.vlog.Size() > 0 {
+		part.mu.RUnlock()
+		s.snapshotMu.RLock()
+		snapshotPinned = true
+		part.mu.RLock()
+	}
 	view := s.partitionReadViewLocked(part, owner.ownershipLo, owner.ownershipHi)
+	lease := s.pinReadView(view)
 	memRecord, memFound := part.mem.Get(key)
 	part.mu.RUnlock()
+	defer func() {
+		if lease != nil {
+			lease.release()
+		}
+		if snapshotPinned {
+			s.snapshotMu.RUnlock()
+		}
+	}()
 
 	immutableRecord, immutableFound := bphsRecord{}, false
 	if view.immutable != nil {
@@ -1915,8 +1989,8 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 		return value, true, nil
 	}
 
-	// L0 is searched newest to oldest. The immutable view pins every file until
-	// the SnapshotMu read lease is released.
+	// L0 is searched newest to oldest. The file lease keeps every selected path
+	// alive while compaction retires or replaces it.
 	for i := len(view.l0) - 1; i >= 0; i-- {
 		if view.l0[i].bphsFilter != nil && !view.l0[i].bphsFilter.MayContain(key) {
 			recordBPHSBloomProbe(true)
@@ -1964,8 +2038,6 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		return nil, fmt.Errorf("background partition compaction: %w", err)
 	}
 
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
 	layout := s.layout.Load()
 	if layout == nil || layout.set == nil {
 		return nil, fmt.Errorf("BPHS layout is not ready")
@@ -1987,6 +2059,13 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		owner := layout.byID[id]
 		part := owner.part
 		part.mu.RLock()
+		snapshotPinned := false
+		if part.vlog.Size() > 0 {
+			part.mu.RUnlock()
+			s.snapshotMu.RLock()
+			snapshotPinned = true
+			part.mu.RLock()
+		}
 		view := s.partitionReadViewLocked(part, owner.ownershipLo, owner.ownershipHi)
 		partStart, partEnd := startKey, endKey
 		if view.ownershipLo != "" && partStart < view.ownershipLo {
@@ -1997,6 +2076,9 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 		}
 		if partStart > partEnd {
 			part.mu.RUnlock()
+			if snapshotPinned {
+				s.snapshotMu.RUnlock()
+			}
 			continue
 		}
 		view.mem = part.mem.SortedRange(partStart, partEnd)
@@ -2007,6 +2089,15 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 			)
 		}
 		part.mu.RUnlock()
+		lease := s.pinReadView(view)
+		releasePart := func() {
+			if lease != nil {
+				lease.release()
+			}
+			if snapshotPinned {
+				s.snapshotMu.RUnlock()
+			}
+		}
 		if !snapshotSignaled && s.scanSnapshotStart != nil {
 			snapshotSignaled = true
 			s.scanSnapshotStart <- struct{}{}
@@ -2020,20 +2111,24 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 			// direct streaming path and avoid merge bookkeeping.
 			if view.base != nil {
 				if err := s.kvs.scanFromSortedFileInto(result, partStart, partEnd, view.base); err != nil {
+					releasePart()
 					return nil, err
 				}
 			}
 		} else if err := s.scanBPHSPartitionMergedInto(result, partStart, partEnd, view); err != nil {
+			releasePart()
 			return nil, err
 		}
 		l0Runs += len(view.l0)
 		for _, rec := range view.mem {
 			value, err := s.recordValueFromReadView(view, rec)
 			if err != nil {
+				releasePart()
 				return nil, err
 			}
 			result[rec.Key] = value
 		}
+		releasePart()
 	}
 	return result, nil
 }

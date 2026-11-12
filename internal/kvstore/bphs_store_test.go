@@ -338,6 +338,38 @@ func TestBPHSRecordSyncQueueCoalescesPartitions(t *testing.T) {
 	}
 }
 
+func TestBPHSReadLeaseDefersRetiredFileRemoval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leased.sst")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewFileDescriptorPool(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := &SortedFileIndex{
+		FilePath: path,
+		FileSize: 1,
+		pool:     pool,
+	}
+	store := &bphsStore{}
+	lease := store.pinReadView(bphsPartitionReadView{base: index})
+	if lease == nil {
+		t.Fatal("expected file lease")
+	}
+
+	store.retireReadFile(index)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("retired file removed while reader leased it: %v", err)
+	}
+
+	lease.release()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("retired file still exists after lease release: %v", err)
+	}
+}
+
 func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},
