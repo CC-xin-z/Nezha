@@ -345,21 +345,24 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 			parentID, splitKey, owner.ownershipLo, owner.ownershipHi)
 		return nil
 	}
+	splitStart := time.Now()
 
-	// Pin the immutable runs for the preparation phase. This excludes
-	// compaction/install from deleting them, but it does not take part.mu, so
-	// GET and SCAN keep reading the old layout while child metadata is prepared.
+	// The global snapshot lock is intentionally limited to pinning the parent
+	// generation and creating independent child links. Child record sync, Base
+	// loading, metadata construction and durable publication happen outside it.
+	// Otherwise a compaction waiting for snapshotMu.Lock can make every new
+	// reader queue behind split preparation.
 	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
-
 	part.mu.RLock()
 	if !part.baseLocal || part.base == nil {
 		part.mu.RUnlock()
+		s.snapshotMu.RUnlock()
 		fmt.Printf("[BPHS-SPLIT] deferred parent=%d: no local base\n", parentID)
 		return nil
 	}
 	if part.vlog.Size() != 0 {
 		part.mu.RUnlock()
+		s.snapshotMu.RUnlock()
 		fmt.Printf("[BPHS-SPLIT] deferred parent=%d: active VLog delta\n", parentID)
 		return nil
 	}
@@ -372,7 +375,58 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	view.mem = append([]bphsRecord(nil), active...)
 	parentBase := part.base
 	parentL0 := append([]*SortedFileIndex(nil), part.l0...)
+	parentMeta, ok, err := loadBPHSPartitionManifest(s.dir, parentID)
+	if err != nil {
+		part.mu.RUnlock()
+		s.snapshotMu.RUnlock()
+		return err
+	}
+	if !ok || parentMeta.BaseFile == "" {
+		part.mu.RUnlock()
+		s.snapshotMu.RUnlock()
+		return fmt.Errorf("partition %d has no durable manifest", parentID)
+	}
+	s.retainBase(parentBase.FilePath)
 	part.mu.RUnlock()
+
+	var childL0Paths []string
+	parentBasePinned := true
+	cleanupParentLinks := func() {
+		for _, path := range childL0Paths {
+			_ = os.Remove(path)
+			_ = os.Remove(sparseIndexPath(path))
+		}
+		if parentBasePinned {
+			_ = s.releaseBase(parentBase.FilePath)
+			parentBasePinned = false
+		}
+	}
+	parentL0Prefix := fmt.Sprintf("p%06d_l0_", parentID)
+	for _, run := range parentL0 {
+		sourceName := filepath.Base(run.FilePath)
+		if !strings.HasPrefix(sourceName, parentL0Prefix) {
+			s.snapshotMu.RUnlock()
+			cleanupParentLinks()
+			return fmt.Errorf("partition %d L0 %s has unexpected name", parentID, sourceName)
+		}
+		childName := fmt.Sprintf("p%06d_l0_%s", newID, strings.TrimPrefix(sourceName, parentL0Prefix))
+		childPath := filepath.Join(s.dir, childName)
+		if err := os.Link(run.FilePath, childPath); err != nil {
+			s.snapshotMu.RUnlock()
+			cleanupParentLinks()
+			return fmt.Errorf("link partition %d L0 %s for child %d: %w", parentID, sourceName, newID, err)
+		}
+		childL0Paths = append(childL0Paths, childPath)
+		if sourceIndex, childIndex := sparseIndexPath(run.FilePath), sparseIndexPath(childPath); fileExists(sourceIndex) {
+			if err := os.Link(sourceIndex, childIndex); err != nil {
+				s.snapshotMu.RUnlock()
+				cleanupParentLinks()
+				return fmt.Errorf("link partition %d L0 index %s for child %d: %w", parentID, sourceIndex, newID, err)
+			}
+		}
+	}
+	s.snapshotMu.RUnlock()
+	pinDone := time.Now()
 
 	if s.splitPrepareStart != nil {
 		s.splitPrepareStart <- struct{}{}
@@ -385,41 +439,43 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	if rangeMismatch || bounds.LeftEntries <= 0 || bounds.RightEntries <= 0 {
 		live, err := s.collectBPHSViewRecords(view)
 		if err != nil {
+			cleanupParentLinks()
 			return err
 		}
 		bounds, err = splitBoundsFromRecords(live, splitKey)
 		if err != nil {
+			cleanupParentLinks()
 			return err
 		}
 	}
-	parentMeta, ok, err := loadBPHSPartitionManifest(s.dir, parentID)
-	if err != nil {
-		return err
-	}
-	if !ok || parentMeta.BaseFile == "" {
-		return fmt.Errorf("partition %d has no durable manifest", parentID)
-	}
-
 	childRecords, err := openPartitionRecordLog(filepath.Join(s.dir, fmt.Sprintf("p%06d.records", newID)))
 	if err != nil {
+		cleanupParentLinks()
 		return err
 	}
 	childVLog, err := openPartitionVLog(filepath.Join(s.dir, fmt.Sprintf("p%06d.vlog", newID)))
 	if err != nil {
 		childRecords.Close()
+		cleanupParentLinks()
 		return err
 	}
-	var childL0Paths []string
+	var childBase *SortedFileIndex
+	childBasePinned := false
 	cleanupChild := func() {
 		childRecords.Close()
 		childVLog.Close()
 		os.Remove(childRecords.Path())
 		os.Remove(childVLog.Path())
 		os.Remove(bphsPartitionManifestPath(s.dir, newID))
-		for _, path := range childL0Paths {
-			os.Remove(path)
-			os.Remove(sparseIndexPath(path))
+		if childBasePinned && childBase != nil {
+			if s.releaseBase(childBase.FilePath) {
+				removeBPHSSortedFile(childBase)
+			} else {
+				childBase.closePool()
+			}
+			childBasePinned = false
 		}
+		cleanupParentLinks()
 	}
 
 	var splitMem []bphsRecord
@@ -446,27 +502,6 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		childMem.Put(rec)
 	}
 
-	parentL0Prefix := fmt.Sprintf("p%06d_l0_", parentID)
-	for _, run := range parentL0 {
-		sourceName := filepath.Base(run.FilePath)
-		if !strings.HasPrefix(sourceName, parentL0Prefix) {
-			cleanupChild()
-			return fmt.Errorf("partition %d L0 %s has unexpected name", parentID, sourceName)
-		}
-		childName := fmt.Sprintf("p%06d_l0_%s", newID, strings.TrimPrefix(sourceName, parentL0Prefix))
-		childPath := filepath.Join(s.dir, childName)
-		if err := os.Link(run.FilePath, childPath); err != nil {
-			cleanupChild()
-			return fmt.Errorf("link partition %d L0 %s for child %d: %w", parentID, sourceName, newID, err)
-		}
-		childL0Paths = append(childL0Paths, childPath)
-		if sourceIndex, childIndex := sparseIndexPath(run.FilePath), sparseIndexPath(childPath); fileExists(sourceIndex) {
-			if err := os.Link(sourceIndex, childIndex); err != nil {
-				cleanupChild()
-				return fmt.Errorf("link partition %d L0 index %s for child %d: %w", parentID, sourceIndex, newID, err)
-			}
-		}
-	}
 	loadedChildL0, err := loadPartitionL0Files(s.kvs, s.dir, newID, 0)
 	if err != nil {
 		cleanupChild()
@@ -481,12 +516,6 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		childL0 = append(childL0, loaded.file)
 	}
 
-	parentMeta.LogicalBytes = bounds.LeftBytes
-	parentMeta.Entries = bounds.LeftEntries
-	if err := writeBPHSPartitionManifest(s.dir, parentID, parentMeta); err != nil {
-		cleanupChild()
-		return err
-	}
 	childMeta := parentMeta
 	childMeta.LogicalBytes = bounds.RightBytes
 	childMeta.Entries = bounds.RightEntries
@@ -494,7 +523,7 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		cleanupChild()
 		return err
 	}
-	childBase, err := loadBPHSBaseFile(s.kvs, s.dir, childMeta, 0)
+	childBase, err = loadBPHSBaseFile(s.kvs, s.dir, childMeta, 0)
 	if err != nil {
 		cleanupChild()
 		return err
@@ -503,6 +532,13 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	childBase.OwnershipLo, childBase.OwnershipHi = splitKey, parentOwnershipHi
 	childBase.InlineValues = s.inline
 	s.retainBase(childBase.FilePath)
+	childBasePinned = true
+	if parentBasePinned {
+		_ = s.releaseBase(parentBase.FilePath)
+		parentBasePinned = false
+	}
+	parentMeta.LogicalBytes = bounds.LeftBytes
+	parentMeta.Entries = bounds.LeftEntries
 
 	child := &bphsPartition{
 		index:        newID,
@@ -529,9 +565,6 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		s.kvs.mu.Unlock()
 	}
 	if oldSet == nil {
-		if s.releaseBase(childBase.FilePath) {
-			childBase.closePool()
-		}
 		cleanupChild()
 		return fmt.Errorf("BPHS split has no routing metadata")
 	}
@@ -544,9 +577,6 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		}
 	}
 	if pos < 0 {
-		if s.releaseBase(childBase.FilePath) {
-			childBase.closePool()
-		}
 		cleanupChild()
 		return fmt.Errorf("parent partition %d is absent from routing metadata", parentID)
 	}
@@ -569,9 +599,6 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	metas[pos+1] = childRoute
 	routeSet, err := partitionSetFromMetadata(metas)
 	if err != nil {
-		if s.releaseBase(childBase.FilePath) {
-			childBase.closePool()
-		}
 		cleanupChild()
 		return err
 	}
@@ -580,15 +607,14 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	// intentionally tiny: install the child slot, change parent ownership and
 	// atomically publish one complete layout. In-flight reads that already
 	// captured the previous layout remain valid and continue on the full parent.
+	publishStart := time.Now()
 	if !kvsLockHeld {
 		s.kvs.mu.Lock()
 		if s.kvs.lastPartitions != oldSet {
 			s.kvs.mu.Unlock()
-			if s.releaseBase(childBase.FilePath) {
-				childBase.closePool()
-			}
 			cleanupChild()
-			return fmt.Errorf("BPHS routing layout changed during split preparation")
+			fmt.Printf("[BPHS-SPLIT] deferred parent=%d: routing layout changed during preparation\n", parentID)
+			return nil
 		}
 	}
 	s.mu.Lock()
@@ -597,11 +623,9 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		if !kvsLockHeld {
 			s.kvs.mu.Unlock()
 		}
-		if s.releaseBase(childBase.FilePath) {
-			childBase.closePool()
-		}
 		cleanupChild()
-		return fmt.Errorf("partition layout changed concurrently during split")
+		fmt.Printf("[BPHS-SPLIT] deferred parent=%d: partition layout changed during preparation\n", parentID)
+		return nil
 	}
 	part.mu.Lock()
 	if part.base != parentBase {
@@ -610,11 +634,18 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		if !kvsLockHeld {
 			s.kvs.mu.Unlock()
 		}
-		if s.releaseBase(childBase.FilePath) {
-			childBase.closePool()
+		cleanupChild()
+		fmt.Printf("[BPHS-SPLIT] deferred parent=%d: base generation changed during preparation\n", parentID)
+		return nil
+	}
+	if err := writeBPHSPartitionManifest(s.dir, parentID, parentMeta); err != nil {
+		part.mu.Unlock()
+		s.mu.Unlock()
+		if !kvsLockHeld {
+			s.kvs.mu.Unlock()
 		}
 		cleanupChild()
-		return fmt.Errorf("partition %d changed during split preparation", parentID)
+		return fmt.Errorf("write parent split manifest: %w", err)
 	}
 	part.ownershipHi = splitKey
 	part.logicalBytes = bounds.LeftBytes
@@ -649,8 +680,9 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		s.kvs.mu.Unlock()
 	}
 	fmt.Printf(
-		"[BPHS-SPLIT] parent=%d child=%d key=%q parent_bytes=%d child_bytes=%d\n",
+		"[BPHS-SPLIT] parent=%d child=%d key=%q parent_bytes=%d child_bytes=%d pin=%v prepare=%v publish=%v total=%v\n",
 		parentID, newID, splitKey, bounds.LeftBytes, bounds.RightBytes,
+		pinDone.Sub(splitStart), publishStart.Sub(pinDone), time.Since(publishStart), time.Since(splitStart),
 	)
 	return nil
 }
