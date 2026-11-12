@@ -390,8 +390,12 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 	part.mu.RUnlock()
 
 	var childL0Paths []string
+	var childL0 []*SortedFileIndex
 	parentBasePinned := true
 	cleanupParentLinks := func() {
+		for _, index := range childL0 {
+			index.closePool()
+		}
 		for _, path := range childL0Paths {
 			_ = os.Remove(path)
 			_ = os.Remove(sparseIndexPath(path))
@@ -401,7 +405,27 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 			parentBasePinned = false
 		}
 	}
+	cloneRun := func(source *SortedFileIndex, path string) (*SortedFileIndex, error) {
+		pool, err := NewFileDescriptorPool(path, partitionPoolSize)
+		if err != nil {
+			return nil, err
+		}
+		return &SortedFileIndex{
+			Sparse:       source.Sparse,
+			FileSize:     source.FileSize,
+			InlineValues: s.inline,
+			FilePath:     path,
+			Lo:           source.Lo,
+			Hi:           source.Hi,
+			OwnershipLo:  source.OwnershipLo,
+			OwnershipHi:  source.OwnershipHi,
+			Entries:      source.Entries,
+			bphsFilter:   source.bphsFilter,
+			pool:         pool,
+		}, nil
+	}
 	parentL0Prefix := fmt.Sprintf("p%06d_l0_", parentID)
+	childL0 = make([]*SortedFileIndex, 0, len(parentL0))
 	for _, run := range parentL0 {
 		sourceName := filepath.Base(run.FilePath)
 		if !strings.HasPrefix(sourceName, parentL0Prefix) {
@@ -424,6 +448,13 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 				return fmt.Errorf("link partition %d L0 index %s for child %d: %w", parentID, sourceIndex, newID, err)
 			}
 		}
+		cloned, err := cloneRun(run, childPath)
+		if err != nil {
+			s.snapshotMu.RUnlock()
+			cleanupParentLinks()
+			return fmt.Errorf("open child L0 descriptor pool %s: %w", childPath, err)
+		}
+		childL0 = append(childL0, cloned)
 	}
 	s.snapshotMu.RUnlock()
 	pinDone := time.Now()
@@ -448,6 +479,7 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 			return err
 		}
 	}
+	boundsDone := time.Now()
 	childRecords, err := openPartitionRecordLog(filepath.Join(s.dir, fmt.Sprintf("p%06d.records", newID)))
 	if err != nil {
 		cleanupParentLinks()
@@ -497,23 +529,10 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		cleanupChild()
 		return fmt.Errorf("sync child split MemTable: %w", err)
 	}
+	recordsDone := time.Now()
 	childMem := newPartitionMemtable(s.memtableBytes)
 	for _, rec := range splitMem {
 		childMem.Put(rec)
-	}
-
-	loadedChildL0, err := loadPartitionL0Files(s.kvs, s.dir, newID, 0)
-	if err != nil {
-		cleanupChild()
-		return err
-	}
-	if len(loadedChildL0) != len(parentL0) {
-		cleanupChild()
-		return fmt.Errorf("partition %d child L0 count=%d, want %d", parentID, len(loadedChildL0), len(parentL0))
-	}
-	childL0 := make([]*SortedFileIndex, 0, len(loadedChildL0))
-	for _, loaded := range loadedChildL0 {
-		childL0 = append(childL0, loaded.file)
 	}
 
 	childMeta := parentMeta
@@ -523,10 +542,10 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		cleanupChild()
 		return err
 	}
-	childBase, err = loadBPHSBaseFile(s.kvs, s.dir, childMeta, 0)
+	childBase, err = cloneRun(parentBase, parentBase.FilePath)
 	if err != nil {
 		cleanupChild()
-		return err
+		return fmt.Errorf("open child Base descriptor pool: %w", err)
 	}
 	childBase.Lo, childBase.Hi = bounds.RightLo, bounds.RightHi
 	childBase.OwnershipLo, childBase.OwnershipHi = splitKey, parentOwnershipHi
@@ -537,6 +556,7 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		_ = s.releaseBase(parentBase.FilePath)
 		parentBasePinned = false
 	}
+	baseDone := time.Now()
 	parentMeta.LogicalBytes = bounds.LeftBytes
 	parentMeta.Entries = bounds.LeftEntries
 
@@ -680,9 +700,10 @@ func (s *bphsStore) splitPartitionCommandWithKVSLock(
 		s.kvs.mu.Unlock()
 	}
 	fmt.Printf(
-		"[BPHS-SPLIT] parent=%d child=%d key=%q parent_bytes=%d child_bytes=%d pin=%v prepare=%v publish=%v total=%v\n",
+		"[BPHS-SPLIT] parent=%d child=%d key=%q parent_bytes=%d child_bytes=%d pin=%v bounds=%v records=%v base=%v route=%v publish=%v total=%v\n",
 		parentID, newID, splitKey, bounds.LeftBytes, bounds.RightBytes,
-		pinDone.Sub(splitStart), publishStart.Sub(pinDone), time.Since(publishStart), time.Since(splitStart),
+		pinDone.Sub(splitStart), boundsDone.Sub(pinDone), recordsDone.Sub(boundsDone),
+		baseDone.Sub(recordsDone), publishStart.Sub(baseDone), time.Since(publishStart), time.Since(splitStart),
 	)
 	return nil
 }
