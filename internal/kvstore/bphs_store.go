@@ -91,9 +91,9 @@ type bphsPartition struct {
 	pendingDurableVersion atomic.Uint32
 }
 
-// bphsPartitionReadView pins one immutable partition state while file I/O is
-// performed outside part.mu. snapshotMu prevents compaction/split cleanup from
-// closing or unlinking files referenced by an active read view.
+// bphsPartitionReadView captures one immutable partition state while file I/O
+// is performed outside part.mu. BPHS file leases keep each referenced Base/L0
+// alive until the read finishes; snapshotMu remains for VLog replacement.
 type bphsPartitionReadView struct {
 	index       int
 	base        *SortedFileIndex
@@ -162,9 +162,6 @@ type bphsStore struct {
 	legacyCovered             bool
 	baseRefMu                 sync.Mutex
 	baseRefs                  map[string]int
-	readRefMu                 sync.Mutex
-	readRefs                  map[string]int
-	retiredReadFiles          map[string]*SortedFileIndex
 	snapshotMu                sync.RWMutex
 
 	compactCh   chan int
@@ -801,74 +798,75 @@ func (s *bphsStore) currentLayoutView(id int) (bphsPartitionView, bool) {
 }
 
 type bphsFileLease struct {
-	store *bphsStore
-	paths []string
+	files []*SortedFileIndex
 }
 
 func (l *bphsFileLease) release() {
-	if l == nil || l.store == nil {
+	if l == nil {
 		return
 	}
-	var removals []*SortedFileIndex
-	l.store.readRefMu.Lock()
-	for _, path := range l.paths {
-		count := l.store.readRefs[path]
-		if count <= 1 {
-			delete(l.store.readRefs, path)
-			if index := l.store.retiredReadFiles[path]; index != nil {
-				delete(l.store.retiredReadFiles, path)
-				removals = append(removals, index)
-			}
-			continue
-		}
-		l.store.readRefs[path] = count - 1
-	}
-	l.store.readRefMu.Unlock()
-	for _, index := range removals {
-		removeBPHSSortedFile(index)
+	for _, index := range l.files {
+		index.releaseBPHSRead()
 	}
 }
 
 func (s *bphsStore) pinReadView(view bphsPartitionReadView) *bphsFileLease {
-	paths := make([]string, 0, 1+len(view.l0))
+	files := make([]*SortedFileIndex, 0, 1+len(view.l0))
 	if view.base != nil {
-		paths = append(paths, view.base.FilePath)
+		files = append(files, view.base)
 	}
 	for _, run := range view.l0 {
-		paths = append(paths, run.FilePath)
+		files = append(files, run)
 	}
-	if len(paths) == 0 {
+	if len(files) == 0 {
 		return nil
 	}
-	s.readRefMu.Lock()
-	if s.readRefs == nil {
-		s.readRefs = make(map[string]int)
+	// The caller captured this view under part.mu. Once that view is replaced,
+	// retireBPHSRead marks the old files and no later reader can pin them.
+	for _, index := range files {
+		index.pinBPHSRead()
 	}
-	for _, path := range paths {
-		s.readRefs[path]++
-	}
-	s.readRefMu.Unlock()
-	return &bphsFileLease{store: s, paths: paths}
+	return &bphsFileLease{files: files}
 }
 
 func (s *bphsStore) retireReadFile(index *SortedFileIndex) {
-	if s == nil || index == nil || index.FilePath == "" {
+	if s == nil || index == nil {
 		return
 	}
-	removeNow := false
-	s.readRefMu.Lock()
-	if s.retiredReadFiles == nil {
-		s.retiredReadFiles = make(map[string]*SortedFileIndex)
+	index.retireBPHSRead()
+}
+
+func (index *SortedFileIndex) pinBPHSRead() {
+	index.bphsReaders.Add(1)
+}
+
+func (index *SortedFileIndex) releaseBPHSRead() {
+	if index == nil {
+		return
 	}
-	if s.readRefs[index.FilePath] == 0 {
-		removeNow = true
-	} else {
-		s.retiredReadFiles[index.FilePath] = index
+	if index.bphsReaders.Add(-1) == 0 && index.bphsRetired.Load() {
+		index.removeBPHSReadFile()
 	}
-	s.readRefMu.Unlock()
-	if removeNow {
-		removeBPHSSortedFile(index)
+}
+
+func (index *SortedFileIndex) retireBPHSRead() {
+	if index == nil || index.FilePath == "" {
+		return
 	}
+	index.bphsRetired.Store(true)
+	if index.bphsReaders.Load() == 0 {
+		index.removeBPHSReadFile()
+	}
+}
+
+func (index *SortedFileIndex) removeBPHSReadFile() {
+	if index == nil ||
+		!index.bphsRetired.Load() ||
+		index.bphsReaders.Load() != 0 ||
+		!index.bphsRemoved.CompareAndSwap(false, true) {
+		return
+	}
+	removeBPHSSortedFile(index)
 }
 
 func (s *bphsStore) retainBase(path string) {

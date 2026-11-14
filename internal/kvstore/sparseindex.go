@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
 )
@@ -507,6 +508,12 @@ type SortedFileIndex struct {
 	// bphsFilter accelerates BPHS L0 probes. It is advisory only: false means
 	// the key is definitely absent, true still requires a normal file lookup.
 	bphsFilter *bphsKeyFilter
+
+	// BPHS-specific file lifetime state. The global sorted-file path does not
+	// use these fields; they replace bphsStore.readRefMu for foreground reads.
+	bphsReaders atomic.Int64
+	bphsRetired atomic.Bool
+	bphsRemoved atomic.Bool
 }
 
 func (sfi *SortedFileIndex) closePool() {

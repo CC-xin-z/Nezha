@@ -370,6 +370,98 @@ func TestBPHSReadLeaseDefersRetiredFileRemoval(t *testing.T) {
 	}
 }
 
+func TestBPHSReadLeaseConcurrentReadersRemoveAfterLastRelease(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leased-concurrent.sst")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewFileDescriptorPool(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := &SortedFileIndex{
+		FilePath: path,
+		FileSize: 1,
+		pool:     pool,
+	}
+	store := &bphsStore{}
+
+	const readerCount = 16
+	leases := make([]*bphsFileLease, 0, readerCount)
+	for range readerCount {
+		lease := store.pinReadView(bphsPartitionReadView{base: index})
+		if lease == nil {
+			t.Fatal("expected file lease")
+		}
+		leases = append(leases, lease)
+	}
+
+	store.retireReadFile(index)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("retired file removed while readers leased it: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(len(leases))
+	for _, lease := range leases {
+		go func() {
+			defer wg.Done()
+			<-start
+			lease.release()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("retired file still exists after all leases released: %v", err)
+	}
+}
+
+func TestBPHSReadLeaseConcurrentRetireAndRelease(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leased-retire-release.sst")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewFileDescriptorPool(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := &SortedFileIndex{
+		FilePath: path,
+		FileSize: 1,
+		pool:     pool,
+	}
+	store := &bphsStore{}
+	lease := store.pinReadView(bphsPartitionReadView{base: index})
+	if lease == nil {
+		t.Fatal("expected file lease")
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		store.retireReadFile(index)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		lease.release()
+	}()
+	close(start)
+	wg.Wait()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("retired file still exists after retire/release race: %v", err)
+	}
+}
+
 func TestBPHSStorePutGetAndRestart(t *testing.T) {
 	kvs := &KVServer{
 		persister:       &raft.Persister{},
