@@ -164,11 +164,15 @@ func (kvs *KVServer) scanBlock(index *SortedFileIndex, key string, start, end in
 		defer file.Close()
 	}
 
-	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return nil, err
-	}
-
-	reader := bufio.NewReaderSize(io.LimitReader(file, end-start), 64*1024)
+	// FileDescriptorPool.Get uses dup(2), and descriptors duplicated from the
+	// same source share one open-file-description and therefore one seek
+	// offset. A Seek followed by Read here would make concurrent point lookups
+	// race on that offset. SectionReader uses ReadAt, which is positionless
+	// and safe to share across duplicated descriptors.
+	reader := bufio.NewReaderSize(
+		io.NewSectionReader(file, start, end-start),
+		64*1024,
+	)
 	// 解析条数就是 AVP 每次命中所省下的工作量，逐条计数后统一上报
 	scanned := 0
 	for {

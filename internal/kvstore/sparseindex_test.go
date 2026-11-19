@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"gitee.com/dong-shuishui/FlexSync/internal/raft"
@@ -330,5 +331,99 @@ func TestLookupInSortedFileUsesBlockHash(t *testing.T) {
 	}
 	if len(index.blockHashes) != 0 {
 		t.Fatal("block hash disabled, but lookup built a hash index")
+	}
+}
+
+func TestLookupInSortedFileDisabledBlockHashConcurrent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "part.p0")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	kvs := &KVServer{disableBlockHash: true}
+
+	const count = 2049
+	for i := 0; i < count; i++ {
+		entry := &raft.Entry{
+			Index: uint32(i + 1),
+			Key:   fmt.Sprintf("%010d", i*2),
+			Value: fmt.Sprintf("value-%06d", i),
+		}
+		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sparse, fileSize, err := kvs.BuildSparseIndex(path, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewFileDescriptorPool(path, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	index := &SortedFileIndex{
+		Sparse:   sparse,
+		FileSize: fileSize,
+		FilePath: path,
+		pool:     pool,
+	}
+
+	const (
+		workers    = 32
+		iterations = 100
+	)
+	start := make(chan struct{})
+	ready := make(chan struct{}, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			for i := 0; i < iterations; i++ {
+				pos := (worker*31 + i*17) % count
+				if (worker+i)%4 == 0 {
+					key := fmt.Sprintf("%010d", pos*2+1)
+					if _, err := kvs.lookupInSortedFile(index, key); err == nil {
+						errs <- fmt.Errorf("missing key %s was found", key)
+						return
+					}
+					continue
+				}
+
+				key := fmt.Sprintf("%010d", pos*2)
+				got, err := kvs.lookupInSortedFile(index, key)
+				if err != nil {
+					errs <- fmt.Errorf("lookup(%s): %w", key, err)
+					return
+				}
+				want := fmt.Sprintf("value-%06d", pos)
+				if got.Key != key || got.Value != want {
+					errs <- fmt.Errorf("lookup(%s) = {%q,%q}, want {%q,%q}",
+						key, got.Key, got.Value, key, want)
+					return
+				}
+			}
+		}(worker)
+	}
+	for i := 0; i < workers; i++ {
+		<-ready
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

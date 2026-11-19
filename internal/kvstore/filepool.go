@@ -45,6 +45,8 @@ func NewFileDescriptorPool(filePath string, poolSize int) (*FileDescriptorPool, 
 }
 
 // Get 从池中获取一个文件描述符
+// 注意：dup 出来的描述符共享同一个文件偏移。调用方必须使用 ReadAt 或
+// io.NewSectionReader 做定位读取；Seek + Read 会让并发读者互相改变偏移。
 func (p *FileDescriptorPool) Get() (*os.File, error) {
 	select {
 	case file := <-p.pool:
