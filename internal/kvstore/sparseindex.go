@@ -208,7 +208,7 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 	if blockLen <= 0 {
 		return nil, ErrKeyAbsent
 	}
-	if blockLen > 1<<20 {
+	if blockLen > 1<<20 || kvs.disableBlockHash {
 		avpRecordHashFallback()
 		return kvs.scanBlock(index, key, start, end)
 	}

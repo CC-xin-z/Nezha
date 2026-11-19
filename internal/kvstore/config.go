@@ -94,6 +94,9 @@ type Config struct {
 	// 字段留着供复现那次实验；上面"于是库永远留在内存表里"那段是当初的假设，没有成立。
 	InlineBudgetMB int
 	IndexBlockKB   int // sparse index granularity over sorted files
+	// DisableBlockHash forces sorted-file point reads through the bounded block
+	// scan. It exists to isolate the contribution of the lazy block hash.
+	DisableBlockHash bool
 
 	GCThresholdGB  float64
 	CommitTimeoutS int // how long a Put waits for its apply before giving up

@@ -314,4 +314,21 @@ func TestLookupInSortedFileUsesBlockHash(t *testing.T) {
 			t.Fatalf("不存在的 key %s 被错误命中", key)
 		}
 	}
+
+	kvs.disableBlockHash = true
+	index.blockHashes = nil
+	fallbackBefore := avpStats.hashFallbacks.Load()
+	got, err := kvs.lookupInSortedFile(index, "0000000100")
+	if err != nil {
+		t.Fatalf("disabled block hash lookup: %v", err)
+	}
+	if got.Key != "0000000100" || got.Value != "value-000050" {
+		t.Fatalf("disabled block hash lookup = {%q,%q}", got.Key, got.Value)
+	}
+	if avpStats.hashFallbacks.Load() <= fallbackBefore {
+		t.Fatal("block hash disabled, but lookup did not fall back to block scan")
+	}
+	if len(index.blockHashes) != 0 {
+		t.Fatal("block hash disabled, but lookup built a hash index")
+	}
 }

@@ -184,8 +184,9 @@ type KVServer struct {
 	inlineBudgetStore *raft.Persister
 	gcThresholdGB     float64 // value log size in GB that triggers GC
 	// gcDrain 是"测读之前把尾部吸收干净"的收尾开关，理由见 gcdrain.go。
-	gcDrain         gcDrainState
-	indexBlockBytes int64 // sparse index granularity: one index entry per this many bytes
+	gcDrain          gcDrainState
+	indexBlockBytes  int64 // sparse index granularity: one index entry per this many bytes
+	disableBlockHash bool
 	// partitionTargetBytes 是 GC 产物中单个分区的目标大小，见 partition.go 的取舍说明。
 	partitionTargetBytes int64
 	// absorbRatio 决定何时吸收：尾部日志达到分区总量的这个比例就开一轮。
@@ -358,6 +359,7 @@ func New(cfg Config) (*KVServer, error) {
 		// 负数当 0（不限），不要变成一个负的额度把所有内联都拒掉。
 		inlineBudgetBytes: max(int64(cfg.InlineBudgetMB), 0) << 20,
 		indexBlockBytes:   int64(cfg.IndexBlockKB) << 10,
+		disableBlockHash:  cfg.DisableBlockHash,
 		gcThresholdGB:     cfg.GCThresholdGB,
 		FirstGC:           true,
 		dataDir:           cfg.DataDir,
@@ -420,10 +422,10 @@ func New(cfg Config) (*KVServer, error) {
 	}
 	// blockCacheMB 必须印出来。它的默认值 0 意味着"每次点读都从文件里读索引块、
 	// 过滤块、数据块"，而那足以决定点读的结论——一个能翻转结论的配置不该只存在于源码里。
-	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d tailRoute=%v bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d bphsDynamicSplit=%v bphsSplitThresholdPercent=%d\n",
+	fmt.Printf("[SYSTEM] %s | kvSeparation=%v gcEnabled=%v gcThresholdGB=%g extraPersistence=%v syncWAL=%v commitQuorum=%s blockCacheMB=%d | inlinePlacement=%v inlineThreshold=%dB inlineCacheMB=%d inlineBudgetMB=%d tailRoute=%v blockHash=%v bphs=%v bphsMemtableMB=%d bphsSyncConcurrency=%d bphsRecordSyncConcurrency=%d bphsRaftLogWAL=%v bphsLogCheckpointMB=%d bphsWALMB=%d bphsPartitionGCThresholdMB=%d partitionTargetMB=%d bphsDynamicSplit=%v bphsSplitThresholdPercent=%d\n",
 		cfg.systemName(), kvs.kvSeparation, kvs.gcEnabled, kvs.gcThresholdGB,
 		kvs.extraPersistence, cfg.SyncWAL, cq, cfg.BlockCacheMB,
-		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.TailRoute, cfg.BPHS,
+		kvs.inlinePlacement, kvs.inlineThreshold, cfg.InlineCacheMB, kvs.inlineBudgetBytes>>20, cfg.TailRoute, !kvs.disableBlockHash, cfg.BPHS,
 		kvs.bphsMemtableBytes>>20, kvs.bphsSyncConcurrency, kvs.bphsRecordSyncConcurrency,
 		kvs.bphsRaftLogWAL, kvs.bphsLogCheckpointBytes>>20, kvs.bphsWALBytes>>20,
 		kvs.bphsPartitionGCThresholdBytes>>20,
