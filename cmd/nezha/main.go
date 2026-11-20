@@ -23,6 +23,7 @@ func main() {
 	var peers string
 	blockHash := true
 	sortedIndexMode := string(kvstore.SortedIndexBlockHash)
+	partitioned := true
 	flag.StringVar(&cfg.Address, "address", "", "client-facing gRPC address, e.g. 192.168.1.240:3099")
 	flag.StringVar(&cfg.InternalAddress, "internalAddress", "", "this node's Raft address; must be one of -peers")
 	flag.StringVar(&peers, "peers", "", "comma-separated Raft addresses of all nodes; the order defines node ids")
@@ -79,6 +80,7 @@ func main() {
 	// existing experiment scripts retain their meaning.
 	flag.BoolVar(&blockHash, "blockHash", true, "deprecated compatibility alias: false => sparse-scan, true => sparse-block-hash")
 	flag.Float64Var(&cfg.GCThresholdGB, "gcThresholdGB", 4000, "value log size in GB that triggers garbage collection; lower it to exercise GC in tests")
+	flag.BoolVar(&partitioned, "partitioned", true, "produce key-range partitioned GC output; false writes one sorted file and bypasses range routing")
 	flag.IntVar(&cfg.PartitionTargetMB, "partitionTargetMB", 128, "target size in MB of one GC output partition; lower it to exercise multi-partition reads in tests")
 	flag.Float64Var(&cfg.AbsorbRatio, "absorbRatio", 0.25, "start a GC round once the tail log reaches this fraction of the partitions' total size")
 	flag.BoolVar(&cfg.BPHS, "bphs", false, "enable the static Bootstrap-Partitioned Hybrid Storage prototype after the first partitioned GC")
@@ -143,8 +145,13 @@ func main() {
 	}
 	cfg.SortedIndexMode = mode
 	cfg.DisableBlockHash = mode == kvstore.SortedIndexSparseScan
+	cfg.DisablePartitioning = !partitioned
 	if mode == kvstore.SortedIndexGlobalMap && cfg.BPHS {
 		fmt.Fprintln(os.Stderr, "nezha: -sortedIndexMode=global-map is not supported with -bphs")
+		os.Exit(2)
+	}
+	if cfg.DisablePartitioning && cfg.BPHS {
+		fmt.Fprintln(os.Stderr, "nezha: -partitioned=false is not supported with -bphs")
 		os.Exit(2)
 	}
 	cfg.Peers = strings.Split(peers, ",")

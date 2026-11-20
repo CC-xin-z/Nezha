@@ -48,11 +48,10 @@ type blockHashEntry struct {
 // SparseIndexBuilder 在顺序写 sortedFile 的同时构建稀疏索引。
 // 调用方每写完一条 entry 就调用一次 Observe，最后用 Build 收尾。
 type SparseIndexBuilder struct {
-	entries       []SparseEntry
-	blockBytes    int64
-	sinceLast     int64
-	started       bool
-	globalOffsets map[string]int64
+	entries    []SparseEntry
+	blockBytes int64
+	sinceLast  int64
+	started    bool
 }
 
 func NewSparseIndexBuilder(blockBytes int64) *SparseIndexBuilder {
@@ -60,18 +59,6 @@ func NewSparseIndexBuilder(blockBytes int64) *SparseIndexBuilder {
 		blockBytes = defaultIndexBlockBytes
 	}
 	return &SparseIndexBuilder{blockBytes: blockBytes}
-}
-
-// EnableGlobalMap makes Observe also build the paper-style full key->offset
-// map. The sorted file is already deduplicated, so each key appears once.
-func (b *SparseIndexBuilder) EnableGlobalMap() {
-	b.globalOffsets = make(map[string]int64)
-}
-
-// GlobalOffsets returns the full per-key offset map, or nil when it was not
-// requested. The map is read-only after the builder is finished.
-func (b *SparseIndexBuilder) GlobalOffsets() map[string]int64 {
-	return b.globalOffsets
 }
 
 // 4KB。块尺寸是外层稀疏索引与块内索引的内存/读放大旋钮。没有块内哈希时，
@@ -86,9 +73,6 @@ const defaultIndexBlockBytes = 4 * 1024
 // Observe 记录一条刚写入的 entry。key 必须是写进文件的那个 key（已 padding），
 // offset 是它的起始偏移，size 是它占用的字节数。
 func (b *SparseIndexBuilder) Observe(key string, offset int64, size int64) {
-	if b.globalOffsets != nil {
-		b.globalOffsets[key] = offset
-	}
 	// 第一条永远建立索引点，保证 Sparse[0] 是文件中最小的 key
 	if !b.started || b.sinceLast >= b.blockBytes {
 		b.entries = append(b.entries, SparseEntry{PaddedKey: key, Offset: offset})
@@ -171,47 +155,78 @@ func (kvs *KVServer) effectiveSortedIndexMode() SortedIndexMode {
 	return SortedIndexBlockHash
 }
 
-func (kvs *KVServer) newSparseIndexBuilder() *SparseIndexBuilder {
-	builder := NewSparseIndexBuilder(kvs.indexBlockBytes)
-	if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
-		builder.EnableGlobalMap()
+const (
+	globalPartitionBits = 16
+	globalOffsetBits    = 64 - globalPartitionBits
+	globalOffsetMask    = uint64(1<<globalOffsetBits) - 1
+)
+
+func packGlobalLocation(partition int, offset int64) (uint64, error) {
+	if partition < 0 || partition >= 1<<globalPartitionBits {
+		return 0, fmt.Errorf("global index partition id %d exceeds %d bits", partition, globalPartitionBits)
 	}
-	return builder
+	if offset < 0 || uint64(offset) > globalOffsetMask {
+		return 0, fmt.Errorf("global index offset %d exceeds %d bits", offset, globalOffsetBits)
+	}
+	return uint64(partition)<<globalOffsetBits | uint64(offset), nil
 }
 
-// buildGlobalOffsets reconstructs the paper-style full key->offset map by
-// scanning one immutable sorted file. It is used on recovery because the full
-// map is intentionally derived state and is not persisted.
-func (kvs *KVServer) buildGlobalOffsets(path string, expectedSize int64) (map[string]int64, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
+func unpackGlobalLocation(location uint64) (partition int, offset int64) {
+	return int(location >> globalOffsetBits), int64(location & globalOffsetMask)
+}
 
-	offsets := make(map[string]int64)
-	reader := bufio.NewReaderSize(file, 1<<20)
-	var offset int64
-	for {
-		entry, size, err := ReadEntry(reader, offset)
+// buildPartitionGlobalIndex reconstructs the paper-style full key->offset
+// map across the whole partition set. The map value packs the partition id and
+// record offset, so a hit bypasses PartitionSet.find entirely.
+func (kvs *KVServer) buildPartitionGlobalIndex(ps *PartitionSet) error {
+	if ps == nil || kvs.effectiveSortedIndexMode() != SortedIndexGlobalMap {
+		return nil
+	}
+	totalEntries := 0
+	for _, part := range ps.parts {
+		totalEntries += part.Entries
+	}
+	index := make(map[string]uint64, totalEntries)
+	for partition, part := range ps.parts {
+		file, err := os.Open(part.FilePath)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
+			return err
 		}
-		offsets[entry.Key] = offset
-		offset += size
+		reader := bufio.NewReaderSize(file, 1<<20)
+		var offset int64
+		for {
+			entry, size, err := ReadEntry(reader, offset)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				file.Close()
+				return err
+			}
+			location, err := packGlobalLocation(partition, offset)
+			if err != nil {
+				file.Close()
+				return fmt.Errorf("sorted file %s: %v", part.FilePath, err)
+			}
+			if _, exists := index[entry.Key]; exists {
+				file.Close()
+				return fmt.Errorf("duplicate key %q in sorted partition set", entry.Key)
+			}
+			index[entry.Key] = location
+			offset += size
+		}
+		file.Close()
+		if offset != part.FileSize {
+			return fmt.Errorf(
+				"sorted file %s: expected %d bytes, parsed %d",
+				part.FilePath,
+				part.FileSize,
+				offset,
+			)
+		}
 	}
-	if expectedSize > 0 && offset != expectedSize {
-		return nil, fmt.Errorf(
-			"sorted file %s: expected %d bytes, parsed %d",
-			path,
-			expectedSize,
-			offset,
-		)
-	}
-	return offsets, nil
+	ps.globalOffsets = index
+	return nil
 }
 
 // readEntryAtSortedOffset follows the original Nezha global-map path: the map
@@ -326,17 +341,10 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 		return nil, errors.New("invalid index: index is nil")
 	}
 	if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
-		if index.globalOffsets == nil {
-			return nil, fmt.Errorf(
-				"sorted file %s: global index mode but no global offset map",
-				index.FilePath,
-			)
-		}
-		offset, ok := index.globalOffsets[key]
-		if !ok {
-			return nil, ErrKeyAbsent
-		}
-		return kvs.readEntryAtSortedOffset(index, key, offset)
+		return nil, fmt.Errorf(
+			"sorted file %s: global-map lookup must use its PartitionSet index",
+			index.FilePath,
+		)
 	}
 	start, end, ok := index.blockRange(key)
 	if !ok {
@@ -613,10 +621,6 @@ type SortedFileIndex struct {
 	// 查找时二分定位到块，再在块内顺序扫描，内存从 O(key 数) 降为 O(块数)。
 	Sparse   []SparseEntry
 	FileSize int64 // sortedFile 总长度，用于界定最后一块的右边界
-	// globalOffsets is present only in global-map mode. Partitions cover
-	// disjoint key ranges, so their full maps together implement the original
-	// paper's logical global key->offset index without duplicating partition ids.
-	globalOffsets map[string]int64
 	// InlineValues 是小值的有界缓存，纯读加速层，命中则免去一次文件 seek。
 	// 它可以为 nil、可以随时淘汰任何条目，都不影响正确性——value 始终在 sortedFile 里。
 	// 同一组分区里的每个分区都指向同一个实例，见 PartitionSet.inline。

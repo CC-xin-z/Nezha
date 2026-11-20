@@ -356,18 +356,11 @@ func TestPartitionGlobalMapBuildAndReload(t *testing.T) {
 
 	const n, vsize = 200, 100
 	ps := writeEntries(t, kvs, base, n, vsize)
-	for i, part := range ps.parts {
-		if part.globalOffsets == nil {
-			t.Fatalf("partition %d has no global offset map after GC", i)
-		}
-		if len(part.globalOffsets) != part.Entries {
-			t.Fatalf(
-				"partition %d global map has %d entries, want %d",
-				i,
-				len(part.globalOffsets),
-				part.Entries,
-			)
-		}
+	if ps.globalOffsets == nil {
+		t.Fatal("partition set has no global offset map after GC")
+	}
+	if len(ps.globalOffsets) != n {
+		t.Fatalf("global map has %d entries, want %d", len(ps.globalOffsets), n)
 	}
 	metas := ps.manifest()
 	ps.Close()
@@ -377,16 +370,51 @@ func TestPartitionGlobalMapBuildAndReload(t *testing.T) {
 		t.Fatalf("loadPartitionSet: %v", err)
 	}
 	defer reloaded.Close()
-	for i, part := range reloaded.parts {
-		if part.globalOffsets == nil {
-			t.Fatalf("partition %d has no global offset map after reload", i)
-		}
+	if reloaded.globalOffsets == nil {
+		t.Fatal("partition set has no global offset map after reload")
 	}
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("%010d", i)
 		if _, _, err := kvs.getFromPartitions(key, reloaded); err != nil {
 			t.Fatalf("global-map lookup after reload(%s): %v", key, err)
 		}
+	}
+}
+
+func TestUnpartitionedWriterProducesOneFileWithoutRouting(t *testing.T) {
+	dir := t.TempDir()
+	kvs := newTestServer(4096)
+	kvs.partitioningDisabled = true
+	base := filepath.Join(dir, "sorted_1")
+
+	const n, vsize = 200, 100
+	ps := writeEntries(t, kvs, base, n, vsize)
+	if !ps.unpartitioned {
+		t.Fatal("partition set did not record the unpartitioned mode")
+	}
+	if ps.Len() != 1 {
+		t.Fatalf("unpartitioned writer produced %d files, want 1", ps.Len())
+	}
+	metas := ps.manifest()
+	// Break the routing bounds deliberately: the unpartitioned path must still
+	// find every key because it never calls find.
+	ps.parts[0].Lo = "zzzzzzzzzz"
+	ps.parts[0].Hi = "zzzzzzzzzz"
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("%010d", i)
+		if _, _, err := kvs.getFromPartitions(key, ps); err != nil {
+			t.Fatalf("lookup(%s): %v", key, err)
+		}
+	}
+
+	ps.Close()
+	reloaded, err := kvs.loadPartitionSet(base, metas)
+	if err != nil {
+		t.Fatalf("loadPartitionSet: %v", err)
+	}
+	defer reloaded.Close()
+	if !reloaded.unpartitioned || reloaded.Len() != 1 {
+		t.Fatalf("reloaded unpartitioned set = %v with %d files", reloaded.unpartitioned, reloaded.Len())
 	}
 }
 

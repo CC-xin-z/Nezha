@@ -180,8 +180,16 @@ func (kvs *KVServer) absorbTail(startTime time.Time) error {
 	for _, p := range newParts {
 		p.InlineValues = parts.inline
 	}
-	merged := &PartitionSet{parts: newParts, inline: parts.inline, base: base}
+	merged := &PartitionSet{
+		parts:         newParts,
+		inline:        parts.inline,
+		base:          base,
+		unpartitioned: kvs.partitioningDisabled,
+	}
 	merged.assignOwnershipRanges()
+	if err := kvs.buildPartitionGlobalIndex(merged); err != nil {
+		return err
+	}
 
 	kvs.mu.Lock()
 	kvs.anotherPartitions = merged

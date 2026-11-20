@@ -51,6 +51,11 @@ const partitionPoolSize = 8
 // 读路径靠它把一次查找路由到唯一（GET）或若干连续（SCAN）分区上。
 type PartitionSet struct {
 	parts []*SortedFileIndex
+	// globalOffsets implements the paper-style key->offset index across the
+	// whole set. A value packs [partition id, in-file offset].
+	globalOffsets map[string]uint64
+	// unpartitioned requests the single-file fast path: no find/range routing.
+	unpartitioned bool
 	// ids maps sorted ownership ranges to stable BPHS storage identities.
 	// Dynamic split can insert a range without renaming existing partitions.
 	ids []int
@@ -413,7 +418,11 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 		fmt.Printf("[RECOVER] 装载 %d 个分区（%dB）耗时 %v：旁挂索引 %d 个，扫描重建 %d 个\n",
 			len(metas), bytesTotal, time.Since(t0), loaded, scanned)
 	}()
-	ps := &PartitionSet{base: base, inline: NewInlineCache(kvs.inlineCacheBytes)}
+	ps := &PartitionSet{
+		base:          base,
+		inline:        NewInlineCache(kvs.inlineCacheBytes),
+		unpartitioned: kvs.partitioningDisabled,
+	}
 	ids, err := partitionIDsFromMetadata(metas)
 	if err != nil {
 		return nil, err
@@ -449,14 +458,6 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			loaded++
 		} else {
 			scanned++
-		}
-		var globalOffsets map[string]int64
-		if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
-			globalOffsets, err = kvs.buildGlobalOffsets(path, m.Size)
-			if err != nil {
-				ps.Close()
-				return nil, fmt.Errorf("rebuild global index for %s: %v", path, err)
-			}
 		}
 		pool, err := NewFileDescriptorPool(path, partitionPoolSize)
 		if err != nil {
@@ -504,20 +505,23 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			}
 		}
 		ps.parts = append(ps.parts, &SortedFileIndex{
-			Sparse:        sparse,
-			FileSize:      size,
-			globalOffsets: globalOffsets,
-			InlineValues:  ps.inline,
-			FilePath:      path,
-			Lo:            m.Lo,
-			Hi:            m.Hi,
-			pool:          pool,
-			Entries:       m.Entries,
+			Sparse:       sparse,
+			FileSize:     size,
+			InlineValues: ps.inline,
+			FilePath:     path,
+			Lo:           m.Lo,
+			Hi:           m.Hi,
+			pool:         pool,
+			Entries:      m.Entries,
 		})
 	}
 	if err := applyOwnershipMetadata(ps, metas); err != nil {
 		ps.Close()
 		return nil, err
+	}
+	if err := kvs.buildPartitionGlobalIndex(ps); err != nil {
+		ps.Close()
+		return nil, fmt.Errorf("rebuild global index: %v", err)
 	}
 	return ps, nil
 }
@@ -611,7 +615,9 @@ type partitionWriter struct {
 
 func (kvs *KVServer) newPartitionWriter(base string) *partitionWriter {
 	target := kvs.partitionTargetBytes
-	if target <= 0 {
+	if kvs.partitioningDisabled {
+		target = int64(^uint64(0) >> 1)
+	} else if target <= 0 {
 		target = defaultPartitionTargetBytes
 	}
 	return &partitionWriter{
@@ -631,7 +637,7 @@ func (pw *partitionWriter) open() error {
 	}
 	pw.file = f
 	pw.w = bufio.NewWriter(f)
-	pw.sparse = pw.kvs.newSparseIndexBuilder()
+	pw.sparse = NewSparseIndexBuilder(pw.kvs.indexBlockBytes)
 	pw.offset, pw.n = 0, 0
 	pw.lo, pw.hi = "", ""
 	return nil
@@ -711,7 +717,6 @@ func (pw *partitionWriter) seal() error {
 	pw.file, pw.w = nil, nil
 
 	sparse := pw.sparse.Build()
-	globalOffsets := pw.sparse.GlobalOffsets()
 	// 旁挂索引写在数据 fsync **之后**，所以它描述的一定是已经落盘的内容。
 	// 写失败不算这一轮失败：索引缺失只会让下次启动退回扫描重建，不影响正确性。
 	if err := writeSparseIndex(path, sparse, pw.kvs.indexBlockBytes, pw.offset); err != nil {
@@ -723,15 +728,14 @@ func (pw *partitionWriter) seal() error {
 		return fmt.Errorf("file descriptor pool for %s: %v", path, err)
 	}
 	pw.done = append(pw.done, &SortedFileIndex{
-		Sparse:        sparse,
-		FileSize:      pw.offset,
-		globalOffsets: globalOffsets,
-		InlineValues:  pw.inline,
-		FilePath:      path,
-		Lo:            pw.lo,
-		Hi:            pw.hi,
-		pool:          pool,
-		Entries:       pw.n,
+		Sparse:       sparse,
+		FileSize:     pw.offset,
+		InlineValues: pw.inline,
+		FilePath:     path,
+		Lo:           pw.lo,
+		Hi:           pw.hi,
+		pool:         pool,
+		Entries:      pw.n,
 	})
 	pw.total += pw.offset
 	// 一个分区刚落盘、后面还有的那一刻——本轮产物在盘上但不完整、也还没提交。
@@ -752,12 +756,20 @@ func (pw *partitionWriter) Finish() (*PartitionSet, error) {
 	if err := pw.seal(); err != nil {
 		return nil, err
 	}
-	ps := &PartitionSet{parts: pw.done, inline: pw.inline, base: pw.base}
+	ps := &PartitionSet{
+		parts:         pw.done,
+		inline:        pw.inline,
+		base:          pw.base,
+		unpartitioned: pw.kvs.partitioningDisabled,
+	}
 	ps.ids = make([]int, len(ps.parts))
 	for i := range ps.ids {
 		ps.ids[i] = i
 	}
 	ps.assignOwnershipRanges()
+	if err := pw.kvs.buildPartitionGlobalIndex(ps); err != nil {
+		return nil, err
+	}
 	return ps, nil
 }
 

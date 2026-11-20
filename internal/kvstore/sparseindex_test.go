@@ -285,9 +285,10 @@ func TestLookupInSortedFileUsesBlockHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	index := &SortedFileIndex{
-		Sparse:   sparse,
-		FileSize: fileSize,
-		FilePath: path,
+		Sparse:       sparse,
+		FileSize:     fileSize,
+		InlineValues: NewInlineCache(0),
+		FilePath:     path,
 	}
 
 	hashLookupsBefore := avpStats.hashLookups.Load()
@@ -428,7 +429,7 @@ func TestLookupInSortedFileDisabledBlockHashConcurrent(t *testing.T) {
 	}
 }
 
-func TestLookupInSortedFileGlobalMap(t *testing.T) {
+func TestPartitionGlobalIndexLookup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "part.p0")
 	file, err := os.Create(path)
 	if err != nil {
@@ -459,34 +460,33 @@ func TestLookupInSortedFileGlobalMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	globalOffsets, err := kvs.buildGlobalOffsets(path, fileSize)
-	if err != nil {
+	index := &SortedFileIndex{
+		Sparse:   sparse,
+		FileSize: fileSize,
+		FilePath: path,
+	}
+	ps := &PartitionSet{parts: []*SortedFileIndex{index}}
+	if err := kvs.buildPartitionGlobalIndex(ps); err != nil {
 		t.Fatal(err)
 	}
-	if len(globalOffsets) != count {
-		t.Fatalf("global map entries = %d, want %d", len(globalOffsets), count)
-	}
-	index := &SortedFileIndex{
-		Sparse:        sparse,
-		FileSize:      fileSize,
-		FilePath:      path,
-		globalOffsets: globalOffsets,
+	if len(ps.globalOffsets) != count {
+		t.Fatalf("global map entries = %d, want %d", len(ps.globalOffsets), count)
 	}
 
 	for i := 0; i < count; i++ {
 		key := fmt.Sprintf("%010d", i*2)
-		got, err := kvs.lookupInSortedFile(index, key)
+		got, _, err := kvs.getFromPartitions(key, ps)
 		if err != nil {
 			t.Fatalf("lookup(%s): %v", key, err)
 		}
 		want := fmt.Sprintf("value-%06d", i)
-		if got.Key != key || got.Value != want {
-			t.Fatalf("lookup(%s) = {%q,%q}, want {%q,%q}", key, got.Key, got.Value, key, want)
+		if got != want {
+			t.Fatalf("lookup(%s) = %q, want %q", key, got, want)
 		}
 	}
 	for i := 0; i < count; i++ {
 		key := fmt.Sprintf("%010d", i*2+1)
-		if _, err := kvs.lookupInSortedFile(index, key); err == nil {
+		if _, _, err := kvs.getFromPartitions(key, ps); err == nil {
 			t.Fatalf("missing key %s was found", key)
 		}
 	}

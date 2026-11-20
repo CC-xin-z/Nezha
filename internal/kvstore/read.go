@@ -856,7 +856,15 @@ func (kvs *KVServer) getFromPartitions(key string, ps *PartitionSet) (_ string, 
 	if ps == nil {
 		return "", false, errors.New("invalid partition set: set is nil")
 	}
-	part := ps.find(key)
+	if ps.globalOffsets != nil {
+		return kvs.getFromGlobalIndex(key, ps)
+	}
+	var part *SortedFileIndex
+	if ps.unpartitioned && len(ps.parts) == 1 {
+		part = ps.parts[0]
+	} else {
+		part = ps.find(key)
+	}
 	if part == nil {
 		// key 比所有分区都小，或落在两个分区之间的空隙里——都等价于这组分区里没有它。
 		// 内联缓存不必在这里查：缓存只由写进某个分区的 entry 填充，被缓存的 key 必然落在
@@ -865,6 +873,29 @@ func (kvs *KVServer) getFromPartitions(key string, ps *PartitionSet) (_ string, 
 		return "", false, ErrKeyAbsent
 	}
 	return kvs.getFromSortedFile(key, part)
+}
+
+func (kvs *KVServer) getFromGlobalIndex(key string, ps *PartitionSet) (_ string, cacheHit bool, _ error) {
+	location, ok := ps.globalOffsets[key]
+	if !ok {
+		return "", false, ErrKeyAbsent
+	}
+	partition, offset := unpackGlobalLocation(location)
+	if partition < 0 || partition >= len(ps.parts) {
+		return "", false, fmt.Errorf("global index points key %q at invalid partition %d", key, partition)
+	}
+	index := ps.parts[partition]
+	if value, ok := index.InlineValues.Get(key); ok {
+		return string(value), true, nil
+	}
+	entry, err := kvs.readEntryAtSortedOffset(index, key, offset)
+	if err != nil {
+		return "", false, err
+	}
+	if kvs.shouldInline(len(entry.Value)) {
+		index.InlineValues.Add(key, entry.Value)
+	}
+	return entry.Value, false, nil
 }
 
 // scanFromPartitions 把一次范围查询路由到与 [startKey, endKey] 有交集的那些分区，
@@ -876,6 +907,13 @@ func (kvs *KVServer) getFromPartitions(key string, ps *PartitionSet) (_ string, 
 func (kvs *KVServer) scanFromPartitions(startKey, endKey string, ps *PartitionSet) (map[string]string, error) {
 	if ps == nil {
 		return nil, nil
+	}
+	if ps.unpartitioned && len(ps.parts) == 1 {
+		result := make(map[string]string)
+		if err := kvs.scanFromSortedFileInto(result, startKey, endKey, ps.parts[0]); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 	parts := ps.overlapping(startKey, endKey)
 	if len(parts) == 0 {

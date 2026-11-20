@@ -131,6 +131,9 @@ type Config struct {
 	// SortedIndexMode selects global-map, sparse-scan, or sparse-block-hash
 	// for point reads from GC-produced sorted files.
 	SortedIndexMode SortedIndexMode
+	// DisablePartitioning writes one sorted file per GC round and uses a
+	// direct single-file read path without range routing.
+	DisablePartitioning bool
 	// DisableBlockHash forces sorted-file point reads through the bounded block
 	// scan. Retained as the internal compatibility path for older tests;
 	// SortedIndexMode supersedes it.
