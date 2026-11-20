@@ -348,6 +348,48 @@ func TestPartitionManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPartitionGlobalMapBuildAndReload(t *testing.T) {
+	dir := t.TempDir()
+	kvs := newTestServer(4096)
+	kvs.sortedIndexMode = SortedIndexGlobalMap
+	base := filepath.Join(dir, "sorted_1")
+
+	const n, vsize = 200, 100
+	ps := writeEntries(t, kvs, base, n, vsize)
+	for i, part := range ps.parts {
+		if part.globalOffsets == nil {
+			t.Fatalf("partition %d has no global offset map after GC", i)
+		}
+		if len(part.globalOffsets) != part.Entries {
+			t.Fatalf(
+				"partition %d global map has %d entries, want %d",
+				i,
+				len(part.globalOffsets),
+				part.Entries,
+			)
+		}
+	}
+	metas := ps.manifest()
+	ps.Close()
+
+	reloaded, err := kvs.loadPartitionSet(base, metas)
+	if err != nil {
+		t.Fatalf("loadPartitionSet: %v", err)
+	}
+	defer reloaded.Close()
+	for i, part := range reloaded.parts {
+		if part.globalOffsets == nil {
+			t.Fatalf("partition %d has no global offset map after reload", i)
+		}
+	}
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("%010d", i)
+		if _, _, err := kvs.getFromPartitions(key, reloaded); err != nil {
+			t.Fatalf("global-map lookup after reload(%s): %v", key, err)
+		}
+	}
+}
+
 func TestPartitionManifestPreservesStableBPHSIDs(t *testing.T) {
 	dir := t.TempDir()
 	kvs := newTestServer(4096)

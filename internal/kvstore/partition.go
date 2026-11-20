@@ -450,6 +450,14 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 		} else {
 			scanned++
 		}
+		var globalOffsets map[string]int64
+		if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
+			globalOffsets, err = kvs.buildGlobalOffsets(path, m.Size)
+			if err != nil {
+				ps.Close()
+				return nil, fmt.Errorf("rebuild global index for %s: %v", path, err)
+			}
+		}
 		pool, err := NewFileDescriptorPool(path, partitionPoolSize)
 		if err != nil {
 			ps.Close()
@@ -496,14 +504,15 @@ func (kvs *KVServer) loadPartitionSet(base string, metas []partitionMeta) (*Part
 			}
 		}
 		ps.parts = append(ps.parts, &SortedFileIndex{
-			Sparse:       sparse,
-			FileSize:     size,
-			InlineValues: ps.inline,
-			FilePath:     path,
-			Lo:           m.Lo,
-			Hi:           m.Hi,
-			pool:         pool,
-			Entries:      m.Entries,
+			Sparse:        sparse,
+			FileSize:      size,
+			globalOffsets: globalOffsets,
+			InlineValues:  ps.inline,
+			FilePath:      path,
+			Lo:            m.Lo,
+			Hi:            m.Hi,
+			pool:          pool,
+			Entries:       m.Entries,
 		})
 	}
 	if err := applyOwnershipMetadata(ps, metas); err != nil {
@@ -622,7 +631,7 @@ func (pw *partitionWriter) open() error {
 	}
 	pw.file = f
 	pw.w = bufio.NewWriter(f)
-	pw.sparse = NewSparseIndexBuilder(pw.kvs.indexBlockBytes)
+	pw.sparse = pw.kvs.newSparseIndexBuilder()
 	pw.offset, pw.n = 0, 0
 	pw.lo, pw.hi = "", ""
 	return nil
@@ -702,6 +711,7 @@ func (pw *partitionWriter) seal() error {
 	pw.file, pw.w = nil, nil
 
 	sparse := pw.sparse.Build()
+	globalOffsets := pw.sparse.GlobalOffsets()
 	// 旁挂索引写在数据 fsync **之后**，所以它描述的一定是已经落盘的内容。
 	// 写失败不算这一轮失败：索引缺失只会让下次启动退回扫描重建，不影响正确性。
 	if err := writeSparseIndex(path, sparse, pw.kvs.indexBlockBytes, pw.offset); err != nil {
@@ -713,14 +723,15 @@ func (pw *partitionWriter) seal() error {
 		return fmt.Errorf("file descriptor pool for %s: %v", path, err)
 	}
 	pw.done = append(pw.done, &SortedFileIndex{
-		Sparse:       sparse,
-		FileSize:     pw.offset,
-		InlineValues: pw.inline,
-		FilePath:     path,
-		Lo:           pw.lo,
-		Hi:           pw.hi,
-		pool:         pool,
-		Entries:      pw.n,
+		Sparse:        sparse,
+		FileSize:      pw.offset,
+		globalOffsets: globalOffsets,
+		InlineValues:  pw.inline,
+		FilePath:      path,
+		Lo:            pw.lo,
+		Hi:            pw.hi,
+		pool:          pool,
+		Entries:       pw.n,
 	})
 	pw.total += pw.offset
 	// 一个分区刚落盘、后面还有的那一刻——本轮产物在盘上但不完整、也还没提交。

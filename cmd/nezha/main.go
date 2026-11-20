@@ -22,6 +22,7 @@ func main() {
 	var cfg kvstore.Config
 	var peers string
 	blockHash := true
+	sortedIndexMode := string(kvstore.SortedIndexBlockHash)
 	flag.StringVar(&cfg.Address, "address", "", "client-facing gRPC address, e.g. 192.168.1.240:3099")
 	flag.StringVar(&cfg.InternalAddress, "internalAddress", "", "this node's Raft address; must be one of -peers")
 	flag.StringVar(&peers, "peers", "", "comma-separated Raft addresses of all nodes; the order defines node ids")
@@ -68,7 +69,15 @@ func main() {
 	flag.IntVar(&cfg.InlineCacheMB, "inlineCacheMB", 256, "memory budget in MB for the inline small-value cache (0 disables it)")
 	flag.IntVar(&cfg.InlineBudgetMB, "inlineBudgetMB", 0, "with -inlinePlacement: at most this many MB (key+value) are inlined per store generation, the rest stored as offsets (0 = unlimited, the default; a budget measured net negative, see results/avp-inline-budget/)")
 	flag.IntVar(&cfg.IndexBlockKB, "indexBlockKB", 4, "sparse index block size in KB: one in-memory index entry per block")
-	flag.BoolVar(&blockHash, "blockHash", true, "use the lazy block-local hash index for sorted-file point reads")
+	flag.StringVar(
+		&sortedIndexMode,
+		"sortedIndexMode",
+		string(kvstore.SortedIndexBlockHash),
+		"sorted-file point-read index: global-map, sparse-scan, or sparse-block-hash",
+	)
+	// -blockHash predates -sortedIndexMode. Keep it as a compatibility alias so
+	// existing experiment scripts retain their meaning.
+	flag.BoolVar(&blockHash, "blockHash", true, "deprecated compatibility alias: false => sparse-scan, true => sparse-block-hash")
 	flag.Float64Var(&cfg.GCThresholdGB, "gcThresholdGB", 4000, "value log size in GB that triggers garbage collection; lower it to exercise GC in tests")
 	flag.IntVar(&cfg.PartitionTargetMB, "partitionTargetMB", 128, "target size in MB of one GC output partition; lower it to exercise multi-partition reads in tests")
 	flag.Float64Var(&cfg.AbsorbRatio, "absorbRatio", 0.25, "start a GC round once the tail log reaches this fraction of the partitions' total size")
@@ -102,7 +111,42 @@ func main() {
 	flag.IntVar(&cfg.SSTSpanMB, "sstSpanMB", 32, "lsm-raft: applied value bytes per shipped SSTable span")
 	flag.IntVar(&cfg.SSTIdleMs, "sstIdleMs", 1000, "lsm-raft: cut the open span after this many ms without writes")
 	flag.Parse()
-	cfg.DisableBlockHash = !blockHash
+	mode, err := kvstore.ParseSortedIndexMode(sortedIndexMode)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "nezha:", err)
+		flag.Usage()
+		os.Exit(2)
+	}
+	modeExplicit, blockHashExplicit := false, false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "sortedIndexMode":
+			modeExplicit = true
+		case "blockHash":
+			blockHashExplicit = true
+		}
+	})
+	if blockHashExplicit {
+		legacyMode := kvstore.SortedIndexSparseScan
+		if blockHash {
+			legacyMode = kvstore.SortedIndexBlockHash
+		}
+		if modeExplicit && mode != legacyMode {
+			fmt.Fprintf(
+				os.Stderr,
+				"nezha: -blockHash conflicts with -sortedIndexMode=%s; use only -sortedIndexMode\n",
+				mode,
+			)
+			os.Exit(2)
+		}
+		mode = legacyMode
+	}
+	cfg.SortedIndexMode = mode
+	cfg.DisableBlockHash = mode == kvstore.SortedIndexSparseScan
+	if mode == kvstore.SortedIndexGlobalMap && cfg.BPHS {
+		fmt.Fprintln(os.Stderr, "nezha: -sortedIndexMode=global-map is not supported with -bphs")
+		os.Exit(2)
+	}
 	cfg.Peers = strings.Split(peers, ",")
 	if cfg.Address == "" || cfg.InternalAddress == "" || peers == "" {
 		fmt.Fprintln(os.Stderr, "nezha: -address, -internalAddress and -peers are required")

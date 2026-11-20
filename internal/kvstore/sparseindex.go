@@ -48,10 +48,11 @@ type blockHashEntry struct {
 // SparseIndexBuilder 在顺序写 sortedFile 的同时构建稀疏索引。
 // 调用方每写完一条 entry 就调用一次 Observe，最后用 Build 收尾。
 type SparseIndexBuilder struct {
-	entries    []SparseEntry
-	blockBytes int64
-	sinceLast  int64
-	started    bool
+	entries       []SparseEntry
+	blockBytes    int64
+	sinceLast     int64
+	started       bool
+	globalOffsets map[string]int64
 }
 
 func NewSparseIndexBuilder(blockBytes int64) *SparseIndexBuilder {
@@ -59,6 +60,18 @@ func NewSparseIndexBuilder(blockBytes int64) *SparseIndexBuilder {
 		blockBytes = defaultIndexBlockBytes
 	}
 	return &SparseIndexBuilder{blockBytes: blockBytes}
+}
+
+// EnableGlobalMap makes Observe also build the paper-style full key->offset
+// map. The sorted file is already deduplicated, so each key appears once.
+func (b *SparseIndexBuilder) EnableGlobalMap() {
+	b.globalOffsets = make(map[string]int64)
+}
+
+// GlobalOffsets returns the full per-key offset map, or nil when it was not
+// requested. The map is read-only after the builder is finished.
+func (b *SparseIndexBuilder) GlobalOffsets() map[string]int64 {
+	return b.globalOffsets
 }
 
 // 4KB。块尺寸是外层稀疏索引与块内索引的内存/读放大旋钮。没有块内哈希时，
@@ -73,6 +86,9 @@ const defaultIndexBlockBytes = 4 * 1024
 // Observe 记录一条刚写入的 entry。key 必须是写进文件的那个 key（已 padding），
 // offset 是它的起始偏移，size 是它占用的字节数。
 func (b *SparseIndexBuilder) Observe(key string, offset int64, size int64) {
+	if b.globalOffsets != nil {
+		b.globalOffsets[key] = offset
+	}
 	// 第一条永远建立索引点，保证 Sparse[0] 是文件中最小的 key
 	if !b.started || b.sinceLast >= b.blockBytes {
 		b.entries = append(b.entries, SparseEntry{PaddedKey: key, Offset: offset})
@@ -145,6 +161,112 @@ func (sfi *SortedFileIndex) boundedScanRange(startKey, endKey string) (int64, in
 	return start, end, true
 }
 
+func (kvs *KVServer) effectiveSortedIndexMode() SortedIndexMode {
+	if kvs.sortedIndexMode != "" {
+		return kvs.sortedIndexMode
+	}
+	if kvs.disableBlockHash {
+		return SortedIndexSparseScan
+	}
+	return SortedIndexBlockHash
+}
+
+func (kvs *KVServer) newSparseIndexBuilder() *SparseIndexBuilder {
+	builder := NewSparseIndexBuilder(kvs.indexBlockBytes)
+	if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
+		builder.EnableGlobalMap()
+	}
+	return builder
+}
+
+// buildGlobalOffsets reconstructs the paper-style full key->offset map by
+// scanning one immutable sorted file. It is used on recovery because the full
+// map is intentionally derived state and is not persisted.
+func (kvs *KVServer) buildGlobalOffsets(path string, expectedSize int64) (map[string]int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	offsets := make(map[string]int64)
+	reader := bufio.NewReaderSize(file, 1<<20)
+	var offset int64
+	for {
+		entry, size, err := ReadEntry(reader, offset)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		offsets[entry.Key] = offset
+		offset += size
+	}
+	if expectedSize > 0 && offset != expectedSize {
+		return nil, fmt.Errorf(
+			"sorted file %s: expected %d bytes, parsed %d",
+			path,
+			expectedSize,
+			offset,
+		)
+	}
+	return offsets, nil
+}
+
+// readEntryAtSortedOffset follows the original Nezha global-map path: the map
+// supplies the exact record offset, so no block search is needed.
+func (kvs *KVServer) readEntryAtSortedOffset(
+	index *SortedFileIndex,
+	key string,
+	offset int64,
+) (*raft.Entry, error) {
+	if offset < 0 || offset >= index.FileSize {
+		return nil, fmt.Errorf(
+			"sorted file %s: key %q has invalid offset %d (size %d)",
+			index.FilePath,
+			key,
+			offset,
+			index.FileSize,
+		)
+	}
+
+	var file *os.File
+	var err error
+	if index.pool != nil {
+		file, err = index.pool.Get()
+		if err != nil {
+			return nil, err
+		}
+		defer index.pool.Put(file)
+	} else {
+		file, err = os.Open(index.FilePath)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+	}
+
+	reader := bufio.NewReaderSize(
+		io.NewSectionReader(file, offset, index.FileSize-offset),
+		64*1024,
+	)
+	entry, _, err := ReadEntry(reader, offset)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Key != key {
+		return nil, fmt.Errorf(
+			"sorted file %s: offset %d contains key %q, want %q",
+			index.FilePath,
+			offset,
+			entry.Key,
+			key,
+		)
+	}
+	return entry, nil
+}
+
 // scanBlock 在 [start, end) 内顺序查找 key。
 // 找到返回其 entry；块内 key 已超过目标说明不存在，返回 raft.ErrNoKey。
 func (kvs *KVServer) scanBlock(index *SortedFileIndex, key string, start, end int64) (*raft.Entry, error) {
@@ -203,6 +325,19 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 	if index == nil {
 		return nil, errors.New("invalid index: index is nil")
 	}
+	if kvs.effectiveSortedIndexMode() == SortedIndexGlobalMap {
+		if index.globalOffsets == nil {
+			return nil, fmt.Errorf(
+				"sorted file %s: global index mode but no global offset map",
+				index.FilePath,
+			)
+		}
+		offset, ok := index.globalOffsets[key]
+		if !ok {
+			return nil, ErrKeyAbsent
+		}
+		return kvs.readEntryAtSortedOffset(index, key, offset)
+	}
 	start, end, ok := index.blockRange(key)
 	if !ok {
 		return nil, ErrKeyAbsent
@@ -212,7 +347,7 @@ func (kvs *KVServer) lookupInSortedFile(index *SortedFileIndex, key string) (*ra
 	if blockLen <= 0 {
 		return nil, ErrKeyAbsent
 	}
-	if blockLen > 1<<20 || kvs.disableBlockHash {
+	if blockLen > 1<<20 || kvs.effectiveSortedIndexMode() == SortedIndexSparseScan {
 		avpRecordHashFallback()
 		return kvs.scanBlock(index, key, start, end)
 	}
@@ -478,6 +613,10 @@ type SortedFileIndex struct {
 	// 查找时二分定位到块，再在块内顺序扫描，内存从 O(key 数) 降为 O(块数)。
 	Sparse   []SparseEntry
 	FileSize int64 // sortedFile 总长度，用于界定最后一块的右边界
+	// globalOffsets is present only in global-map mode. Partitions cover
+	// disjoint key ranges, so their full maps together implement the original
+	// paper's logical global key->offset index without duplicating partition ids.
+	globalOffsets map[string]int64
 	// InlineValues 是小值的有界缓存，纯读加速层，命中则免去一次文件 seek。
 	// 它可以为 nil、可以随时淘汰任何条目，都不影响正确性——value 始终在 sortedFile 里。
 	// 同一组分区里的每个分区都指向同一个实例，见 PartitionSet.inline。

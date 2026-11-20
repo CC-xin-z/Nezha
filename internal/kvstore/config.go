@@ -2,8 +2,42 @@ package kvstore
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
+
+// SortedIndexMode selects how a point lookup searches a GC-produced sorted
+// value-log file.
+type SortedIndexMode string
+
+const (
+	// SortedIndexGlobalMap is the paper's full key->offset hash map. Partitions
+	// are disjoint key ranges, so one full map per partition is equivalent to
+	// one global map without storing a partition id in every entry.
+	SortedIndexGlobalMap SortedIndexMode = "global-map"
+	// SortedIndexSparseScan keeps one entry per sparse block and scans the
+	// selected block linearly.
+	SortedIndexSparseScan SortedIndexMode = "sparse-scan"
+	// SortedIndexBlockHash keeps the sparse block index and lazily builds a
+	// compact hash table inside each visited block.
+	SortedIndexBlockHash SortedIndexMode = "sparse-block-hash"
+)
+
+func ParseSortedIndexMode(value string) (SortedIndexMode, error) {
+	mode := SortedIndexMode(strings.ToLower(strings.TrimSpace(value)))
+	switch mode {
+	case SortedIndexGlobalMap, SortedIndexSparseScan, SortedIndexBlockHash:
+		return mode, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid sorted index mode %q: want %s, %s, or %s",
+			value,
+			SortedIndexGlobalMap,
+			SortedIndexSparseScan,
+			SortedIndexBlockHash,
+		)
+	}
+}
 
 // Config is everything a node needs to start. cmd/nezha fills it from flags; tests fill
 // it directly.
@@ -94,8 +128,12 @@ type Config struct {
 	// 字段留着供复现那次实验；上面"于是库永远留在内存表里"那段是当初的假设，没有成立。
 	InlineBudgetMB int
 	IndexBlockKB   int // sparse index granularity over sorted files
+	// SortedIndexMode selects global-map, sparse-scan, or sparse-block-hash
+	// for point reads from GC-produced sorted files.
+	SortedIndexMode SortedIndexMode
 	// DisableBlockHash forces sorted-file point reads through the bounded block
-	// scan. It exists to isolate the contribution of the lazy block hash.
+	// scan. Retained as the internal compatibility path for older tests;
+	// SortedIndexMode supersedes it.
 	DisableBlockHash bool
 
 	GCThresholdGB  float64

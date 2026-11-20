@@ -427,3 +427,89 @@ func TestLookupInSortedFileDisabledBlockHashConcurrent(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestLookupInSortedFileGlobalMap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "part.p0")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	kvs := &KVServer{sortedIndexMode: SortedIndexGlobalMap}
+
+	const count = 1025
+	for i := 0; i < count; i++ {
+		entry := &raft.Entry{
+			Index: uint32(i + 1),
+			Key:   fmt.Sprintf("%010d", i*2),
+			Value: fmt.Sprintf("value-%06d", i),
+		}
+		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sparse, fileSize, err := kvs.BuildSparseIndex(path, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalOffsets, err := kvs.buildGlobalOffsets(path, fileSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(globalOffsets) != count {
+		t.Fatalf("global map entries = %d, want %d", len(globalOffsets), count)
+	}
+	index := &SortedFileIndex{
+		Sparse:        sparse,
+		FileSize:      fileSize,
+		FilePath:      path,
+		globalOffsets: globalOffsets,
+	}
+
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2)
+		got, err := kvs.lookupInSortedFile(index, key)
+		if err != nil {
+			t.Fatalf("lookup(%s): %v", key, err)
+		}
+		want := fmt.Sprintf("value-%06d", i)
+		if got.Key != key || got.Value != want {
+			t.Fatalf("lookup(%s) = {%q,%q}, want {%q,%q}", key, got.Key, got.Value, key, want)
+		}
+	}
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("%010d", i*2+1)
+		if _, err := kvs.lookupInSortedFile(index, key); err == nil {
+			t.Fatalf("missing key %s was found", key)
+		}
+	}
+}
+
+func TestParseSortedIndexMode(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  SortedIndexMode
+	}{
+		{"global-map", SortedIndexGlobalMap},
+		{" sparse-scan ", SortedIndexSparseScan},
+		{"SPARSE-BLOCK-HASH", SortedIndexBlockHash},
+	} {
+		got, err := ParseSortedIndexMode(test.input)
+		if err != nil {
+			t.Fatalf("ParseSortedIndexMode(%q): %v", test.input, err)
+		}
+		if got != test.want {
+			t.Fatalf("ParseSortedIndexMode(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+	if _, err := ParseSortedIndexMode("dense-magic"); err == nil {
+		t.Fatal("invalid mode was accepted")
+	}
+}
