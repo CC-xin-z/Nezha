@@ -97,3 +97,25 @@ func TestTailRouteTargetOnlyWhenCandidateSetIsUnique(t *testing.T) {
 		t.Fatal("tail routing must not preempt the BPHS read path")
 	}
 }
+
+func TestTailRouteIsIndependentOfInlineFeatures(t *testing.T) {
+	filter := NewTailFilter(64, 10)
+	filter.MarkExact()
+	filter.Add("tail-key")
+	kvs := &KVServer{
+		tailFilter:       filter,
+		inlinePlacement:  false,
+		inlineCacheBytes: 0,
+	}
+
+	if kvs.tailRouteShortcut("tail-key") {
+		t.Fatal("a key in the current tail must retain the normal two-path lookup")
+	}
+	if !kvs.tailRouteShortcut("historical-key") {
+		t.Fatal("a key proven absent from the tail must be routed directly to partitions")
+	}
+	single, both := filter.RouteStats()
+	if single != 1 || both != 1 {
+		t.Fatalf("route stats = single:%d both:%d, want 1/1", single, both)
+	}
+}
