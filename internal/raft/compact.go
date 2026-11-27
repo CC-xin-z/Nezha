@@ -61,21 +61,35 @@ func (rf *Raft) compactLog() {
 			continue
 		}
 
-		// 快照在飞的时候整个跳过压缩，传输结束之后还要再保持一段（见
-		// releaseDelayAfterSnapshot）。etcd 在 inflightSnapshots != 0 时同样是直接跳过
-		// 整轮压缩，而 CockroachDB 为此给快照速率设了**下限**，理由就是发送方在传输期间
-		// 会挡住日志截断。
+		// 快照在飞的时候**不能整轮跳过压缩**（原先是直接 continue）。
+		// 那种写法在内存日志上是无界的：100GB 数据、100MB/s 限速下，一次快照
+		// 传输就要十几分钟，这段时间进来的写入全部留下，2026-11-26 实测
+		// 256KB 档连 baseline 都堆到 149GB。
 		//
-		// 省掉这一条的后果 CockroachDB 的注释里有原话：快照做完、发完、装完期间日志继续
-		// 截断，落后节点追到的位点又落在新的 first index 之前，于是 "likely entering a
-		// never ending loop of snapshots"（cockroachdb#8629）。
-		if rf.snapshotsInFlightLocked() {
+		// 正确的约束在 compactDecisionLocked 里：压缩点收到快照的覆盖点 P。
+		// P 之前的日志对这份快照已经没用（接收端装完从 P+1 追）；
+		// 压过 P 才会退化成 cockroachdb#8629 的"没完没了重发快照"。
+		// 覆盖点还没定（快照正在物化）时才跳过本轮，见 d.snapshotPending。
+		//
+		// 唯独传输刚结束的那 30 秒仍整轮跳过：回执到 nextIndex 更新之间要留余量
+		// （etcd 的同名常量 releaseDelayAfterSnapshot），时长有限，代价可以接受。
+		if rf.inflightSnaps == 0 && time.Now().Before(rf.snapReleaseAt) {
 			rf.mu.Unlock()
 			continue
 		}
 
 		d := rf.compactDecisionLocked(catchUpEntries)
 		safeIndex := d.point
+
+		if d.snapshotPending {
+			rf.mu.Unlock()
+			continue
+		}
+		if d.snapshotBound > 0 {
+			fmt.Printf("[LOG-SNAPSHOT] 有快照在飞（覆盖到 %d），压缩点从 %d 收到 %d："+
+				"这段日志要留给装完快照的副本接着追\n",
+				d.snapshotBound, d.snapshotCappedFrom, d.snapshotBound)
+		}
 
 		// 预算把某个副本截住了：它会落到压缩点之前，接下来由快照补齐。
 		// 这是**有意为之**的一步，所以要说清楚是谁、在什么水位上被截的。
@@ -305,6 +319,13 @@ type compactDecision struct {
 	// state-machine durable floor. A peer that falls behind the new point must
 	// be repaired by a snapshot once the state machine reaches that cut.
 	budgetBypassedFloor bool
+	// snapshotBound > 0 表示压缩点被在飞快照的覆盖点压住了：
+	// 只能压到这里，再往后那份快照就作废（见 snapshotCompactionBoundLocked）。
+	snapshotBound int
+	// snapshotCappedFrom 是收窄之前的压缩点，只供日志打印。
+	snapshotCappedFrom int
+	// snapshotPending 表示有快照正在物化、覆盖点还没定：这一轮不能动日志。
+	snapshotPending bool
 }
 
 // compactDecisionLocked 按三档规则算出压缩点。调用方须持有 rf.mu。
@@ -376,28 +397,39 @@ func (rf *Raft) compactDecisionLocked(catchUpEntries int) compactDecision {
 
 	// matchIndex 仅在成为 leader 时分配；follower 上为 nil，此时无需 peer 约束。
 	// 单节点时该循环为空，压缩仅受 lastApplied 约束。
-	if rf.role != ROLE_LEADER || rf.matchIndex == nil {
-		return d
+	if rf.role == ROLE_LEADER && rf.matchIndex != nil {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			m := rf.matchIndex[i]
+			if m >= d.point {
+				continue
+			}
+			if !rf.peerRecentlyActiveLocked(i) && d.overBudget {
+				continue // 第二档：不活跃且超预算，不再为它保留
+			}
+			if m < d.floor {
+				// 第三档：预算截住了它。它会因此落到压缩点之前，改由快照补齐。
+				d.cappedBy, d.cappedAt = i, m
+				m = d.floor
+			}
+			if m < d.point {
+				d.point = m
+				d.pinnedBy = i
+			}
+		}
 	}
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		m := rf.matchIndex[i]
-		if m >= d.point {
-			continue
-		}
-		if !rf.peerRecentlyActiveLocked(i) && d.overBudget {
-			continue // 第二档：不活跃且超预算，不再为它保留
-		}
-		if m < d.floor {
-			// 第三档：预算截住了它。它会因此落到压缩点之前，改由快照补齐。
-			d.cappedBy, d.cappedAt = i, m
-			m = d.floor
-		}
-		if m < d.point {
-			d.point = m
-			d.pinnedBy = i
+
+	// 快照这道闸门必须放在最后：前面三档都可能把压缩点往上抬（floor），
+	// 而这里只许往下收——压缩点越过快照的覆盖点，那份快照就白传了。
+	if bound, hasSnap := rf.snapshotCompactionBoundLocked(); hasSnap {
+		if bound <= 0 {
+			d.snapshotPending = true
+		} else if d.point > bound {
+			d.snapshotCappedFrom = d.point
+			d.snapshotBound = bound
+			d.point = bound
 		}
 	}
 	return d

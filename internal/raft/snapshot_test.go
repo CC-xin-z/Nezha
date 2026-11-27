@@ -186,29 +186,84 @@ func TestSnapshotConcurrencyLimit(t *testing.T) {
 	close(block)
 }
 
-// 快照在飞的时候压缩必须整个跳过，传完之后还要再保持一段。
-// 少了这一条，落后节点追到的位点又会落在新的压缩点之前，于是没完没了地重发快照
-// （CockroachDB 的原话是 "likely entering a never ending loop of snapshots"）。
-func TestCompactionBlockedWhileSnapshotInFlight(t *testing.T) {
+// snapshotsInFlightLocked 现在只用于"能不能动盘上的日志文件"（轮转/删除会打断
+// 正在传的那份快照）；内存压缩改由 snapshotCompactionBoundLocked 做细粒度收窄。
+// 这里钉住的是它的语义边界：在飞、以及传输刚结束的保护期内都为真。
+func TestSnapshotsInFlightBlocksLogRotation(t *testing.T) {
 	rf := leaderForSnapTest(3)
 	rf.mu.Lock()
 	if rf.snapshotsInFlightLocked() {
-		t.Error("什么都没发的时候压缩不该被挡")
+		t.Error("什么都没发的时候不该判成在飞")
 	}
 	rf.inflightSnaps = 1
 	if !rf.snapshotsInFlightLocked() {
-		t.Error("有快照在飞却允许压缩")
+		t.Error("有快照在飞却允许轮转日志文件")
 	}
 	rf.inflightSnaps = 0
 	rf.snapReleaseAt = time.Now().Add(time.Minute)
 	if !rf.snapshotsInFlightLocked() {
-		t.Error("传输刚结束的保护期内允许了压缩")
+		t.Error("传输刚结束的保护期内允许了轮转")
 	}
 	rf.snapReleaseAt = time.Now().Add(-time.Second)
 	if rf.snapshotsInFlightLocked() {
-		t.Error("保护期过了还在挡压缩")
+		t.Error("保护期过了还在挡轮转")
 	}
 	rf.mu.Unlock()
+}
+
+// 快照在飞时压缩点必须收到它的覆盖点 P：P 之前的日志对这份快照已经没用了，
+// 而压过 P 的话接收端装完立刻又落在新的压缩点之前，退化成没完没了地重发快照
+// （cockroachdb#8629）。但**不能整轮跳过**——那会让内存日志随传输时长无界增长。
+func TestCompactionCappedAtInflightSnapshotCoverage(t *testing.T) {
+	rf := leaderForTruncTest(1 << 30) // 预算充裕，日志 100 条（1001..1100）
+	rf.matchIndex[1] = 1100
+	rf.matchIndex[2] = 1100
+	rf.notePeerActive(1)
+	rf.notePeerActive(2)
+
+	// 没有快照时不构成约束：压缩点 = 1095（受 catchUpEntries 限制）。
+	if d := rf.compactDecisionLocked(5); d.point != 1095 || d.snapshotBound != 0 {
+		t.Fatalf("无快照时 point=%d bound=%d; want 1095 / 0", d.point, d.snapshotBound)
+	}
+
+	// 快照覆盖到 1040：压缩点只能到 1040。
+	rf.ensurePeerSnapLocked()
+	rf.inflightSnaps = 1
+	rf.peerSnap[1].state = progressSnapshotting
+	rf.peerSnap[1].index = 1040
+	d := rf.compactDecisionLocked(5)
+	if d.snapshotPending {
+		t.Fatal("覆盖点已知却判成未定")
+	}
+	if d.snapshotBound != 1040 || d.point != 1040 {
+		t.Errorf("bound=%d point=%d; want 1040 / 1040", d.snapshotBound, d.point)
+	}
+	if d.snapshotCappedFrom != 1095 {
+		t.Errorf("cappedFrom=%d; want 1095（收窄之前的位置要能说清楚）", d.snapshotCappedFrom)
+	}
+
+	// 覆盖点比正常压缩点更远：不构成约束，不应改动压缩点。
+	rf.peerSnap[1].index = 1200
+	if d := rf.compactDecisionLocked(5); d.snapshotBound != 0 || d.point != 1095 {
+		t.Errorf("覆盖点更远时 bound=%d point=%d; want 0 / 1095", d.snapshotBound, d.point)
+	}
+}
+
+// 快照正在物化、覆盖点还没定：这一轮不动日志，否则可能把它压废。
+func TestCompactionWaitsWhileSnapshotCoverageUnknown(t *testing.T) {
+	rf := leaderForTruncTest(1 << 30)
+	rf.matchIndex[1] = 1100
+	rf.matchIndex[2] = 1100
+	rf.notePeerActive(1)
+	rf.notePeerActive(2)
+
+	rf.ensurePeerSnapLocked()
+	rf.inflightSnaps = 1
+	rf.peerSnap[1].state = progressSnapshotting // index 仍是 0：source 还没返回
+	d := rf.compactDecisionLocked(5)
+	if !d.snapshotPending {
+		t.Fatal("覆盖点未定时应当跳过本轮压缩")
+	}
 }
 
 // 卸任要丢掉本任期的快照记账，否则下个任期会带着上个任期的 snapshotting 状态，

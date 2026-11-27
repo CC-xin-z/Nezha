@@ -176,9 +176,47 @@ func (rf *Raft) peerRecentlyActiveLocked(peerId int) bool {
 	return time.Since(rf.peerActiveAt[peerId]) < peerActiveWindow
 }
 
-// snapshotsInFlight 供 compactLog 判断现在能不能压缩。调用方须持有 rf.mu。
+// snapshotsInFlight 供日志轮转（checkpoint.go）判断现在能不能动盘上的日志文件：
+// 在飞快照发的是当前日志文件本身，轮转把它删/换掉会打断那次传输。
+// 内存里的压缩不使用这个粗粒度判断，见 snapshotCompactionBoundLocked。调用方须持有 rf.mu。
 func (rf *Raft) snapshotsInFlightLocked() bool {
 	return rf.inflightSnaps > 0 || time.Now().Before(rf.snapReleaseAt)
+}
+
+// snapshotCompactionBoundLocked 返回"有快照在飞时内存压缩点能推进到的上界"。
+//
+// 一份快照覆盖到 P，接收端装完之后就从 P+1 继续追日志。压缩点只要不超过 P，
+// 装完的副本就能直接接上；压过 P 它就会立刻落在新的压缩点之前、再要一份快照，
+// 也就是 cockroachdb#8629 说的 "never ending loop of snapshots"。
+//
+// 但"整轮跳过"不是正确的做法：Raft 日志常驻内存，跳过一轮就等于让它的驻留量
+// 随快照传输时长无界增长（100GB 数据、100MB/s 限速下光传输就十几分钟）。
+// 正确语义是**把压缩点收到 P**——P 之前的日志对这份快照已经没用了。
+//
+// ok=false 表示没有快照在飞，不构成约束；ok=true 且 bound<=0 表示快照正在物化、
+// 覆盖点还没定，这一轮不要动日志。调用方须持有 rf.mu。
+func (rf *Raft) snapshotCompactionBoundLocked() (bound int, ok bool) {
+	if rf.inflightSnaps == 0 {
+		return 0, false
+	}
+	for i := range rf.peerSnap {
+		ps := &rf.peerSnap[i]
+		if ps.state != progressSnapshotting {
+			continue
+		}
+		if ps.index <= 0 {
+			return 0, true // 覆盖点还没定（source 尚未返回）：本轮不动
+		}
+		if !ok || ps.index < bound {
+			bound = ps.index
+			ok = true
+		}
+	}
+	if !ok {
+		// 在飞计数为正、却没有 peer 处于 snapshotting：账目不一致，按未定处理。
+		return 0, true
+	}
+	return bound, true
 }
 
 // maybeSendSnapshot 由复制循环每轮对每个 peer 调一次。
