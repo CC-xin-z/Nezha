@@ -24,6 +24,7 @@ func main() {
 	blockHash := true
 	sortedIndexMode := string(kvstore.SortedIndexBlockHash)
 	partitioned := true
+	bphsInlinePlacement := true
 	flag.StringVar(&cfg.Address, "address", "", "client-facing gRPC address, e.g. 192.168.1.240:3099")
 	flag.StringVar(&cfg.InternalAddress, "internalAddress", "", "this node's Raft address; must be one of -peers")
 	flag.StringVar(&peers, "peers", "", "comma-separated Raft addresses of all nodes; the order defines node ids")
@@ -84,6 +85,7 @@ func main() {
 	flag.IntVar(&cfg.PartitionTargetMB, "partitionTargetMB", 128, "target size in MB of one GC output partition; lower it to exercise multi-partition reads in tests")
 	flag.Float64Var(&cfg.AbsorbRatio, "absorbRatio", 0.25, "start a GC round once the tail log reaches this fraction of the partitions' total size")
 	flag.BoolVar(&cfg.BPHS, "bphs", false, "enable the static Bootstrap-Partitioned Hybrid Storage prototype after the first partitioned GC")
+	flag.BoolVar(&bphsInlinePlacement, "bphsInlinePlacement", true, "store small values inline in BPHS partitions; false keeps every value in partition VLogs and Base/L0 only stores BlobRefs")
 	flag.IntVar(&cfg.BPHSMemtableMB, "bphsMemtableMB", 4, "logical MemTable budget in MB per BPHS partition; 0 keeps all latest records")
 	flag.IntVar(&cfg.BPHSSyncConcurrency, "bphsSyncConcurrency", 8, "maximum number of dirty BPHS partitions fsynced in parallel after one apply batch")
 	flag.IntVar(&cfg.BPHSRecordSyncConcurrency, "bphsRecordSyncConcurrency", 8, "maximum number of BPHS partition record logs synced by the background worker")
@@ -146,12 +148,17 @@ func main() {
 	cfg.SortedIndexMode = mode
 	cfg.DisableBlockHash = mode == kvstore.SortedIndexSparseScan
 	cfg.DisablePartitioning = !partitioned
+	cfg.DisableBPHSInlinePlacement = !bphsInlinePlacement
 	if mode == kvstore.SortedIndexGlobalMap && cfg.BPHS {
 		fmt.Fprintln(os.Stderr, "nezha: -sortedIndexMode=global-map is not supported with -bphs")
 		os.Exit(2)
 	}
 	if cfg.DisablePartitioning && cfg.BPHS {
 		fmt.Fprintln(os.Stderr, "nezha: -partitioned=false is not supported with -bphs")
+		os.Exit(2)
+	}
+	if cfg.DisableBPHSInlinePlacement && cfg.BPHSDynamicSplit {
+		fmt.Fprintln(os.Stderr, "nezha: -bphsInlinePlacement=false is not supported with -bphsDynamicSplit")
 		os.Exit(2)
 	}
 	cfg.Peers = strings.Split(peers, ",")

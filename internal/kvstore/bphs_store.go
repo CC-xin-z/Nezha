@@ -33,6 +33,9 @@ type bphsPartitionManifest struct {
 	Generation   uint64 `json:"generation"`
 	BaseFile     string `json:"base_file,omitempty"`
 	BaseSize     int64  `json:"base_size,omitempty"`
+	BaseEncoded  bool   `json:"base_encoded,omitempty"`
+	VLogFile     string `json:"vlog_file,omitempty"`
+	VLogBytes    int64  `json:"vlog_bytes,omitempty"`
 	LogicalBytes int64  `json:"logical_bytes,omitempty"`
 	MaxVersion   uint32 `json:"max_version"`
 	Lo           string `json:"lo,omitempty"`
@@ -65,26 +68,28 @@ func loadBPHSPartitionManifest(dir string, partition int) (bphsPartitionManifest
 // 新版本。MemTable 达到预算后刷成 L0，l0 数量达到阈值时只在本分区内合并；
 // records 仍是持久化 WAL，重启时只重放比最新 L0 更新的版本。
 type bphsPartition struct {
-	mu           sync.RWMutex
-	index        int
-	base         *SortedFileIndex
-	baseLocal    bool
-	mem          *partitionMemtable
-	immutable    *partitionMemtable
-	records      *partitionRecordLog
-	vlog         *partitionVLog
-	l0           []*SortedFileIndex // 从旧到新
-	gen          uint64
-	logicalBytes int64
-	ownershipLo  string
-	ownershipHi  string
-	recordsDirty bool
-	vlogDirty    bool
-	compacting   bool
-	flushing     bool
-	flushDone    chan struct{}
-	l0Merges     int
-	durableIndex atomic.Uint32
+	mu            sync.RWMutex
+	index         int
+	base          *SortedFileIndex
+	baseLocal     bool
+	baseEncoded   bool
+	mem           *partitionMemtable
+	immutable     *partitionMemtable
+	records       *partitionRecordLog
+	vlog          *partitionVLog
+	vlogBaseBytes int64
+	l0            []*SortedFileIndex // 从旧到新
+	gen           uint64
+	logicalBytes  int64
+	ownershipLo   string
+	ownershipHi   string
+	recordsDirty  bool
+	vlogDirty     bool
+	compacting    bool
+	flushing      bool
+	flushDone     chan struct{}
+	l0Merges      int
+	durableIndex  atomic.Uint32
 	// pendingDurableVersion is advanced after a record (and, when needed, its
 	// VLog value) is fsynced. A background sync therefore advances the BPHS
 	// durable frontier without waiting for a MemTable flush.
@@ -97,6 +102,7 @@ type bphsPartition struct {
 type bphsPartitionReadView struct {
 	index       int
 	base        *SortedFileIndex
+	baseEncoded bool
 	l0          []*SortedFileIndex
 	mem         []bphsRecord
 	immutable   *partitionMemtable
@@ -271,8 +277,20 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 		maxCoveredVersion := uint32(0)
 		gen := uint64(1)
 		logicalBytes := basePart.FileSize
+		baseEncoded := false
+		vlogBaseBytes := int64(0)
+		vlogName := fmt.Sprintf("p%06d.vlog", partitionID)
 		if hasMeta {
 			gen = meta.Generation
+			baseEncoded = meta.BaseEncoded
+			vlogBaseBytes = meta.VLogBytes
+			if meta.VLogFile != "" {
+				if filepath.Base(meta.VLogFile) != meta.VLogFile {
+					s.Close()
+					return nil, fmt.Errorf("partition %d BPHS manifest has invalid VLog file %q", partitionID, meta.VLogFile)
+				}
+				vlogName = meta.VLogFile
+			}
 			maxCoveredVersion = meta.MaxVersion
 			if meta.LogicalBytes > 0 {
 				logicalBytes = meta.LogicalBytes
@@ -302,7 +320,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			s.Close()
 			return nil, fmt.Errorf("open partition %d record log: %w", partitionID, err)
 		}
-		vlog, err := openPartitionVLog(filepath.Join(dir, fmt.Sprintf("p%06d.vlog", partitionID)))
+		vlog, err := openPartitionVLog(filepath.Join(dir, vlogName))
 		if err != nil {
 			records.Close()
 			if localBaseLoaded {
@@ -312,16 +330,18 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 			return nil, fmt.Errorf("open partition %d vlog: %w", partitionID, err)
 		}
 		part := &bphsPartition{
-			index:        partitionID,
-			base:         localBase,
-			baseLocal:    localBaseLoaded,
-			mem:          newPartitionMemtable(memtableBytes),
-			records:      records,
-			vlog:         vlog,
-			gen:          gen,
-			logicalBytes: logicalBytes,
-			ownershipLo:  basePart.OwnershipLo,
-			ownershipHi:  basePart.OwnershipHi,
+			index:         partitionID,
+			base:          localBase,
+			baseLocal:     localBaseLoaded,
+			baseEncoded:   baseEncoded,
+			mem:           newPartitionMemtable(memtableBytes),
+			records:       records,
+			vlog:          vlog,
+			vlogBaseBytes: vlogBaseBytes,
+			gen:           gen,
+			logicalBytes:  logicalBytes,
+			ownershipLo:   basePart.OwnershipLo,
+			ownershipHi:   basePart.OwnershipHi,
 		}
 		l0, err := loadPartitionL0Files(kvs, dir, partitionID, inlineCacheBytes)
 		if err != nil {
@@ -451,7 +471,7 @@ func openBPHSStore(kvs *KVServer, base *PartitionSet, dir string, memtableBytes,
 	return s, nil
 }
 
-var bphsPartitionFileName = regexp.MustCompile(`^p[0-9]{6}(\.(records|vlog)|_(l0|base)_[^/]+\.sst)$`)
+var bphsPartitionFileName = regexp.MustCompile(`^p[0-9]{6}(\.(records|vlog)|_vlog_[0-9]+\.vlog|_(l0|base)_[^/]+\.sst)$`)
 var bphsPartitionManifestName = regexp.MustCompile(`^p([0-9]{6})\.manifest\.json$`)
 
 func cleanupUnreferencedBPHSFiles(s *bphsStore) error {
@@ -1011,7 +1031,7 @@ func (s *bphsStore) Put(key, value string, version uint32) (int, error) {
 	lockWait := time.Since(lockStart)
 
 	rec := bphsRecord{Key: key, Version: version}
-	if s.kvs.shouldInline(len(value)) {
+	if !s.kvs.disableBPHSInlinePlacement && s.kvs.shouldInline(len(value)) {
 		rec.Kind = bphsInlineRecord
 		rec.Value = value
 	} else {
@@ -1240,7 +1260,10 @@ func (s *bphsStore) shouldCompactPartitionLocked(part *bphsPartition) bool {
 	if part.vlog.Size() == 0 {
 		return part.l0Merges >= bphsBaseCompactionL0Rounds
 	}
-	delta := part.vlog.Size()
+	delta := part.vlog.Size() - part.vlogBaseBytes
+	if delta < 0 {
+		delta = 0
+	}
 	threshold := s.partitionGCThresholdBytes
 	if threshold <= 0 {
 		threshold = int64(16 << 20)
@@ -1372,6 +1395,7 @@ func (s *bphsStore) installCompactionSnapshot(
 	oldL0 := append([]*SortedFileIndex(nil), snapshot.l0...)
 	part.base = newBase
 	part.baseLocal = true
+	part.baseEncoded = false
 	part.logicalBytes = newBase.FileSize
 	part.l0 = append([]*SortedFileIndex(nil), part.l0[len(snapshot.l0):]...)
 	part.l0Merges = 0
@@ -1428,6 +1452,9 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	if part == nil || (len(part.l0) == 0 && part.mem.Len() == 0) {
 		return nil
 	}
+	if s.kvs.disableBPHSInlinePlacement {
+		return s.compactPartitionOffsetLocked(part)
+	}
 	if part.vlogDirty {
 		if err := part.vlog.Sync(); err != nil {
 			return err
@@ -1450,7 +1477,13 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	}
 
 	if part.base != nil {
-		records, err := readRawSortedFile(part.base.FilePath)
+		var records []bphsRecord
+		var err error
+		if part.baseEncoded {
+			records, err = readBPHSSortedFile(part.base.FilePath)
+		} else {
+			records, err = readRawSortedFile(part.base.FilePath)
+		}
 		if err != nil {
 			return err
 		}
@@ -1495,6 +1528,13 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	for _, rec := range merged {
 		if rec.Version > cutVersion {
 			cutVersion = rec.Version
+		}
+		if rec.Kind != bphsInlineRecord {
+			value, err := s.recordValue(part, rec)
+			if err != nil {
+				return err
+			}
+			rec = bphsRecord{Key: rec.Key, Version: rec.Version, Kind: bphsInlineRecord, Value: value}
 		}
 		records = append(records, rec)
 	}
@@ -1541,6 +1581,7 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 	oldL0 := part.l0
 	part.base = newBase
 	part.baseLocal = true
+	part.baseEncoded = false
 	part.gen = nextGen
 	part.logicalBytes = newBase.FileSize
 	part.l0 = nil
@@ -1581,7 +1622,216 @@ func (s *bphsStore) compactPartitionLocked(part *bphsPartition) error {
 		return err
 	}
 	part.vlogDirty = false
+	part.vlogBaseBytes = 0
 
+	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
+		if s.releaseBase(oldBase.FilePath) {
+			removeBPHSSortedFile(oldBase)
+		} else {
+			oldBase.closePool()
+		}
+	}
+	return nil
+}
+
+// compactPartitionOffsetLocked is the no-inline BPHS compaction path. It keeps
+// the index layer as key->BlobRef records and rewrites the surviving values
+// into a versioned partition VLog. The manifest switch is the commit point:
+// only after it is durable do in-memory readers switch to the new generation.
+func (s *bphsStore) compactPartitionOffsetLocked(part *bphsPartition) error {
+	if part.vlogDirty {
+		if err := part.vlog.Sync(); err != nil {
+			return err
+		}
+		part.vlogDirty = false
+	}
+	if part.recordsDirty {
+		if err := part.records.Sync(); err != nil {
+			return err
+		}
+		part.recordsDirty = false
+	}
+
+	merged := make(map[string]bphsRecord)
+	putLatest := func(rec bphsRecord) {
+		old, ok := merged[rec.Key]
+		if !ok || rec.Version >= old.Version {
+			merged[rec.Key] = rec
+		}
+	}
+	if part.base != nil {
+		var records []bphsRecord
+		var err error
+		if part.baseEncoded {
+			records, err = readBPHSSortedFile(part.base.FilePath)
+		} else {
+			records, err = readRawSortedFile(part.base.FilePath)
+		}
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			if part.ownsKey(rec.Key) {
+				putLatest(rec)
+			}
+		}
+	}
+	for _, run := range part.l0 {
+		records, err := readBPHSSortedFile(run.FilePath)
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			if part.ownsKey(rec.Key) {
+				putLatest(rec)
+			}
+		}
+	}
+	var immutableRecords []bphsRecord
+	if part.immutable != nil {
+		immutableRecords = part.immutable.Sorted()
+	}
+	for _, rec := range mergePartitionMemtableRecords(part.mem.Sorted(), immutableRecords) {
+		putLatest(rec)
+	}
+
+	records := make([]bphsRecord, 0, len(merged))
+	var cutVersion uint32
+	for _, rec := range merged {
+		if rec.Version > cutVersion {
+			cutVersion = rec.Version
+		}
+		records = append(records, rec)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+	if len(records) == 0 {
+		return nil
+	}
+
+	nextGen := part.gen + 1
+	vlogName := fmt.Sprintf("p%06d_vlog_%020d.vlog", part.index, nextGen)
+	vlogPath := filepath.Join(s.dir, vlogName)
+	if _, err := os.Stat(vlogPath); err == nil {
+		return fmt.Errorf("BPHS partition %d compaction VLog already exists: %s", part.index, vlogPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	newVLog, err := openPartitionVLog(vlogPath)
+	if err != nil {
+		return err
+	}
+	removeNewVLog := func() {
+		_ = newVLog.Close()
+		_ = os.Remove(vlogPath)
+	}
+
+	encoded := make([]bphsRecord, 0, len(records))
+	for _, rec := range records {
+		value, err := s.recordValue(part, rec)
+		if err != nil {
+			removeNewVLog()
+			return err
+		}
+		ref, err := newVLog.Append([]byte(value))
+		if err != nil {
+			removeNewVLog()
+			return err
+		}
+		ref.Generation = nextGen
+		encoded = append(encoded, bphsRecord{
+			Key: rec.Key, Version: rec.Version, Kind: bphsBlobRecord, Blob: ref,
+		})
+	}
+	if err := newVLog.Sync(); err != nil {
+		removeNewVLog()
+		return err
+	}
+
+	baseName := fmt.Sprintf("p%06d_base_%020d.sst", part.index, time.Now().UnixNano())
+	basePath := filepath.Join(s.dir, baseName)
+	newBase, err := s.kvs.flushBPHSBaseFile(encoded, basePath, 0, true)
+	if err != nil {
+		removeNewVLog()
+		return err
+	}
+	if newBase == nil {
+		removeNewVLog()
+		return nil
+	}
+	newBase.InlineValues = s.inline
+	s.retainBase(newBase.FilePath)
+
+	meta := bphsPartitionManifest{
+		Generation:   nextGen,
+		BaseFile:     filepath.Base(basePath),
+		BaseSize:     newBase.FileSize,
+		BaseEncoded:  true,
+		VLogFile:     vlogName,
+		VLogBytes:    newVLog.Size(),
+		LogicalBytes: newBase.FileSize + newVLog.Size(),
+		MaxVersion:   cutVersion,
+		Lo:           newBase.Lo,
+		Hi:           newBase.Hi,
+		Entries:      newBase.Entries,
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		removeNewVLog()
+		if s.releaseBase(newBase.FilePath) {
+			removeBPHSSortedFile(newBase)
+		}
+		return err
+	}
+	if err := raft.WriteFileAtomic(bphsPartitionManifestPath(s.dir, part.index), data); err != nil {
+		removeNewVLog()
+		if s.releaseBase(newBase.FilePath) {
+			removeBPHSSortedFile(newBase)
+		}
+		return err
+	}
+
+	oldBase, oldLocal := part.base, part.baseLocal
+	oldL0 := part.l0
+	oldVLog := part.vlog
+	oldVLogPath := oldVLog.Path()
+	part.base = newBase
+	part.baseLocal = true
+	part.baseEncoded = true
+	part.vlog = newVLog
+	part.vlogBaseBytes = newVLog.Size()
+	part.gen = nextGen
+	part.logicalBytes = meta.LogicalBytes
+	part.l0 = nil
+	part.l0Merges = 0
+	part.mem.Reset()
+	if err := s.advancePartitionDurable(part, cutVersion); err != nil {
+		return err
+	}
+
+	if err := part.records.Close(); err != nil {
+		return err
+	}
+	recordPath := part.records.Path()
+	if err := os.Remove(recordPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	part.records, err = openPartitionRecordLog(recordPath)
+	if err != nil {
+		return err
+	}
+	part.recordsDirty = false
+
+	if err := oldVLog.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(oldVLogPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, run := range oldL0 {
+		run.closePool()
+		os.Remove(run.FilePath)
+		os.Remove(sparseIndexPath(run.FilePath))
+	}
 	if oldLocal && oldBase != nil && oldBase.FilePath != newBase.FilePath {
 		if s.releaseBase(oldBase.FilePath) {
 			removeBPHSSortedFile(oldBase)
@@ -1724,10 +1974,16 @@ func readRawSortedFile(path string) ([]bphsRecord, error) {
 	}
 }
 
-func (kvs *KVServer) flushBPHSBaseFile(records []bphsRecord, path string, inlineCacheBytes int64) (*SortedFileIndex, error) {
+func (kvs *KVServer) flushBPHSBaseFile(
+	records []bphsRecord,
+	path string,
+	inlineCacheBytes int64,
+	encodeRecords ...bool,
+) (*SortedFileIndex, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
+	encode := len(encodeRecords) > 0 && encodeRecords[0]
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -1737,13 +1993,24 @@ func (kvs *KVServer) flushBPHSBaseFile(records []bphsRecord, path string, inline
 	var offset int64
 	lo, hi := records[0].Key, records[0].Key
 	for _, rec := range records {
-		entry := &raft.Entry{Index: rec.Version, Key: rec.Key, Value: rec.Value}
+		var entry *raft.Entry
+		var err error
+		if encode {
+			entry, err = bphsRecordEntry(rec)
+			if err != nil {
+				file.Close()
+				os.Remove(path)
+				return nil, err
+			}
+		} else {
+			entry = &raft.Entry{Index: rec.Version, Key: rec.Key, Value: rec.Value}
+		}
 		if err := kvs.WriteEntryToSortedFile(writer, entry); err != nil {
 			file.Close()
 			os.Remove(path)
 			return nil, err
 		}
-		size := int64(20 + len(rec.Key) + len(rec.Value))
+		size := int64(20 + len(entry.Key) + len(entry.Value))
 		sparse.Observe(rec.Key, offset, size)
 		offset += size
 		hi = rec.Key
@@ -1911,6 +2178,7 @@ func (s *bphsStore) partitionReadViewLocked(
 	view := bphsPartitionReadView{
 		index:       part.index,
 		base:        part.base,
+		baseEncoded: part.baseEncoded,
 		generation:  part.gen,
 		vlog:        part.vlog,
 		ownershipLo: ownershipLo,
@@ -2019,6 +2287,18 @@ func (s *bphsStore) Get(key string) (value string, found bool, err error) {
 	if view.base != nil {
 		entry, err := s.kvs.lookupInSortedFile(view.base, key)
 		if err == nil {
+			if view.baseEncoded {
+				rec, decodeErr := entryToBPHSRecord(entry)
+				if decodeErr != nil {
+					return "", false, decodeErr
+				}
+				value, valueErr := s.recordValueFromReadView(view, rec)
+				if valueErr != nil {
+					return "", false, valueErr
+				}
+				recordBPHSRead(bphsReadBase)
+				return value, true, nil
+			}
 			recordBPHSRead(bphsReadBase)
 			return entry.Value, true, nil
 		}
@@ -2110,7 +2390,13 @@ func (s *bphsStore) Scan(startKey, endKey string) (map[string]string, error) {
 			// The ready/local steady state has one run. Keep the original
 			// direct streaming path and avoid merge bookkeeping.
 			if view.base != nil {
-				if err := s.kvs.scanFromSortedFileInto(result, partStart, partEnd, view.base); err != nil {
+				var err error
+				if view.baseEncoded {
+					err = s.scanBPHSSortedFileInto(result, partStart, partEnd, part, view.base)
+				} else {
+					err = s.kvs.scanFromSortedFileInto(result, partStart, partEnd, view.base)
+				}
+				if err != nil {
 					releasePart()
 					return nil, err
 				}
@@ -2239,7 +2525,7 @@ func (s *bphsStore) scanBPHSPartitionMergedInto(
 	defer closeRuns()
 
 	if view.base != nil {
-		run, err := s.openBPHSScanRun(view, view.base, startKey, endKey, false, 0)
+		run, err := s.openBPHSScanRun(view, view.base, startKey, endKey, view.baseEncoded, 0)
 		if err != nil {
 			return err
 		}

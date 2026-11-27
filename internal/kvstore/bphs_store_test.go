@@ -1473,3 +1473,102 @@ func TestBPHSVLogSizeTriggersCompactionBeforeMemtableFull(t *testing.T) {
 		}
 	}
 }
+
+func TestBPHSOffsetOnlyCompactionPersistsBlobBase(t *testing.T) {
+	kvs := &KVServer{
+		persister:                  &raft.Persister{},
+		inlineThreshold:            512,
+		indexBlockBytes:            128,
+		disableBPHSInlinePlacement: true,
+	}
+	base := newBPHSTestBase(t, kvs, "0000000005", "base-old")
+	defer base.Close()
+
+	dir := filepath.Join(t.TempDir(), "bphs")
+	store, err := openBPHSStore(kvs, base, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	want := map[string]string{
+		"0000000001": "value-1",
+		"0000000002": "value-2",
+		"0000000003": "value-3",
+		"0000000005": "base-old",
+	}
+	dirty := map[int]struct{}{}
+	version := uint32(2)
+	for key, value := range want {
+		idx, err := store.Put(key, value, version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dirty[idx] = struct{}{}
+		version++
+	}
+	if err := store.SyncPartitions(dirty); err != nil {
+		t.Fatal(err)
+	}
+
+	part := store.parts[0]
+	part.mu.Lock()
+	if err := store.compactPartitionLocked(part); err != nil {
+		part.mu.Unlock()
+		t.Fatal(err)
+	}
+	part.mu.Unlock()
+
+	if !part.baseEncoded {
+		t.Fatal("offset-only compaction did not mark the base as BPHS-encoded")
+	}
+	if part.vlog.Size() == 0 {
+		t.Fatal("offset-only compaction unexpectedly removed all partition VLog values")
+	}
+	records, err := readBPHSSortedFile(part.base.FilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != len(want) {
+		t.Fatalf("base has %d records, want %d", len(records), len(want))
+	}
+	for _, rec := range records {
+		if rec.Kind != bphsBlobRecord {
+			t.Fatalf("base record %q kind=%d, want blob", rec.Key, rec.Kind)
+		}
+	}
+
+	manifest, ok, err := loadBPHSPartitionManifest(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !manifest.BaseEncoded || manifest.VLogFile == "" {
+		t.Fatalf("offset-only manifest = %+v, ok=%v", manifest, ok)
+	}
+	for key, value := range want {
+		got, found, err := store.Get(key)
+		if err != nil || !found || got != value {
+			t.Fatalf("get(%s) = %q found=%v err=%v", key, got, found, err)
+		}
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenBase := newBPHSTestBase(t, kvs, "0000000005", "base-old")
+	defer reopenBase.Close()
+	reopened, err := openBPHSStore(kvs, reopenBase, dir, 1<<20, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if !reopened.parts[0].baseEncoded {
+		t.Fatal("reloaded offset-only partition lost its encoded-base marker")
+	}
+	for key, value := range want {
+		got, found, err := reopened.Get(key)
+		if err != nil || !found || got != value {
+			t.Fatalf("reloaded get(%s) = %q found=%v err=%v", key, got, found, err)
+		}
+	}
+}

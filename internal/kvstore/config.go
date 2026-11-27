@@ -134,6 +134,9 @@ type Config struct {
 	// DisablePartitioning writes one sorted file per GC round and uses a
 	// direct single-file read path without range routing.
 	DisablePartitioning bool
+	// DisableBPHSInlinePlacement keeps all BPHS values in partition VLogs and
+	// stores only BlobRefs in MemTable/L0/Base records.
+	DisableBPHSInlinePlacement bool
 	// DisableBlockHash forces sorted-file point reads through the bounded block
 	// scan. Retained as the internal compatibility path for older tests;
 	// SortedIndexMode supersedes it.
